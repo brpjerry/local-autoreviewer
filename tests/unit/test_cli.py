@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.helpers import ROOT  # noqa: F401  (puts src/ on sys.path)
 from local_autoreviewer import __main__ as cli
 
 
@@ -25,8 +26,9 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as share:
             out = io.StringIO()
             with mock.patch.dict(os.environ, {"LOCAL_AUTOREVIEWER_SHARE": share}), \
-                    contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                    contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exit_:
                 cli.main(["--version"])
+        self.assertEqual(exit_.exception.code, 0)
         self.assertEqual(out.getvalue(), "local-autoreviewer dev\n")
 
 
