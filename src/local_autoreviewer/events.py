@@ -57,6 +57,20 @@ def stop_jobs(conn, repo, number, status, reason, *, agent=None, keep=None):
     return stopped
 
 
+def requeue_for_service(conn, cfg, job, *, now, token_owner):
+    """Queue the review the poller would have queued for a cancelled `review --post` job's head:
+    while that job was active it counted as the head's review, so a poll that saw the head skipped
+    it. Does nothing if the poller hasn't seen this head (its next poll will). Returns new job ids."""
+    row = conn.execute("SELECT * FROM prs WHERE repo=? AND number=? AND state='open'",
+                       (job["repo"], job["number"])).fetchone()
+    if row is None or (row["head_sha"], row["base_ref"]) != (job["head_sha"], job["base_ref"]):
+        return []
+    event = PrEvent(repo=job["repo"], number=job["number"], action="synchronize", head_sha=row["head_sha"],
+                    base_ref=row["base_ref"], is_draft=bool(row["is_draft"]), author=row["author"], source="poll",
+                    head_changed_at=row["head_changed_at"], agents=(job["agent"],))
+    return ingest(conn, cfg, event, now=now, token_owner=token_owner)
+
+
 def ingest(conn, cfg, event, *, now, token_owner):
     """Apply policy to one event inside the caller's transaction. Returns new job ids."""
     repo_cfg = cfg.repo(event.repo)
@@ -108,7 +122,7 @@ def ingest(conn, cfg, event, *, now, token_owner):
             latest = conn.execute(
                 "SELECT status, rerun FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=?"
                 f" AND NOT {db.TRIAL_SQL} ORDER BY rerun DESC LIMIT 1",
-                (repo, event.number, event.head_sha, event.base_ref, agent)).fetchone()
+                (repo, event.number, event.head_sha, event.base_ref, agent, db.FOREGROUND)).fetchone()
             if latest is not None and latest["status"] not in ("cancelled", "superseded"):
                 continue  # already reviewed, or in flight
             rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)

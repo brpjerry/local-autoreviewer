@@ -40,6 +40,8 @@ MIGRATIONS = [
     CREATE INDEX jobs_pr ON jobs (repo, number, agent);
     CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """,
+    # 2: failed posts are retried without running the agent again; count them apart from `attempts`.
+    "ALTER TABLE jobs ADD COLUMN post_attempts INTEGER NOT NULL DEFAULT 0;",
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -136,7 +138,7 @@ def is_trial(job):
     return job["source"] == FOREGROUND and not job["post"]
 
 
-TRIAL_SQL = f"(source='{FOREGROUND}' AND post=0)"  # is_trial() as a WHERE condition
+TRIAL_SQL = "(source=? AND post=0)"  # is_trial() as a WHERE condition; bind FOREGROUND
 
 
 def active_jobs(conn, repo, number, agent=None):

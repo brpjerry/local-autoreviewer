@@ -85,8 +85,9 @@ class Worker:
             conn.close()
 
     def recover_posts(self, svc):
-        """Finish posts interrupted by a crash (the worker's own, or a dead `review`'s). Each runs
-        in a thread like a job, so a slow GitHub can't stall the loop, and occupies its agent's slot."""
+        """Finish posts that failed and are due for a retry, or were interrupted by a crash (the
+        worker's own, or a dead `review`'s). Each runs in a thread like a job, so a slow GitHub can't
+        stall the loop, and occupies its agent's slot."""
         conn = svc.connect()
         try:
             rows = conn.execute("SELECT id, source, agent FROM jobs WHERE status='posting' AND not_before<=?",
@@ -211,7 +212,7 @@ class Worker:
         for _thread, token, _agent in self.threads.values():
             token.cancel("shutdown")
         for job_id, (thread, _token, _agent) in list(self.threads.items()):
-            thread.join(timeout=90)
+            thread.join(timeout=130)  # a post recovery's gh call can take up to 120 s
             if thread.is_alive():
                 log.warning("job %s did not stop in time", job_id)
 

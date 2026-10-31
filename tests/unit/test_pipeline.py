@@ -247,7 +247,7 @@ class PipelineTests(EnvTestCase):
     def test_a_rate_limited_post_is_retried(self):
         for message in ("gh: API rate limit exceeded for user ID 1. (HTTP 403)",
                         "gh: You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)",
-                        "gh: Too Many Requests (HTTP 429)"):
+                        "gh: Too Many Requests (HTTP 429)", "gh: Request Timeout (HTTP 408)"):
             with self.subTest(message=message):
                 svc, (job_id,) = self.queue()
                 self.failing_post(message)
@@ -264,7 +264,35 @@ class PipelineTests(EnvTestCase):
         self.clock.advance(pipeline.POST_RECOVERY_RETRY)
         recover_posts(Worker(lambda cfg: svc, None), svc)
         job = self.job(svc, job_id)
-        self.assertEqual((job["status"], job["attempts"]), ("failed", 2))
+        self.assertEqual((job["status"], job["post_attempts"]), ("failed", 2))
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_post_attempts_are_counted_apart_from_agent_attempts(self):
+        svc, (job_id,) = self.queue()
+        conn = svc.connect()
+        with db.transaction(conn):  # it needed two agent retries before it got this far
+            db.update_job(conn, job_id, attempts=2)
+        conn.close()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.assertEqual((self.job(svc, job_id)["attempts"], self.job(svc, job_id)["post_attempts"]), (2, 1))
+
+    def test_out_of_post_retries_checks_once_more_whether_it_reached_github(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 1}))
+        real_post = self.github.post_review
+
+        def post_then_time_out(*args):
+            real_post(*args)
+            raise GitHubError("gh api repos/o/r timed out")
+
+        self.github.post_review = post_then_time_out
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        self.assertEqual(len(self.github.posted), 1)
+
+    def test_a_garbled_response_to_the_first_post_does_not_rerun_the_agent(self):
+        svc, (job_id,) = self.queue()
+        self.github.post_review = lambda *args: None  # no JSON object came back
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
         self.assertEqual(len(self.agent_log("claude")), 1)
 
     def test_post_recovery_honours_a_retarget_during_the_backoff(self):
@@ -322,6 +350,55 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "posted")
         self.assertEqual(sum(waits), pipeline.POST_RECOVERY_RETRY)
         self.assertEqual((len(self.github.posted), len(self.agent_log("claude"))), (1, 1))
+
+    def test_review_post_stops_waiting_when_the_pr_closes(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+            if len(waits) == 3:
+                conn = svc.connect()
+                with db.transaction(conn):  # the poll sees the close
+                    events.stop_jobs(conn, REPO, 1, "cancelled", "PR closed")
+                conn.close()
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "cancelled")
+        self.assertLess(sum(waits), pipeline.POST_RECOVERY_RETRY)
+
+    def test_a_cancelled_review_post_hands_the_head_back_to_the_service(self):
+        conn = self.services().connect()
+        with db.transaction(conn):  # the poller has seen this head
+            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                         " head_changed_at, last_seen_at) VALUES (?, 1, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                         (REPO, self.head, OWNER))
+        conn.close()
+        svc, (job_id,) = self.foreground(post=True)
+        event = events.PrEvent(repo=REPO, number=1, action="synchronize", head_sha=self.head, base_ref="main",
+                               is_draft=False, author=OWNER, source="poll", agents=("claude",))
+        conn = svc.connect()
+        with db.transaction(conn):  # the running `review --post` counts as this head's review
+            self.assertEqual(events.ingest(conn, svc.config, event, now=self.clock(), token_owner=OWNER), [])
+        conn.close()
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")  # Ctrl-C
+        conn = svc.connect()
+        jobs = [dict(r) for r in conn.execute("SELECT id, source, status FROM jobs ORDER BY id")]
+        conn.close()
+        self.assertEqual([(j["source"], j["status"]) for j in jobs],
+                         [(db.FOREGROUND, "cancelled"), ("poll", "queued")])
+
+    def test_review_command_reports_its_jobs(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), contextlib.redirect_stdout(out):
+            code = cli.cmd_review(argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False))
+        self.assertEqual(code, 0)
+        self.assertIn("job 1 [claude]: skipped — posting disabled", out.getvalue())
+        self.assertIn(f"  review: {pipeline.job_paths(self.state, 1).out}/review.md", out.getvalue())
 
     def test_long_wait_cancel_keeps_a_status_a_poll_just_set(self):
         svc, (job_id,) = self.foreground()

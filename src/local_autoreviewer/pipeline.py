@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, leakscan, review
+from . import db, events, leakscan, review
 from .agents import make_agent
 from .agents.base import JobPaths
 from .github import GitHubError
@@ -222,15 +222,16 @@ def _watch_cancel(svc, job_id, token, done):
             return
 
 
-def _wait_while(svc, conn, job_id, status, wait, sleep):
-    """Sleep up to `wait` seconds in short steps while the job keeps `status`; return early with its
-    new status if a push or close ends it meanwhile."""
+def _wait_while(svc, conn, job_id, status, wait, sleep, *, stop_on_cancel=False):
+    """Sleep up to `wait` seconds in short steps while the job keeps `status`. Return early, with its
+    status, if a push or close ends it meanwhile; a queued job's status changes then, while a
+    `posting` job only gets a cancel request (stop_on_cancel)."""
     deadline = svc.now() + wait
     while (remaining := deadline - svc.now()) > 0:
         sleep(min(FOREGROUND_CANCEL_POLL, remaining))
-        current = db.get_job(conn, job_id)["status"]
-        if current != status:
-            return current
+        job = db.get_job(conn, job_id)
+        if job["status"] != status or (stop_on_cancel and job["cancel_requested"]):
+            return job["status"]
     return status
 
 
@@ -242,13 +243,15 @@ def _finish_post(svc, job_id, sleep, notify):
         while True:
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
+            # POST_RECOVERY_RETRY equals FOREGROUND_MAX_WAIT today, so this only hands a post to the
+            # worker if the two diverge.
             if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT:
                 return job["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
-            if _wait_while(svc, conn, job_id, "posting", wait, sleep) != "posting":
+            if _wait_while(svc, conn, job_id, "posting", wait, sleep, stop_on_cancel=True) != "posting":
                 return db.get_job(conn, job_id)["status"]
-            recover_post(conn, svc, db.get_job(conn, job_id))
+            recover_post(conn, svc, db.get_job(conn, job_id))  # also honours a cancel request
     finally:
         conn.close()
 
@@ -284,6 +287,7 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
                         (reason[:1000], svc.now(), job_id)).rowcount
                 if cancelled:
                     log.info("job %s -> cancelled: %s", job_id, reason)
+                    _hand_back(conn, svc, db.get_job(conn, job_id))
                 return db.get_job(conn, job_id)["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
@@ -316,8 +320,17 @@ def abandon(svc, job_ids, reason):
             if job["scope_unit"]:
                 svc.runner.cleanup(job["scope_unit"])
             _finish(conn, svc, job_id, "cancelled", reason)
+            _hand_back(conn, svc, job)
     finally:
         conn.close()
+
+
+def _hand_back(conn, svc, job):
+    """After cancelling a foreground `review --post` job, queue the service's own review of its head
+    if the job had stood in for it (see events.requeue_for_service)."""
+    if job["post"]:
+        with db.transaction(conn):
+            events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.token_owner)
 
 
 def _cancelled(conn, svc, job, cancel):
@@ -422,16 +435,27 @@ def _rejected(exc):
 
 def post_failed(conn, svc, job, exc):
     """A post that failed or whose result is unknown (a timeout after GitHub accepted it, say). It stays
-    `posting` for marker-checked recovery, without running the agent again, until max_attempts; a
-    definite refusal fails it at once. The review stays in out/review.md either way."""
-    attempts = db.get_job(conn, job["id"])["attempts"] + 1
-    saved = f"review saved to {job_paths(svc.state, job['id']).out}/review.md"
-    if _rejected(exc) or attempts >= svc.config.service.max_attempts:
-        return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000], attempts=attempts,
-                       error=str(exc)[:2000])
+    `posting` for marker-checked recovery, without running the agent again, for max_attempts post
+    attempts (counted apart from the agent's); a definite refusal fails it at once. The review stays
+    in out/review.md either way."""
+    post_attempts = db.get_job(conn, job["id"])["post_attempts"] + 1
+    rejected = _rejected(exc)
+    if not rejected and post_attempts >= svc.config.service.max_attempts:
+        try:  # out of retries: one last look, in case a failure that wasn't a refusal did reach GitHub
+            existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
+        except Exception:
+            existing = None
+        if existing:
+            return _finish(conn, svc, job["id"], "posted", "review found after a failed post", posted_at=svc.now(),
+                           post_attempts=post_attempts, review_id=existing.get("id"),
+                           review_url=existing.get("html_url"))
+    if rejected or post_attempts >= svc.config.service.max_attempts:
+        saved = f"review saved to {job_paths(svc.state, job['id']).out}/review.md"
+        return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000],
+                       post_attempts=post_attempts, error=str(exc)[:2000])
     log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)
     with db.transaction(conn):
-        db.update_job(conn, job["id"], attempts=attempts, reason=f"post failed: {exc}"[:1000],
+        db.update_job(conn, job["id"], post_attempts=post_attempts, reason=f"post failed: {exc}"[:1000],
                       not_before=svc.now() + POST_RECOVERY_RETRY)
     return "posting"
 
@@ -453,7 +477,9 @@ def recover_post(conn, svc, job):
         return _finish(conn, svc, job["id"], "superseded" if reason.startswith("superseded") else "cancelled", reason)
     if not Path(job_paths(svc.state, job["id"]).out, "review.md").is_file():
         if job["source"] == db.FOREGROUND:  # no owner left to run it again
-            return _finish(conn, svc, job["id"], "cancelled", "interrupted post had no saved review")
+            status = _finish(conn, svc, job["id"], "cancelled", "interrupted post had no saved review")
+            _hand_back(conn, svc, job)
+            return status
         return _finish(conn, svc, job["id"], "queued", "requeued: review output missing")
     try:
         return post(conn, svc, job)
@@ -470,7 +496,10 @@ def post(conn, svc, job):
     try:
         _check_pr(svc, job)
         response = svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
-    except GitHubError as exc:
+        review_id, review_url = response.get("id"), response.get("html_url")
+    except Outcome:
+        raise  # the PR closed, moved or was retargeted: not a failed post
+    except Exception as exc:  # including a garbled response to a post that may have succeeded
         return post_failed(conn, svc, job, exc)
     return _finish(conn, svc, job["id"], "posted", "review posted", posted_at=svc.now(),
-                   review_id=response.get("id"), review_url=response.get("html_url"))
+                   review_id=review_id, review_url=review_url)

@@ -15,7 +15,7 @@ Restart=always
 RestartSec=5
 # Running reviews are cancelled and requeued on stop.
 KillMode=mixed
-TimeoutStopSec=120
+TimeoutStopSec=150
 NoNewPrivileges=yes
 UMask=0077
 

@@ -232,6 +232,30 @@ class PollTests(EnvTestCase):
         self.assertEqual(self.jobs(), [])
 
 
+class HousekeepingTests(EnvTestCase):
+    def test_stale_lock_files_are_removed(self):
+        from local_autoreviewer import maintenance, pipeline
+        svc = self.services()
+        conn = svc.connect()
+        ids = []
+        for status in ("posted", "running"):
+            with db.transaction(conn):
+                job_id = db.insert_job(conn, repo=REPO, number=len(ids) + 1, head_sha="a" * 40, base_ref="main",
+                                       agent="claude", model="", source=db.FOREGROUND, not_before=0,
+                                       now=self.clock())
+                db.update_job(conn, job_id, status=status)
+            ids.append(job_id)
+        conn.close()
+        finished, active = ids
+        pipeline.foreground_lock_path(self.state, finished).parent.mkdir(parents=True)
+        pipeline.foreground_lock_path(self.state, finished).touch()  # left by a killed `review`
+        held = pipeline.hold_foreground_lock(self.state, active)
+        self.addCleanup(held.close)
+        maintenance.housekeeping(svc)
+        self.assertFalse(pipeline.foreground_lock_path(self.state, finished).exists())
+        self.assertTrue(pipeline.foreground_lock_path(self.state, active).exists())
+
+
 class ManualIngestTests(EnvTestCase):
     def ingest(self, **kw):
         svc = self.services()
