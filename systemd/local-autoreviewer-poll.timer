@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll GitHub for PR updates every 2 minutes
+Documentation=file:///usr/share/doc/local-autoreviewer/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

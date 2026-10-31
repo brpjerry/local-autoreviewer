@@ -1,0 +1,39 @@
+# local-autoreviewer configuration: ~/.config/local-autoreviewer/config.toml
+# The GitHub token lives separately in ~/.config/local-autoreviewer/github-token (mode 0600):
+# a fine-grained PAT for the repos below with Metadata: read, Contents: read, Pull requests: read/write.
+# Changes are picked up by the worker without a restart.
+
+[service]
+paused = false             # stop claiming new reviews (running ones finish)
+review_timeout = "20m"     # per review; the agent's process tree is killed after this
+settle = "3m"              # wait after the last push, so a burst of pushes yields one review
+max_reviews_per_day = 30   # per agent; protects your interactive subscription budget
+bootstrap = "baseline"     # "baseline": a newly added repo's existing PRs are not reviewed; "review": they are
+retain_jobs = "14d"        # job checkouts are kept this long for `resume` / `ask`
+# max_attempts = 3
+
+[defaults]                 # every [[repo]] inherits these and may override any of them
+agents = ["claude", "codex"]
+authors = ["@token-owner"] # "@token-owner" = the GitHub account the token belongs to
+project_docs = true        # give the agent the base branch's CLAUDE.md/AGENTS.md as reference
+max_changed_files = 300
+max_diff_bytes = 1_500_000
+# diff_exclude = ["**/*.lock", "**/package-lock.json", "**/dist/**"]   # left out of pr.diff
+post = true                # false: write reviews to the state dir only
+# extra_instructions = ""
+
+[agents.claude]
+model = "opus"
+effort = "high"
+# memory_max = "3G"
+
+[agents.codex]
+model = ""                 # empty: codex's default model
+effort = ""                # e.g. "high"; empty: codex's default
+mode = "shell"             # "inline": no shell tool; the diff and changed files are put in the prompt
+# memory_max = "3G"
+
+[[repo]]
+name = "your-user/your-scratch-repo"
+# agents = ["claude"]
+# extra_instructions = "This repo targets Python 3.12; prefer the stdlib."

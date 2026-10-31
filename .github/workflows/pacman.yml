@@ -1,0 +1,43 @@
+name: Pacman package
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      tag:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Git for a full checkout
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Build, test, install and check the package
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          bash packaging/arch/build.sh dist "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: local-autoreviewer-pacman
+          path: |
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS
+          if-no-files-found: error

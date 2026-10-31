@@ -1,0 +1,9 @@
+[Unit]
+Description=local-autoreviewer agents and services
+Documentation=file:///usr/share/doc/local-autoreviewer/README.md
+
+[Slice]
+# Shared ceiling for the worker, the poller and every review scope; interactive work wins.
+MemoryMax=6G
+CPUWeight=50
+IOWeight=50

@@ -1,0 +1,16 @@
+[project]
+name = "local-autoreviewer"
+version = "0.1.0"
+description = "Review your GitHub pull requests with local Claude Code and Codex sessions"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# Standard library only. Distributed as an Arch package (packaging/arch); see README.md.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/brpjerry/local-autoreviewer"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,14 @@
+[Unit]
+Description=local-autoreviewer: poll GitHub for PR updates
+Documentation=file:///usr/share/doc/local-autoreviewer/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/local-autoreviewer poll
+Slice=autoreviewer.slice
+StateDirectory=local-autoreviewer
+StateDirectoryMode=0700
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+UMask=0077

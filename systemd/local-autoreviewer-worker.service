@@ -1,0 +1,23 @@
+[Unit]
+Description=local-autoreviewer review worker
+Documentation=file:///usr/share/doc/local-autoreviewer/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/local-autoreviewer worker
+Slice=autoreviewer.slice
+StateDirectory=local-autoreviewer
+StateDirectoryMode=0700
+Environment=PYTHONUNBUFFERED=1
+# The worker exits on its own after a package upgrade (once idle); come back on the new code.
+Restart=always
+RestartSec=5
+# Running reviews are cancelled and requeued on stop.
+KillMode=mixed
+TimeoutStopSec=120
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

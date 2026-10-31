@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  pacman:
+    uses: ./.github/workflows/pacman.yml
+    with:
+      ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+
+  publish:
+    needs: [pacman]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: local-autoreviewer-pacman
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_file="release-notes/$TAG.md"
+          test -f "$notes_file" || { echo "Missing release notes: $notes_file" >&2; exit 1; }
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "local-autoreviewer $TAG" \
+            --generate-notes \
+            --notes-file "$notes_file" \
+            dist/*.pkg.tar.zst dist/SHA256SUMS

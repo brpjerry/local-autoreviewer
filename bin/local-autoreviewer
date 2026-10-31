@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Launcher: run from a checkout (./src) or from the package (/usr/lib/local-autoreviewer)."""
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_src = os.path.join(os.path.dirname(_here), "src")
+sys.path.insert(0, _src if os.path.isdir(os.path.join(_src, "local_autoreviewer"))
+                else "/usr/lib/local-autoreviewer")
+
+from local_autoreviewer.__main__ import main  # noqa: E402
+
+sys.exit(main())

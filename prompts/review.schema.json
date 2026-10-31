@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "test_gaps", "questions", "nits"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "2-6 sentences: what the PR does, overall assessment, and the most important risks."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Substantive problems, most severe first. Empty if none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "file", "line", "title", "detail", "suggestion"],
+        "properties": {
+          "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+          "category": {
+            "type": "string",
+            "enum": ["correctness", "security", "performance", "design", "tests", "readability", "docs", "other"]
+          },
+          "file": {"type": "string", "description": "Repository-relative path, or empty if not file-specific."},
+          "line": {"type": "integer", "description": "Line in the new version of the file, or 0 if not applicable."},
+          "title": {"type": "string", "description": "One-line statement of the problem."},
+          "detail": {"type": "string", "description": "Why it is a problem, with the concrete failure scenario."},
+          "suggestion": {"type": "string", "description": "How to fix it, or empty."}
+        }
+      }
+    },
+    "test_gaps": {
+      "type": "array",
+      "description": "Behaviour introduced or changed by the PR that no test covers.",
+      "items": {"type": "string"}
+    },
+    "questions": {
+      "type": "array",
+      "description": "Things the author should clarify; not defects.",
+      "items": {"type": "string"}
+    },
+    "nits": {
+      "type": "array",
+      "description": "Minor style/readability points, at most 15.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "text"],
+        "properties": {
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "text": {"type": "string"}
+        }
+      }
+    }
+  }
+}
