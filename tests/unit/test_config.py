@@ -12,7 +12,7 @@ class ConfigTests(unittest.TestCase):
         repo = cfg.repo("YOUR-USER/your-scratch-repo")
         self.assertEqual(repo.agents, ("claude", "codex"))
         self.assertEqual(repo.authors, ("@token-owner",))
-        self.assertEqual(cfg.service.review_timeout, 1200)
+        self.assertEqual(cfg.service.review_timeout, 2400)
         self.assertEqual(cfg.service.retain_jobs, 14 * 86400)
         self.assertEqual(cfg.agents["claude"].model, "opus")
 

@@ -5,7 +5,7 @@
 
 [service]
 paused = false             # stop claiming new reviews (running ones finish)
-review_timeout = "20m"     # per review; the agent's process tree is killed after this
+review_timeout = "40m"     # per review; the agent's process tree is killed after this
 settle = "3m"              # wait after the last push, so a burst of pushes yields one review
 max_reviews_per_day = 30   # per agent; protects your interactive subscription budget
 bootstrap = "baseline"     # "baseline": a newly added repo's existing PRs are not reviewed; "review": they are
