@@ -358,6 +358,7 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="local-autoreviewer",
                                      description="Review your GitHub PRs with local Claude Code / Codex sessions.")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {paths.read_version()}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("poll", help="poll configured repos once and queue reviews")
