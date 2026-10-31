@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import fcntl
+import sqlite3
+import threading
 import unittest
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
@@ -33,6 +36,105 @@ class PollTests(EnvTestCase):
             return [dict(r) for r in conn.execute(sql, where[1:])]
         finally:
             conn.close()
+
+    def test_github_is_called_without_holding_the_write_lock(self):
+        probes = []
+
+        def probe(call):
+            def wrapped(*args, **kwargs):
+                # Fails at once with "database is locked" if the poller holds the write lock.
+                other = sqlite3.connect(self.state / "state.sqlite3", timeout=0, isolation_level=None)
+                try:
+                    other.execute("BEGIN IMMEDIATE")
+                    other.execute("ROLLBACK")
+                finally:
+                    other.close()
+                probes.append(call.__name__)
+                return call(*args, **kwargs)
+            return wrapped
+
+        self.github.set_pr(1, "a" * 40)
+        self.poll()
+        self.github.set_pr(1, "a" * 40, state="CLOSED")  # gone from the open list: poll confirms with pr_view
+        self.github.list_open_prs = probe(self.github.list_open_prs)
+        self.github.pr_view = probe(self.github.pr_view)
+        self.assertEqual(self.poll(), [(1, "closed")])
+        self.assertEqual(probes, ["list_open_prs", "pr_view"])
+
+    def test_polls_run_one_at_a_time(self):
+        self.github.set_pr(1, "a" * 40)
+        started, result = threading.Event(), {}
+        listing = self.github.list_open_prs
+
+        def list_open_prs(repo, limit=500):
+            started.set()
+            return listing(repo, limit)
+
+        self.github.list_open_prs = list_open_prs
+        with poll_mod.poll_lock(self.state):  # another poll is running
+            thread = threading.Thread(target=lambda: result.setdefault("r", poll_mod.poll(self.svc)))
+            thread.start()
+            self.assertFalse(started.wait(0.3))
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(started.is_set())
+        self.assertEqual(result["r"][1], 0)
+
+    def test_enqueue_waits_for_a_running_poll(self):
+        import argparse
+        from unittest import mock
+        from local_autoreviewer import __main__ as cli
+        self.github.set_pr(1, "a" * 40)
+        started, result = threading.Event(), {}
+        view = self.github.pr_view
+
+        def pr_view(repo, number):
+            started.set()
+            return view(repo, number)
+
+        self.github.pr_view = pr_view
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=None, force=False)
+        with mock.patch.object(cli, "load_config", return_value=self.svc.config), \
+                mock.patch.object(cli, "build_services", return_value=self.svc):
+            with poll_mod.poll_lock(self.state):  # a poll is between its fetch and its apply
+                thread = threading.Thread(target=lambda: result.setdefault("r", cli.cmd_enqueue(args)))
+                thread.start()
+                self.assertFalse(started.wait(0.3))
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["r"], 0)
+        self.assertEqual(len(self.jobs("status='queued'")), 2)
+
+    def test_a_failed_fetch_changes_nothing_and_releases_the_lock(self):
+        from local_autoreviewer.github import GitHubError
+        self.github.set_pr(1, "a" * 40)
+        self.poll()
+        self.github.set_pr(1, "a" * 40, state="CLOSED")
+        real_view = self.github.pr_view
+
+        def failing_view(repo, number):
+            raise GitHubError("HTTP 502")
+
+        self.github.pr_view = failing_view
+        results, failures = poll_mod.poll(self.svc)
+        self.assertEqual((results, failures), ({}, 1))
+        self.assertEqual(len(self.jobs("status='queued'")), 2)  # the open PR's jobs are untouched
+        with open(self.state / "poll.lock") as handle:  # raises BlockingIOError if still held
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.github.pr_view = real_view
+        self.assertEqual(self.poll(), [(1, "closed")])
+
+    def test_an_unconfirmed_open_pr_is_left_for_the_next_poll(self):
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                         " head_changed_at, last_seen_at) VALUES (?, 5, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                         (REPO, "c" * 40, OWNER))
+            produced = poll_mod.poll_repo(conn, self.svc, self.svc.config.repo(REPO), self.clock(),
+                                          prs=[], gone={})
+            state = conn.execute("SELECT state FROM prs WHERE number=5").fetchone()[0]
+        conn.close()
+        self.assertEqual((produced, state), ([], "open"))
 
     def test_lifecycle(self):
         self.github.set_pr(1, "a" * 40)
