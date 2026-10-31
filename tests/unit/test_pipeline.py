@@ -369,12 +369,7 @@ class PipelineTests(EnvTestCase):
         self.assertLess(sum(waits), pipeline.POST_RECOVERY_RETRY)
 
     def test_a_cancelled_review_post_hands_the_head_back_to_the_service(self):
-        conn = self.services().connect()
-        with db.transaction(conn):  # the poller has seen this head
-            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
-                         " head_changed_at, last_seen_at) VALUES (?, 1, 'open', 0, ?, 'main', ?, '', 0, 0)",
-                         (REPO, self.head, OWNER))
-        conn.close()
+        self.seen_by_poller(self.head)
         svc, (job_id,) = self.foreground(post=True)
         event = events.PrEvent(repo=REPO, number=1, action="synchronize", head_sha=self.head, base_ref="main",
                                is_draft=False, author=OWNER, source="poll", agents=("claude",))
@@ -388,6 +383,49 @@ class PipelineTests(EnvTestCase):
         conn.close()
         self.assertEqual([(j["source"], j["status"]) for j in jobs],
                          [(db.FOREGROUND, "cancelled"), ("poll", "queued")])
+
+    def seen_by_poller(self, head):
+        conn = self.services().connect()
+        with db.transaction(conn):
+            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                         " head_changed_at, last_seen_at) VALUES (?, 1, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                         (REPO, head, OWNER))
+        conn.close()
+
+    def add_job(self, svc, head, source, status, post=True):
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref="main", agent="claude",
+                                   model="", source=source, not_before=0, now=self.clock(), post=post,
+                                   rerun=db.next_rerun(conn, REPO, 1, head, "main", "claude"))
+            db.update_job(conn, job_id, status=status)
+        conn.close()
+        return job_id
+
+    def test_hand_back_leaves_other_jobs_alone(self):
+        self.seen_by_poller(self.head)  # the poller hasn't seen the newer push yet
+        svc, (old,) = self.foreground(post=True)
+        newer = self.add_job(svc, "b" * 40, db.FOREGROUND, "running")  # a `review --post` of the new head
+        pipeline.abandon(svc, [old], "foreground review ended before the job finished")
+        self.assertEqual((self.job(svc, newer)["status"], self.job(svc, newer)["cancel_requested"]), ("running", 0))
+
+    def test_hand_back_does_not_duplicate_a_service_review(self):
+        self.seen_by_poller(self.head)
+        svc = self.services()
+        for status in ("queued", "posted"):
+            with self.subTest(status=status):
+                service = self.add_job(svc, self.head, "poll", status)
+                cancelled = self.add_job(svc, self.head, db.FOREGROUND, "running")
+                pipeline.abandon(svc, [cancelled], "foreground review ended before the job finished")
+                conn = svc.connect()
+                active = conn.execute("SELECT COUNT(*) FROM jobs WHERE source='poll' AND status IN"
+                                      " ('queued', 'posted') AND id!=?", (service,)).fetchone()[0]
+                conn.close()
+                self.assertEqual(active, 0)
+                conn = svc.connect()
+                with db.transaction(conn):
+                    db.update_job(conn, service, status="superseded")  # out of the next subtest's way
+                conn.close()
 
     def test_review_command_reports_its_jobs(self):
         from local_autoreviewer import __main__ as cli

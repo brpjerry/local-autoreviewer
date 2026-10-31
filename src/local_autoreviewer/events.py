@@ -60,15 +60,32 @@ def stop_jobs(conn, repo, number, status, reason, *, agent=None, keep=None):
 def requeue_for_service(conn, cfg, job, *, now, token_owner):
     """Queue the review the poller would have queued for a cancelled `review --post` job's head:
     while that job was active it counted as the head's review, so a poll that saw the head skipped
-    it. Does nothing if the poller hasn't seen this head (its next poll will). Returns new job ids."""
+    it. Only that one job is added, under the poller's rules, and only if no other job already covers
+    the head; nothing else is superseded. Does nothing if the poller hasn't seen the head, since its
+    next poll will. Returns the new job id or None."""
+    repo_cfg = cfg.repo(job["repo"])
     row = conn.execute("SELECT * FROM prs WHERE repo=? AND number=? AND state='open'",
                        (job["repo"], job["number"])).fetchone()
-    if row is None or (row["head_sha"], row["base_ref"]) != (job["head_sha"], job["base_ref"]):
-        return []
-    event = PrEvent(repo=job["repo"], number=job["number"], action="synchronize", head_sha=row["head_sha"],
-                    base_ref=row["base_ref"], is_draft=bool(row["is_draft"]), author=row["author"], source="poll",
-                    head_changed_at=row["head_changed_at"], agents=(job["agent"],))
-    return ingest(conn, cfg, event, now=now, token_owner=token_owner)
+    if (repo_cfg is None or job["agent"] not in repo_cfg.agents or row is None or row["is_draft"]
+            or (row["head_sha"], row["base_ref"]) != (job["head_sha"], job["base_ref"])
+            or not author_allowed(repo_cfg, row["author"], token_owner)):
+        return None
+    covered = conn.execute(
+        "SELECT 1 FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=? AND id!=?"
+        f" AND NOT {db.TRIAL_SQL} AND status NOT IN ('cancelled', 'superseded')",
+        (job["repo"], job["number"], job["head_sha"], job["base_ref"], job["agent"], job["id"],
+         db.FOREGROUND)).fetchone()
+    if covered:
+        return None
+    job_id = db.insert_job(
+        conn, repo=job["repo"], number=job["number"], head_sha=job["head_sha"], base_ref=job["base_ref"],
+        agent=job["agent"], model=cfg.agents[job["agent"]].model, source="poll",
+        not_before=max(now, row["head_changed_at"] + cfg.service.settle), now=now, post=repo_cfg.post,
+        rerun=db.next_rerun(conn, job["repo"], job["number"], job["head_sha"], job["base_ref"], job["agent"]))
+    if job_id:
+        log.info("queued job %s: %s#%s @%s %s (in place of cancelled job %s)", job_id, job["repo"], job["number"],
+                 job["head_sha"][:12], job["agent"], job["id"])
+    return job_id
 
 
 def ingest(conn, cfg, event, *, now, token_owner):

@@ -59,14 +59,15 @@ def housekeeping(svc):
 
 
 def _remove_stale_locks(conn, svc):
-    """Delete lock files left by a `review` killed after its jobs finished (active jobs' locks are the
-    worker's business). A lock still held by a live process is kept."""
+    """Delete lock files left by a `review` killed after its jobs finished. Only finished jobs': an
+    active job's lock is the worker's business, and a lock with no job row may belong to a `review`
+    that is creating that job right now (it takes the lock before the row commits)."""
     for path in (Path(svc.state) / "locks").glob("job-*.lock"):
         try:
             job_id = int(path.stem.removeprefix("job-"))
         except ValueError:
             continue
         job = db.get_job(conn, job_id)
-        if job is None or job["status"] not in db.ACTIVE:
+        if job is not None and job["status"] not in db.ACTIVE:
             with pipeline.orphaned_foreground(svc.state, job_id):
                 pass  # removes the file if nobody holds it

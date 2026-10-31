@@ -251,9 +251,11 @@ class HousekeepingTests(EnvTestCase):
         pipeline.foreground_lock_path(self.state, finished).touch()  # left by a killed `review`
         held = pipeline.hold_foreground_lock(self.state, active)
         self.addCleanup(held.close)
+        pipeline.foreground_lock_path(self.state, 99).touch()  # a `review` creating job 99 right now
         maintenance.housekeeping(svc)
         self.assertFalse(pipeline.foreground_lock_path(self.state, finished).exists())
         self.assertTrue(pipeline.foreground_lock_path(self.state, active).exists())
+        self.assertTrue(pipeline.foreground_lock_path(self.state, 99).exists())
 
 
 class ManualIngestTests(EnvTestCase):
