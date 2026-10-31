@@ -13,7 +13,8 @@ import time
 
 REVIEW = {
     "summary": "Adds a divide helper; one real bug.",
-    "findings": [{"severity": "major", "category": "correctness", "file": "src/calc.py", "line": 2,
+    "findings": [{"severity": "major", "impact": 6, "likelihood": "common", "trigger": "Any caller passes b=0.",
+                  "category": "correctness", "file": "src/calc.py", "line": 2,
                   "title": "Division by zero is unhandled", "detail": "divide(1, 0) raises ZeroDivisionError.",
                   "suggestion": "Check b == 0 and raise ValueError."}],
     "test_gaps": ["No test for b == 0."],

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Prompt assembly, structured-review validation and Markdown rendering."""
 
+import hashlib
 import json
 import re
 from string import Template
@@ -12,6 +13,7 @@ MAX_BODY = 65_536
 MAX_FIELD = 6_000
 MAX_NITS = 15
 SEVERITIES = ("blocker", "major", "minor")
+LIKELIHOODS = ("common", "occasional", "rare")
 AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 _MENTION_RE = re.compile(r"(?<![\w`/.@])@(?=[A-Za-z0-9][A-Za-z0-9-]*)")
 _HTML_COMMENT_RE = re.compile(r"<!--|-->")
@@ -28,6 +30,14 @@ def schema_path():
 
 def schema_text():
     return json.dumps(json.loads(schema_path().read_text()), separators=(",", ":"))
+
+
+def prompt_version():
+    """Short hash of the prompt template and schema, recorded with each review."""
+    digest = hashlib.sha256()
+    for path in (paths.prompts_dir() / "review.md", schema_path()):
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, context, agent_note="",
@@ -60,6 +70,10 @@ def validate(review):
         severity = item.get("severity") if item.get("severity") in SEVERITIES else "minor"
         findings.append({
             "severity": severity,
+            # Reviews from before the calibrated schema have no impact, likelihood or trigger.
+            "impact": _impact(item.get("impact")),
+            "likelihood": item.get("likelihood") if item.get("likelihood") in LIKELIHOODS else "",
+            "trigger": str(item.get("trigger") or ""),
             "category": str(item.get("category") or "other"),
             "file": str(item.get("file") or ""),
             "line": _int(item.get("line")),
@@ -69,6 +83,8 @@ def validate(review):
         })
     nits = [{"file": str(n.get("file") or ""), "line": _int(n.get("line")), "text": str(n.get("text") or "")}
             for n in (review.get("nits") or []) if isinstance(n, dict) and n.get("text")]
+    # In render order (by severity, stable), so a finding's position matches its number in the review.
+    findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
     return {
         "summary": summary,
         "findings": findings,
@@ -83,6 +99,15 @@ def _int(value):
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _impact(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        return min(10, max(0, int(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def clean(text, limit=MAX_FIELD):
@@ -140,8 +165,15 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
                 line = f"{counter}. **{clean(item['title'], 500)}**"
                 if where:
                     line += f" — {where}"
-                line += f" _({clean(item['category'], 40)})_"
+                rating = [clean(item["category"], 40)]
+                if item.get("impact") is not None:
+                    rating.append(f"impact {item['impact']}/10")
+                if item.get("likelihood"):
+                    rating.append(item["likelihood"])
+                line += f" _({', '.join(rating)})_"
                 findings.append(line)
+                if item.get("trigger"):
+                    findings.append("   **When:** " + clean(item["trigger"], 2000).replace("\n", "\n   "))
                 if item["detail"]:
                     findings.append("   " + clean(item["detail"]).replace("\n", "\n   "))
                 if item["suggestion"]:

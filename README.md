@@ -84,13 +84,24 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | `local-autoreviewer resume <job>` | Continue the review's agent session interactively, in its checkout |
 | `local-autoreviewer ask <job> "why is X a problem?"` | Send one follow-up question to the review session |
 | `local-autoreviewer poll --dry-run` | Show which events the next poll would produce |
+| `local-autoreviewer findings [owner/repo#N] [--untriaged] [--json]` | List what reviews reported; `--json` exports it with each review's metadata |
+| `local-autoreviewer triage ID… [--impact 0-10] [--disposition fixed\|declined\|…] [--commit SHA] [--note …]` | Record what was done about findings |
 | `journalctl --user -u local-autoreviewer-worker -f` | Watch the worker |
 
 - **Foreground reviews.** `review` waits out retries of up to 5 minutes and cancels a job that would wait longer, such as one hitting a usage limit. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit. With `--post`, a post interrupted by Ctrl-C is finished by the worker, and a run cancelled before its review is ready lets the service review that commit as it otherwise would have.
 - **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish, including posts that were interrupted or failed.
 - **Daily cap.** `max_reviews_per_day` limits reviews per agent, which protects your interactive budget. Usage-limit errors defer the job for 30 minutes without using up a retry.
 - **Resuming.** `resume` opens a normal interactive session with your full config. Run it in any terminal or multiplexer pane. Changes made there land in the review checkout, not your own clone.
-- **Retention.** Job checkouts are kept for `retain_jobs` (14 days by default). After that, `resume` recreates the checkout as long as the commit can still be fetched.
+- **Retention.** Job checkouts are kept for `retain_jobs` (14 days by default); the review output and the recorded review data stay. After that, `resume` recreates the checkout as long as the commit can still be fetched.
+
+## Review data
+
+Every review that passes the credential scan is also recorded in the state database, so you can see over time what the reviewers find and what is worth acting on:
+- **Per review:** the agent, model, effort, a hash of the prompt and schema, and the summary.
+- **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen).
+- **Afterwards:** `triage` records your own impact rating, what was done (`fixed`, `declined`, `false-positive`, `duplicate`, `deferred`), the fixing commit and a note.
+
+`findings --json` exports everything, including the job's commit, so the rounds of review on a PR can be reconstructed. Housekeeping also records reviews saved before this existed, and an expired job loses its checkout but keeps its `out/` directory.
 
 ## What protects what
 
@@ -131,7 +142,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.config/local-autoreviewer/github-token` | Fine-grained token (0600) |
 | `~/.local/state/local-autoreviewer/state.sqlite3` | PR snapshots, events, jobs |
 | `~/.local/state/local-autoreviewer/status.json` | Snapshot written by the worker |
-| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout, `context/` (pr.diff, pr.json, …), `out/` (agent output, review.md) |
+| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md), kept |
 | `~/.local/state/local-autoreviewer/mirrors/` | One bare mirror per repo |
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |

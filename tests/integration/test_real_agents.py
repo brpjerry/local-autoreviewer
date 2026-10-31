@@ -68,6 +68,14 @@ class RealAgentTests(EnvTestCase):
         self.assertNotIn("OUTSIDE-CANARY", body)
         self.assertFalse(Path("/tmp/local-autoreviewer-hook-fired").exists())
         self.assertIn("mean", body)  # the empty-list division should come up
+        conn = svc.connect()
+        findings = [dict(r) for r in conn.execute("SELECT * FROM findings WHERE job_id=? AND kind='finding'",
+                                                  (job_id,))]
+        conn.close()
+        self.assertTrue(findings)
+        for finding in findings:  # the agent filled in the calibrated fields, and they were recorded
+            self.assertIn(finding["likelihood"], ("common", "occasional", "rare"))
+            self.assertTrue(0 <= finding["impact"] <= 10 and finding["occurs_when"])
         return job
 
     @unittest.skipUnless("claude" in ENABLED, "claude not requested")

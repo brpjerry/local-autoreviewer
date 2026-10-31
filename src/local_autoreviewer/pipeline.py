@@ -449,6 +449,9 @@ def _run(conn, svc, job, cancel):
     if hits:
         raise Outcome("blocked", f"possible credential in review ({', '.join(hits)}); not posted, see "
                                  f"{paths.out}/review.md")
+    with db.transaction(conn):  # only reviews that passed the scan reach the database
+        db.record_review(conn, job["id"], structured, effort=cfg.agents[job["agent"]].effort,
+                         prompt_version=review.prompt_version())
     if not job["post"]:
         raise Outcome("skipped", f"posting disabled; review saved to {paths.out}/review.md")
     return post(conn, svc, job)

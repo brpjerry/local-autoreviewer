@@ -47,6 +47,30 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(data["findings"][2]["severity"], "minor")
         self.assertEqual(data["findings"][2]["line"], 7)
 
+    def test_calibration_fields(self):
+        base = {"severity": "minor", "category": "correctness", "file": "", "line": 0, "title": "t",
+                "detail": "", "suggestion": ""}
+        items = [dict(base, impact=15, likelihood="rare", trigger="a narrow race"), dict(base, impact=-2),
+                 dict(base, impact="x", likelihood="sometimes"), dict(base, impact=True)]
+        findings = review.validate({"summary": "s", "findings": items})["findings"]
+        self.assertEqual([(f["impact"], f["likelihood"], f["trigger"]) for f in findings],
+                         [(10, "rare", "a narrow race"), (0, "", ""), (None, "", ""), (None, "", "")])
+
+    def test_findings_are_kept_in_render_order(self):
+        data = review.validate(SAMPLE)
+        self.assertEqual([f["severity"] for f in data["findings"]], ["blocker", "minor", "minor"])
+        self.assertIn("1. **SQL injection**", self.render())  # position 0 is finding 1 in the review
+
+    def test_render_shows_impact_and_trigger(self):
+        finding = dict(SAMPLE["findings"][1], impact=9, likelihood="common", trigger="Any search with a quote.")
+        body = self.render(dict(SAMPLE, findings=[finding]))
+        self.assertIn("_(security, impact 9/10, common)_", body)
+        self.assertIn("**When:** Any search with a quote.", body)
+
+    def test_prompt_version(self):
+        self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")
+        self.assertEqual(review.prompt_version(), review.prompt_version())
+
     def test_clean_review(self):
         body = self.render({"summary": "All good.", "findings": [], "test_gaps": [], "questions": [], "nits": []})
         self.assertIn("No significant issues found.", body)

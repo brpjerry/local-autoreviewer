@@ -13,9 +13,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "category", "file", "line", "title", "detail", "suggestion"],
+        "required": ["severity", "impact", "likelihood", "trigger", "category", "file", "line", "title", "detail",
+                     "suggestion"],
         "properties": {
           "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+          "impact": {
+            "type": "integer",
+            "description": "0-10: 0 = matters only for something like a cosmic-ray bit flip, 10 = the app would not work at all."
+          },
+          "likelihood": {"type": "string", "enum": ["common", "occasional", "rare"]},
+          "trigger": {"type": "string", "description": "What has to happen for the problem to occur."},
           "category": {
             "type": "string",
             "enum": ["correctness", "security", "performance", "design", "tests", "readability", "docs", "other"]

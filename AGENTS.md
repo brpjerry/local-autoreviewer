@@ -15,6 +15,7 @@
 - The GitHub token may appear only in the `gh`/`git` subprocess environment (`github.gh_env`). It must never reach an agent, argv or a log line.
 - When you change agent CLI flags, re-verify against the installed CLIs, update `docs/agent-cli-notes.md` and the `REQUIRED_FLAGS` that `doctor` checks.
 - The SQLite schema only grows: add a migration to `db.MIGRATIONS` and never edit an existing one. Rolling back relies on older builds tolerating newer columns.
+- The review schema (`prompts/review.schema.json`) only grows too. `review.validate()` must keep accepting reviews in the older shapes, because housekeeping records saved `review.json` files from before review data was kept. Both CLIs need every property listed in `required`.
 - systemd slice names must not contain dashes, because dashes mean nesting. That is why the slice is `autoreviewer.slice`.
 - Releases: bump `version` in `pyproject.toml`, add `release-notes/vX.Y.Z.md`, then push the tag `vX.Y.Z`. `.github/workflows/release.yml` builds and checks the pacman package and attaches it, with `SHA256SUMS`, to the GitHub release.
 - New source files start with `# SPDX-License-Identifier: GPL-3.0-or-later`.
