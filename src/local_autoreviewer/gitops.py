@@ -180,6 +180,16 @@ class Git:
     def has_commit(self, mirror, sha):
         return self.run(["-C", str(mirror), "cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode == 0
 
+    def contains(self, mirror, sha, other_sha):
+        """Whether everything other_sha has is already in sha: merging it in would change nothing. That is
+        so for an ancestor, and also for a branch merged by squash, which isn't one. False if other_sha
+        isn't in the mirror."""
+        m = str(mirror)
+        merged = self.run(["-C", m, "merge-tree", "--write-tree", sha, other_sha], check=False)
+        if merged.returncode != 0:  # a conflict, or other_sha is missing
+            return False
+        return merged.stdout.split()[0] == self.out(["-C", m, "rev-parse", f"{sha}^{{tree}}"])
+
     def since_review_start(self, mirror, previous_sha, head_sha, base_sha):
         """What to compare head_sha with to see only the PR's own changes since previous_sha. If the PR has
         merged (or been rebased onto) newer base commits since, that is previous_sha with those base commits
