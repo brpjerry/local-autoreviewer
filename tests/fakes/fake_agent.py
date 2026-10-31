@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 REVIEW = {
     "summary": "Adds a divide helper; one real bug.",
@@ -28,6 +29,18 @@ REVIEW = {
 }
 
 
+def followup(context):
+    """A follow-up answer: the first previous finding fixed, the rest not, and one regression."""
+    previous = json.loads((context / "previous-findings.json").read_text())
+    regression = dict(REVIEW["findings"][0], title="The fix dropped the docstring", severity="minor", impact=2,
+                      likelihood="common", edits=[{"file": "src/calc.py", "start_line": 1, "end_line": 1,
+                                                    "replacement": "def divide(a, b):\n    \"\"\"Divide.\"\"\""}])
+    return {"summary": f"{len(previous)} previous finding(s) checked.",
+            "resolutions": [{"finding": item["id"], "status": "fixed" if n == 0 else "not_fixed",
+                             "detail": "checked"} for n, item in enumerate(previous)],
+            "regressions": [regression]}
+
+
 def value_after(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
@@ -43,6 +56,8 @@ def main():
                                  "prompt": prompt, "pid": os.getpid()}) + "\n")
     codex = "exec" in argv
     review = dict(REVIEW)
+    if "This is a follow-up, not a new review." in prompt:
+        review = followup(Path(os.getcwd()).parent / "context")
     if mode == "sleep":
         time.sleep(60)
     if mode == "fail":

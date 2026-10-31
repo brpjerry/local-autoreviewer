@@ -373,6 +373,51 @@ def _cancelled(conn, svc, job, cancel):
     return _finish(conn, svc, job["id"], status, current["reason"] or reason)
 
 
+@dataclass
+class PreviousRound:
+    """The round of reviews a follow-up checks: its head, and the issues still open after it."""
+    head_sha: str
+    findings: list  # finding rows with the reviewing agent
+
+    def for_agent(self):
+        """The findings as the follow-up agent sees them (previous-findings.json)."""
+        return [{"id": f["id"], "reviewer": f["agent"], "severity": f["severity"], "impact": f["impact"],
+                 "title": f["title"], "file": f["file"], "line": f["line"], "trigger": f["occurs_when"],
+                 "detail": f["detail"], "suggestion": f["suggestion"],
+                 "proposed_edits": [{k: e[k] for k in ("file", "start_line", "end_line", "replacement")}
+                                    for e in json.loads(f["edits"] or "[]")]}
+                for f in self.findings]
+
+
+def previous_round(conn, job):
+    """The latest earlier round of reviews of this PR on the same base, or None for a full review. A full
+    round's open issues are its findings; a follow-up round's are its regressions plus the findings it
+    found not, or only partly, fixed. No-post trials don't count as rounds."""
+    scope = (f"repo=? AND number=? AND base_ref=? AND review_recorded=1 AND status IN ('posted', 'skipped')"
+             f" AND NOT {db.TRIAL_SQL}")
+    args = (job["repo"], job["number"], job["base_ref"])
+    row = conn.execute(f"SELECT head_sha FROM jobs WHERE {scope} AND head_sha!=? ORDER BY finished_at DESC, id DESC"
+                       " LIMIT 1", (*args, db.FOREGROUND, job["head_sha"])).fetchone()
+    if row is None:
+        return None
+    ids = set()
+    for previous in conn.execute(f"SELECT id, review_kind FROM jobs WHERE {scope} AND head_sha=?",
+                                 (*args, db.FOREGROUND, row["head_sha"])).fetchall():
+        if previous["review_kind"] == "followup":
+            ids.update(r[0] for r in conn.execute(
+                "SELECT id FROM findings WHERE job_id=? AND kind='regression'", (previous["id"],)))
+            ids.update(r[0] for r in conn.execute(
+                "SELECT finding_id FROM resolutions WHERE job_id=? AND status IN ('not_fixed', 'partly_fixed')",
+                (previous["id"],)))
+        else:
+            ids.update(r[0] for r in conn.execute(
+                "SELECT id FROM findings WHERE job_id=? AND kind='finding'", (previous["id"],)))
+    findings = [dict(r) for r in conn.execute(
+        f"SELECT f.*, j.agent FROM findings f JOIN jobs j ON j.id=f.job_id WHERE f.id IN ({','.join('?' * len(ids))})"
+        " ORDER BY f.id", sorted(ids))] if ids else []
+    return PreviousRound(row["head_sha"], findings)
+
+
 def _run(conn, svc, job, cancel):
     cfg = svc.config
     repo_cfg = cfg.repo(job["repo"])
@@ -397,6 +442,14 @@ def _run(conn, svc, job, cancel):
             pr={"repo": job["repo"], "number": job["number"], "title": pr.get("title", ""),
                 "author": (pr.get("author") or {}).get("login", ""), "url": pr.get("url", ""),
                 "body": pr.get("body", ""), "base_ref": pr["baseRefName"]})
+        previous = previous_round(conn, job)
+        if previous and not svc.git.has_commit(mirror, previous.head_sha):
+            log.info("job %s: previous head %s is gone from the mirror; doing a full review", job["id"],
+                     previous.head_sha[:12])
+            previous = None
+        if previous:
+            svc.git.write_followup_context(mirror, previous.head_sha, job["head_sha"], paths.context,
+                                           exclude=repo_cfg.diff_exclude, previous=previous.for_agent())
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))
     with db.transaction(conn):
@@ -417,15 +470,23 @@ def _run(conn, svc, job, cancel):
     unit = scope_unit(job["id"])
     with db.transaction(conn):
         db.update_job(conn, job["id"], session_id=session_id, scope_unit=unit)
-    prompt = review.build_prompt(
+    fields = dict(
         repo=job["repo"], number=job["number"], title=pr.get("title", ""),
         author=(pr.get("author") or {}).get("login", ""), base_ref=pr["baseRefName"], head_sha=job["head_sha"],
         worktree=paths.worktree, context=paths.context, agent_note=agent.agent_note(),
         extra_instructions=repo_cfg.extra_instructions,
         project_docs=repo_cfg.project_docs and Path(paths.context, "project-docs").is_dir())
-    invocation = agent.invocation(unit=unit, paths=paths, prompt=prompt, session_id=session_id)
-    log.info("job %s: running %s on %s#%s @%s", job["id"], job["agent"], job["repo"], job["number"],
-             job["head_sha"][:12])
+    schema = None
+    if previous:
+        prompt = review.build_followup_prompt(previous_sha=previous.head_sha, previous_count=len(previous.findings),
+                                              **fields)
+        schema = Path(paths.context, "followup.schema.json")
+        schema.write_text(json.dumps(review.followup_schema()))
+    else:
+        prompt = review.build_prompt(**fields)
+    invocation = agent.invocation(unit=unit, paths=paths, prompt=prompt, session_id=session_id, schema=schema)
+    log.info("job %s: running %s on %s#%s @%s%s", job["id"], job["agent"], job["repo"], job["number"],
+             job["head_sha"][:12], f" (follow-up of {previous.head_sha[:12]})" if previous else "")
     run = svc.runner.run(invocation, timeout=cfg.service.review_timeout, should_cancel=cancel)
     if run.cancelled:
         return _cancelled(conn, svc, job, cancel)
@@ -440,11 +501,21 @@ def _run(conn, svc, job, cancel):
     if result.error_kind:
         return _retry(conn, svc, job, result.error or "agent failed")
 
-    structured = review.validate(result.review)
+    if previous:
+        structured = review.validate_followup(result.review, {f["id"] for f in previous.findings})
+    else:
+        structured = review.validate(result.review)
+    # Inline suggestions must fall within the PR's diff against its base, also for a follow-up.
     hunks = suggestions.diff_hunks(Path(paths.context, "pr.diff").read_text(errors="replace"))
     structured = suggestions.apply(structured, worktree=paths.worktree, hunks=hunks, test_paths=repo_cfg.test_paths)
-    body = review.render(structured, repo=job["repo"], number=job["number"], sha=job["head_sha"],
-                         base_ref=pr["baseRefName"], agent=job["agent"], model=job["model"], job_id=job["id"])
+    if previous:
+        structured["followup_of"] = previous.head_sha  # so a saved review.json records as a follow-up
+        body = review.render_followup(structured, previous.findings, repo=job["repo"], number=job["number"],
+                                      sha=job["head_sha"], previous_sha=previous.head_sha, agent=job["agent"],
+                                      model=job["model"], job_id=job["id"])
+    else:
+        body = review.render(structured, repo=job["repo"], number=job["number"], sha=job["head_sha"],
+                             base_ref=pr["baseRefName"], agent=job["agent"], model=job["model"], job_id=job["id"])
     inline = suggestions.comments(structured, review.comment_label(structured))
     Path(paths.out, "review.json").write_text(json.dumps(structured, indent=2))
     Path(paths.out, "review.md").write_text(body)
@@ -455,7 +526,8 @@ def _run(conn, svc, job, cancel):
                                  f"{paths.out}/review.md")
     with db.transaction(conn):  # only reviews that passed the scan reach the database
         db.record_review(conn, job["id"], structured, effort=cfg.agents[job["agent"]].effort,
-                         prompt_version=review.prompt_version())
+                         prompt_version=review.prompt_version(followup=bool(previous)),
+                         followup_of=previous.head_sha if previous else None)
     if not job["post"]:
         raise Outcome("skipped", f"posting disabled; review saved to {paths.out}/review.md")
     return post(conn, svc, job)

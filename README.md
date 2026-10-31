@@ -16,6 +16,7 @@ For each update to one of your open PRs on a configured repo, every enabled agen
 - **Severity:** reviewers rate each finding's impact from 0 to 10, its likelihood and its trigger, and severity follows from impact. Then two adjustments apply to anything below Blocker: a fix that removes lines outside the tests (`test_paths`) moves the finding up a level, and a fix the reviewer rates less readable moves it down two, as far as Nit.
 - **Links:** every finding links to the file and line at that commit.
 - **Pushes:** a burst of pushes produces one review. A push during a review cancels it in favour of the new commit.
+- **Follow-ups:** after the first review, later commits get a follow-up instead of a full review. Each agent checks whether the previous round's issues (both agents' findings, or a previous follow-up's open ones) are fixed, partly fixed, not fixed or obsolete. It also reports regressions in what changed since, and nothing else. A retarget, or a previous commit that is gone from the mirror, means a full review again.
 
 > **Security model: built for your own PRs.**
 >
@@ -100,7 +101,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 
 Every review that passes the credential scan is also recorded in the state database, so you can see over time what the reviewers find and what is worth acting on:
 - **Per review:** the agent, model, effort, a hash of the prompt and schema, and the summary.
-- **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen). Also recorded: the proposed edits (and whether each was a one-click suggestion), the readability rating, the net change in non-test lines, and the severity before and after the adjustments.
+- **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen). Also recorded: the proposed edits (and whether each was a one-click suggestion), the readability rating, the net change in non-test lines, and the severity before and after the adjustments. Follow-ups record each previous finding's status (`resolutions`) and their regressions (kind `regression`), so you can see which fixes worked without triaging by hand.
 - **Afterwards:** `triage` records your own impact rating, what was done (`fixed`, `declined`, `false-positive`, `duplicate`, `deferred`), the fixing commit and a note.
 
 `findings --json` exports everything, including the job's commit, so the rounds of review on a PR can be reconstructed. Housekeeping also records reviews saved before this existed, and an expired job loses its checkout but keeps its `out/` directory.

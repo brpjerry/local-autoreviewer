@@ -67,6 +67,11 @@ class CodexAgent:
         diff = Path(paths.context, "pr.diff").read_text(errors="replace")
         parts.append(f"\n## pr.diff\n\n```diff\n{diff[:INLINE_LIMIT // 2]}\n```\n")
         size += len(parts[-1])
+        for name in ("previous-findings.json", "since-review.diff"):  # a follow-up review's context
+            extra = Path(paths.context, name)
+            if extra.is_file():
+                parts.append(f"\n## {name}\n\n```\n{extra.read_text(errors='replace')[:INLINE_LIMIT // 4]}\n```\n")
+                size += len(parts[-1])
         for line in Path(paths.context, "files.txt").read_text().splitlines():
             fields = line.split("\t")
             if not fields or fields[0].startswith("D"):
@@ -82,10 +87,10 @@ class CodexAgent:
             size += len(chunk)
         return "".join(parts)
 
-    def invocation(self, *, unit, paths, prompt, session_id):
+    def invocation(self, *, unit, paths, prompt, session_id, schema=None):
         argv = [self.cfg.command, "exec", *self._locked_flags(), "--sandbox", "read-only",
                 "-C", paths.worktree, "--skip-git-repo-check", "--json",
-                "-o", f"{paths.out}/review.json", "--output-schema", str(review.schema_path()),
+                "-o", f"{paths.out}/review.json", "--output-schema", str(schema or review.schema_path()),
                 *self._model_flags(), "-"]
         if self.cfg.mode == "inline":
             prompt += self.inline_context(paths)

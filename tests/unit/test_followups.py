@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Follow-up reviews: a later head is checked against the previous round's findings and for regressions."""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from tests.helpers import REPO, EnvTestCase, make_config
+from local_autoreviewer import db, maintenance, pipeline, review
+from local_autoreviewer.agents import claude as claude_mod
+from local_autoreviewer.agents import codex as codex_mod
+
+FIXED = "def divide(a, b):\n    if b == 0:\n        raise ValueError('b must not be zero')\n    return a / b\n"
+
+
+class FollowupTests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        self.head_a = self.remote.open_pr(1, {"src/calc.py": "def divide(a, b):\n    return a / b if b else 0\n"})
+        self.svc = self.services(make_config(self.tmp, agents=("claude",)))
+
+    def review_at(self, head, *, post=True, source="poll"):
+        self.github.set_pr(1, head)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref="main", agent="claude",
+                                   model="opus", source=source, not_before=0, now=self.clock(), post=post,
+                                   rerun=db.next_rerun(conn, REPO, 1, head, "main", "claude"))
+            db.update_job(conn, job_id, status="running", started_at=self.clock())
+        conn.close()
+        status = pipeline.run_job(self.svc, job_id, pipeline.CancelToken())
+        self.clock.advance(60)
+        return job_id, status
+
+    def rows(self, sql, *params):
+        conn = self.svc.connect()
+        try:
+            return [dict(r) for r in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+    def context(self, job_id, name):
+        return Path(pipeline.job_paths(self.state, job_id).context, name)
+
+    def test_a_new_head_gets_a_followup(self):
+        first, status = self.review_at(self.head_a)
+        self.assertEqual(status, "posted")
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        second, status = self.review_at(head_b)
+        self.assertEqual(status, "posted")
+
+        (job,) = self.rows("SELECT review_kind, followup_of, prompt_version FROM jobs WHERE id=?", second)
+        self.assertEqual((job["review_kind"], job["followup_of"]), ("followup", self.head_a))
+        self.assertEqual(job["prompt_version"], review.prompt_version(followup=True))
+        self.assertIn("This is a follow-up, not a new review.", self.agent_log("claude")[-1]["prompt"])
+        previous = json.loads(self.context(second, "previous-findings.json").read_text())
+        self.assertEqual([(p["id"], p["title"], p["reviewer"]) for p in previous],
+                         [(finding["id"], finding["title"], "claude")])
+        self.assertIn("raise ValueError", self.context(second, "since-review.diff").read_text())
+
+        self.assertEqual(self.rows("SELECT finding_id, status FROM resolutions WHERE job_id=?", second),
+                         [{"finding_id": finding["id"], "status": "fixed"}])
+        self.assertEqual([r["title"] for r in self.rows("SELECT title FROM findings WHERE job_id=? AND kind='regression'",
+                                                        second)], ["The fix dropped the docstring"])
+        posted = self.github.posted[-1]
+        self.assertIn("### Follow-up review · Claude Code (opus)", posted["body"])
+        self.assertIn(f"✅ Fixed: {finding['title']}", posted["body"])
+        self.assertIn("1. **The fix dropped the docstring**", posted["body"])
+        self.assertEqual([(c["path"], c["line"]) for c in posted["comments"]], [("src/calc.py", 1)])
+
+    def test_a_chain_of_followups_carries_the_open_issues(self):
+        self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        (regression,) = self.rows("SELECT id FROM findings WHERE job_id=? AND kind='regression'", second)
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "# tidy\n"}))
+        # The first round's finding was fixed in the second; what's open is the second round's regression.
+        previous = json.loads(self.context(third, "previous-findings.json").read_text())
+        self.assertEqual([p["id"] for p in previous], [regression["id"]])
+
+    def test_unfixed_findings_stay_open(self):
+        self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        conn = self.svc.connect()
+        with db.transaction(conn):  # say the follow-up found the finding not fixed after all
+            conn.execute("UPDATE resolutions SET status='not_fixed' WHERE job_id=?", (second,))
+        conn.close()
+        (resolution,) = self.rows("SELECT finding_id FROM resolutions WHERE job_id=?", second)
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "# tidy\n"}))
+        ids = {p["id"] for p in json.loads(self.context(third, "previous-findings.json").read_text())}
+        self.assertIn(resolution["finding_id"], ids)
+
+    def test_a_trial_is_not_a_round(self):
+        self.review_at(self.head_a, post=False, source=db.FOREGROUND)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
+
+    def test_a_previous_head_gone_from_the_mirror_means_a_full_review(self):
+        conn = self.svc.connect()
+        with db.transaction(conn):  # a round whose commit was force-pushed away and garbage-collected
+            gone = db.insert_job(conn, repo=REPO, number=1, head_sha="f" * 40, base_ref="main", agent="claude",
+                                 model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, gone, status="posted", review_recorded=1, finished_at=self.clock())
+        conn.close()
+        job_id, status = self.review_at(self.head_a)
+        self.assertEqual(status, "posted")
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", job_id), [{"review_kind": "full"}])
+
+    def test_a_saved_followup_is_recorded_as_one(self):
+        self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        conn = self.svc.connect()
+        with db.transaction(conn):  # as if recording had failed
+            conn.execute("DELETE FROM resolutions WHERE job_id=?", (second,))
+            conn.execute("DELETE FROM findings WHERE job_id=?", (second,))
+            db.update_job(conn, second, review_recorded=0, review_kind="full", followup_of=None)
+        try:
+            maintenance.record_saved_reviews(conn, self.svc)
+        finally:
+            conn.close()
+        (job,) = self.rows("SELECT review_kind, followup_of FROM jobs WHERE id=?", second)
+        self.assertEqual((job["review_kind"], job["followup_of"]), ("followup", self.head_a))
+        self.assertEqual(len(self.rows("SELECT * FROM resolutions WHERE job_id=?", second)), 1)
+
+
+class FollowupFormatTests(unittest.TestCase):
+    def test_validate_keeps_one_status_per_known_finding(self):
+        raw = {"summary": "s", "regressions": [],
+               "resolutions": [{"finding": 1, "status": "fixed", "detail": "a"},
+                               {"finding": 1, "status": "not_fixed", "detail": "dup"},
+                               {"finding": 9, "status": "fixed", "detail": "unknown"},
+                               {"finding": 2, "status": "maybe", "detail": "bad status"}]}
+        self.assertEqual(review.validate_followup(raw, {1, 2})["resolutions"],
+                         [{"finding": 1, "status": "fixed", "detail": "a"}])
+        with self.assertRaises(review.ReviewFormatError):
+            review.validate_followup({"summary": ""}, set())
+
+    def test_render(self):
+        previous = [{"id": 1, "agent": "codex", "severity": "major", "title": "Leaks a handle", "file": "a.py",
+                     "line": 3},
+                    {"id": 2, "agent": "claude", "severity": "minor", "title": "Typo", "file": "", "line": 0}]
+        data = {"summary": "One fixed.", "findings": [], "resolutions": [{"finding": 1, "status": "fixed",
+                                                                          "detail": "closed in a with block"}]}
+        body = review.render_followup(data, previous, repo="o/r", number=5, sha="b" * 40, previous_sha="a" * 40,
+                                      agent="claude", model="opus", job_id=7)
+        self.assertIn("for the 2 issue(s) raised on [`aaaaaaa`]", body)
+        self.assertIn("- ✅ Fixed: Leaks a handle _(Codex, major, [`a.py:3`]", body)
+        self.assertIn("— closed in a with block", body)
+        self.assertIn("- ❔ Not checked: Typo _(Claude Code, minor)_", body)
+        self.assertIn("No regressions found.", body)
+        self.assertTrue(body.endswith(review.marker(7, "b" * 40, "claude")))
+
+    def test_schema_reuses_the_finding_definition(self):
+        schema = review.followup_schema()
+        finding = json.loads(review.schema_path().read_text())["properties"]["findings"]["items"]
+        self.assertEqual(schema["properties"]["regressions"]["items"], finding)
+        self.assertEqual(set(schema["required"]), set(schema["properties"]))
+
+    def test_agents_take_the_followup_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp), agents=("claude", "codex"))
+            paths = pipeline.job_paths(tmp, 1)
+            target = Path(tmp, "followup.schema.json")
+            target.write_text(json.dumps(review.followup_schema()))
+            argv = claude_mod.ClaudeAgent(cfg.agents["claude"], Path(tmp)).invocation(
+                unit="u", paths=paths, prompt="p", session_id="s", schema=target).argv
+            self.assertIn('"resolutions"', argv[argv.index("--json-schema") + 1])
+            argv = codex_mod.CodexAgent(cfg.agents["codex"], Path(tmp)).invocation(
+                unit="u", paths=paths, prompt="p", session_id=None, schema=target).argv
+            self.assertEqual(argv[argv.index("--output-schema") + 1], str(target))
+
+
+if __name__ == "__main__":
+    unittest.main()

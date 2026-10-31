@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+from pathlib import Path
 from string import Template
 from urllib.parse import quote
 
@@ -29,21 +30,59 @@ def schema_path():
     return paths.prompts_dir() / "review.schema.json"
 
 
-def schema_text():
-    return json.dumps(json.loads(schema_path().read_text()), separators=(",", ":"))
+def schema_text(path=None):
+    return json.dumps(json.loads(Path(path or schema_path()).read_text()), separators=(",", ":"))
 
 
-def prompt_version():
-    """Short hash of the prompt template and schema, recorded with each review."""
+def prompt_version(followup=False):
+    """Short hash of the prompt template(s) and schema, recorded with each review."""
     digest = hashlib.sha256()
-    for path in (paths.prompts_dir() / "review.md", schema_path()):
-        digest.update(path.read_bytes())
+    names = ("review.md", "review.schema.json") + (("followup.md",) if followup else ())
+    for name in names:
+        digest.update((paths.prompts_dir() / name).read_bytes())
     return digest.hexdigest()[:12]
 
 
+FOLLOWUP_STATUSES = ("fixed", "partly_fixed", "not_fixed", "obsolete")
+STATUS_LABELS = {"fixed": "✅ Fixed", "partly_fixed": "🟡 Partly fixed", "not_fixed": "❌ Not fixed",
+                 "obsolete": "➖ No longer applies", None: "❔ Not checked"}
+
+
+def followup_schema():
+    """The follow-up schema, built from the review schema so a finding has one definition."""
+    finding = json.loads(schema_path().read_text())["properties"]["findings"]["items"]
+    return {
+        "type": "object", "additionalProperties": False, "required": ["summary", "resolutions", "regressions"],
+        "properties": {
+            "summary": {"type": "string",
+                        "description": "2-4 sentences: how the previous findings stand, and any regressions."},
+            "resolutions": {
+                "type": "array", "description": "Exactly one entry per previous finding, by its id.",
+                "items": {
+                    "type": "object", "additionalProperties": False, "required": ["finding", "status", "detail"],
+                    "properties": {
+                        "finding": {"type": "integer", "description": "The previous finding's id."},
+                        "status": {"type": "string", "enum": list(FOLLOWUP_STATUSES)},
+                        "detail": {"type": "string",
+                                   "description": "Why: what the code at the new head does about it, with file and line."},
+                    },
+                },
+            },
+            "regressions": {"type": "array", "description": "New problems the changes since the previous review "
+                                                            "introduce. Empty if none.", "items": finding},
+        },
+    }
+
+
+def _section(text, heading):
+    """One '## heading' section of a prompt, up to the next '## ' heading."""
+    start = text.index(f"## {heading}\n")
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else len(text)].strip() + "\n"
+
 def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, context, agent_note="",
-                 extra_instructions="", project_docs=False):
-    template = Template((paths.prompts_dir() / "review.md").read_text())
+                 extra_instructions="", project_docs=False, template=None):
+    template = template or Template((paths.prompts_dir() / "review.md").read_text())
     docs_note = ""
     if project_docs:
         docs_note = (f"- `{context}/project-docs/`: CLAUDE.md/AGENTS.md from the base branch, if present. "
@@ -55,6 +94,32 @@ def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, c
         repo=repo, number=number, title=title.replace("\n", " "), author=author, base_ref=base_ref,
         head_sha=head_sha, worktree=worktree, context=context, agent_note=agent_note,
         project_docs_note=docs_note, extra_instructions=extra)
+
+
+def build_followup_prompt(*, previous_sha, previous_count, **fields):
+    """The follow-up prompt. It shares the review prompt's sections on proposed changes and severity, so
+    the two can't drift apart."""
+    full = (paths.prompts_dir() / "review.md").read_text()
+    # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
+    text = Template((paths.prompts_dir() / "followup.md").read_text()).safe_substitute(
+        proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"))
+    prompt = build_prompt(**fields, template=Template(text))
+    return Template(prompt).safe_substitute(previous_sha=previous_sha, previous_count=previous_count)
+
+
+def validate_followup(raw, previous_ids):
+    """Coerce a follow-up's structured output; regressions are checked like a review's findings."""
+    if not isinstance(raw, dict):
+        raise ReviewFormatError("follow-up is not an object")
+    base = validate({"summary": raw.get("summary"), "findings": raw.get("regressions") or []})
+    resolutions = {}
+    for item in raw.get("resolutions") or []:
+        if not isinstance(item, dict) or item.get("status") not in FOLLOWUP_STATUSES:
+            continue
+        finding = _int(item.get("finding"))
+        if finding in previous_ids and finding not in resolutions:  # unknown ids and repeats are dropped
+            resolutions[finding] = {"finding": finding, "status": item["status"], "detail": str(item.get("detail") or "")}
+    return {**base, "resolutions": list(resolutions.values())}
 
 
 def validate(review):
@@ -266,6 +331,43 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
     body = "\n".join(head + findings + extras + nit_lines + footer)
     if len(body) > MAX_BODY:
         body = "\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer)
+    if len(body) > MAX_BODY:
+        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
+        body = body[:MAX_BODY - len(tail) - 100] + tail
+    return body
+
+
+def render_followup(review, previous, *, repo, number, sha, previous_sha, agent, model, job_id):
+    """A follow-up: each previous finding's status, then any regressions as numbered findings."""
+    agent_name = AGENT_NAMES.get(agent, agent)
+    model_note = f" ({clean(model, 80)})" if model else ""
+    commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
+    before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
+    lines = [f"### Follow-up review · {agent_name}{model_note}", "",
+             f"Checked commit {commit} for the {len(previous)} issue(s) raised on {before}, and for regressions in "
+             "the changes since. Automated read-only review.", "", clean(review["summary"]), ""]
+    status = {r["finding"]: r for r in review["resolutions"]}
+    if previous:
+        lines.append("#### Previous findings")
+        for item in previous:
+            resolution = status.get(item["id"])
+            who = AGENT_NAMES.get(item["agent"], item["agent"])
+            where = _location(repo, sha, item["file"], item["line"])
+            line = (f"- {STATUS_LABELS[resolution['status'] if resolution else None]}: {clean(item['title'], 500)} "
+                    f"_({who}, {item['severity']}{', ' + where if where else ''})_")
+            if resolution and resolution["detail"]:
+                line += " — " + clean(resolution["detail"], 2000).replace("\n", " ")
+            lines.append(line)
+        lines.append("")
+    if review["findings"]:
+        lines.append("#### Regressions")
+        for n, item in enumerate(review["findings"], 1):
+            lines += _finding(n, item, repo, sha)
+        lines.append("")
+    else:
+        lines += ["No regressions found.", ""]
+    footer = ["---", f"<sub>local-autoreviewer · job {job_id} · {agent_name} · follow-up</sub>", marker(job_id, sha, agent)]
+    body = "\n".join(lines + footer)
     if len(body) > MAX_BODY:
         tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
         body = body[:MAX_BODY - len(tail) - 100] + tail

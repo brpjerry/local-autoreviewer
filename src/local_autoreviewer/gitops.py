@@ -177,6 +177,18 @@ class Git:
         return Context(merge_base=merge_base, base_sha=base_sha, changed_files=changed,
                        diff_bytes=len(diff), excluded=excluded)
 
+    def has_commit(self, mirror, sha):
+        return self.run(["-C", str(mirror), "cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode == 0
+
+    def write_followup_context(self, mirror, previous_sha, head_sha, ctx_dir, *, exclude, previous):
+        """A follow-up's extra context: what changed since the previous review, and that review's findings."""
+        excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
+        diff = self.run(["-C", str(mirror), "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
+                         previous_sha, head_sha, "--", ".", *excludes], text=False).stdout
+        (Path(ctx_dir) / "since-review.diff").write_bytes(diff)
+        (Path(ctx_dir) / "previous-findings.json").write_text(json.dumps(previous, indent=2))
+        return len(diff)
+
 
 def strip_agent_files(root):
     """Delete agent config/instruction files from a checkout; return relative paths removed."""
