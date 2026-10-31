@@ -136,6 +136,9 @@ def is_trial(job):
     return job["source"] == FOREGROUND and not job["post"]
 
 
+TRIAL_SQL = f"(source='{FOREGROUND}' AND post=0)"  # is_trial() as a WHERE condition
+
+
 def active_jobs(conn, repo, number, agent=None):
     sql = f"SELECT * FROM jobs WHERE repo=? AND number=? AND status IN ({','.join('?' * len(ACTIVE))})"
     params = [repo, number, *ACTIVE]

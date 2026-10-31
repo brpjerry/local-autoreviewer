@@ -236,8 +236,9 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             sleep(wait)
             with db.transaction(conn):
                 # A push or close during the wait may have ended the job; never revive it.
-                resumed = conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=? AND status='queued'",
-                                       (svc.now(), job_id)).rowcount
+                # Like a worker claim, drop a stale cancel request (one left by a requeue that kept it).
+                resumed = conn.execute("UPDATE jobs SET status='running', started_at=?, cancel_requested=0"
+                                       " WHERE id=? AND status='queued'", (svc.now(), job_id)).rowcount
             if not resumed:
                 return db.get_job(conn, job_id)["status"]
         finally:
@@ -254,7 +255,7 @@ def abandon(svc, job_ids, reason):
     try:
         for job_id in job_ids:
             job = db.get_job(conn, job_id)
-            if job is None or job["status"] not in ("queued", "running"):
+            if job is None or job["source"] != db.FOREGROUND or job["status"] not in ("queued", "running"):
                 continue
             if job["scope_unit"]:
                 svc.runner.cleanup(job["scope_unit"])

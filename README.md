@@ -135,6 +135,8 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |
 
+Run one worker per state directory. A second worker sharing it could, for example, finish the same interrupted post twice.
+
 ## Development
 
 ```sh

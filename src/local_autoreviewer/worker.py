@@ -114,7 +114,9 @@ class Worker:
             if job["status"] != "posting":
                 return
             self.recover_posting(svc, conn, job)
-            if job["source"] == db.FOREGROUND:  # requeued if there was nothing to post: no owner to run it
+            # recover_posting requeues a job with no saved output; a foreground job has no owner left
+            # to run it, so cancel it instead.
+            if job["source"] == db.FOREGROUND:
                 pipeline.abandon(svc, [job_id], "foreground review exited before finishing")
         except Exception:
             log.exception("job %s: post recovery failed; retrying in %d min", job_id, POST_RECOVERY_RETRY // 60)

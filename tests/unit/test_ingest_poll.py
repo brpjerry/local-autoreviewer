@@ -267,6 +267,7 @@ class ManualIngestTests(EnvTestCase):
         with db.transaction(conn):
             enqueued = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="codex",
                                      model="", source="manual", not_before=0, now=self.clock())
+        self.assertIsNotNone(enqueued)
 
         def poll_sees(head, action="synchronize", base="main"):
             event = events.PrEvent(repo=REPO, number=9, action=action, head_sha=head, base_ref=base,
@@ -282,7 +283,6 @@ class ManualIngestTests(EnvTestCase):
                              {"claude": ("running", 1), "codex": ("cancelled", 0)})
         finally:
             conn.close()
-        self.assertIsNotNone(enqueued)
 
     def test_a_new_head_on_a_draft_stops_requested_reviews(self):
         self.foreground_job("running", post=False)

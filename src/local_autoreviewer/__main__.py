@@ -125,6 +125,7 @@ def cmd_review(args):
     svc = build_services(cfg)
     agents = args.agent or list(repo_cfg.agents)
     locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
+    owned = []  # job ids whose rows committed (a rolled-back id may be reused by another process)
     worst = 0
     try:
         # Like enqueue, read the head and create the jobs under the poll lock, so a poll applying
@@ -143,9 +144,10 @@ def cmd_review(args):
                                                not_before=svc.now(), now=svc.now(), post=args.post, rerun=rerun)
                         db.update_job(conn, job_id, status="running", started_at=svc.now())
                         locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
+                    owned.append(job_id)
             finally:
                 conn.close()
-        for job_id in locks:
+        for job_id in owned:
             status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
             conn = svc.connect()
             job = db.get_job(conn, job_id)
@@ -160,11 +162,10 @@ def cmd_review(args):
                 worst = 1
     finally:
         # Never leave this command's jobs for the worker, even after Ctrl-C or an error.
-        pipeline.abandon(svc, list(locks), "foreground review ended before the job finished")
-        if locks:
+        pipeline.abandon(svc, owned, "foreground review ended before the job finished")
+        if owned:
             conn = svc.connect()
-            jobs = [db.get_job(conn, job_id) for job_id in locks]  # None if its row never committed
-            mid_post = [job["id"] for job in jobs if job is not None and job["status"] == "posting"]
+            mid_post = [job_id for job_id in owned if db.get_job(conn, job_id)["status"] == "posting"]
             conn.close()
             for job_id in mid_post:
                 print(f"job {job_id} was interrupted mid-post; the worker will check whether it reached GitHub "

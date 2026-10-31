@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import contextlib
+import io
 import json
 import sqlite3
 import threading
@@ -238,6 +239,11 @@ class PipelineTests(EnvTestCase):
             thread.join(20)
         self.assertEqual(result["s"], "superseded")
 
+    def test_abandon_never_touches_a_worker_job(self):
+        svc, (job_id,) = self.queue(post=False)  # e.g. a poll job that reused a rolled-back id
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.job(svc, job_id)["status"], "running")
+
     def test_abandon_cancels_only_unfinished_jobs(self):
         svc, (done, left) = self.foreground(agents=("claude", "codex"))
         pipeline.run_job(svc, done, pipeline.CancelToken())
@@ -322,6 +328,39 @@ class PipelineTests(EnvTestCase):
                 pipeline.orphaned_foreground(self.state, 1) as orphaned:
             self.assertFalse(orphaned)
 
+    def test_orphaned_queued_foreground_job_is_cancelled(self):
+        svc, job_id = self.orphan("queued")  # its `review` died while waiting to retry
+        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+
+    def test_orphaned_foreground_post_backs_off_while_github_fails(self):
+        svc, job_id = self.orphan("posting")
+
+        def failing_lookup(*args):
+            raise GitHubError("HTTP 503")
+
+        self.github.find_marked_review = failing_lookup
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + POST_RECOVERY_RETRY))
+
+    def test_resume_drops_a_stale_cancel_request(self):
+        svc, (job_id,) = self.foreground()
+        seen = []
+
+        def fake_run_job(svc_, job_id_, token):
+            conn = svc.connect()
+            with db.transaction(conn):
+                if not seen:  # a requeue that kept the cancel request of a since-reopened PR
+                    db.update_job(conn, job_id_, status="queued", not_before=self.clock() + 60, cancel_requested=1)
+            seen.append(db.get_job(conn, job_id_)["cancel_requested"])
+            conn.close()
+            return "queued" if len(seen) == 1 else "skipped"
+
+        with mock.patch.object(pipeline, "run_job", side_effect=fake_run_job):
+            status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        self.assertEqual((status, seen), ("skipped", [1, 0]))
+
     def test_orphaned_foreground_post_without_output_is_cancelled(self):
         svc, job_id = self.orphan("posting")
         recover_posts(Worker(lambda cfg: svc, None), svc)
@@ -350,6 +389,31 @@ class PipelineTests(EnvTestCase):
             thread.join(10)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result["r"], 0)
+
+    def test_review_interrupted_mid_post_says_so_and_releases_its_locks(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=True)
+
+        def interrupted_post(svc_, job_id, **kwargs):
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="posting")
+            conn.close()
+            raise KeyboardInterrupt
+
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=interrupted_post), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        conn = svc.connect()
+        (job,) = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual(job["status"], "posting")  # left for the worker's marker-checked recovery
+        self.assertIn(f"job {job['id']} was interrupted mid-post", stderr.getvalue())
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
 
     def test_review_command_survives_a_job_row_that_never_committed(self):
         from local_autoreviewer import __main__ as cli
