@@ -72,29 +72,29 @@ def replacement_lines(text):
 
 def check_edit(edit, worktree):
     """The edit, placed in the file: with the lines it replaces (`original`) and how it was placed
-    (`anchor`), or None if it can't apply (a path outside the checkout, a missing file, or a range past
-    the end of the file).
+    (`anchor`), or None if it can't apply (a path outside the checkout, a missing file, or, for an edit
+    without `current`, a range past the end of the file).
 
-    A reviewer gives the text it means to replace (`current`), and its line numbers are sometimes off by
-    a line or two. So the edit goes where that text is, nearest the stated lines and at most ANCHOR_WINDOW
-    lines away, ignoring trailing whitespace (often lost in copying): "matched" at the stated lines,
-    "moved" elsewhere. If the text isn't there, the edit is kept for the record but not applied:
-    "dropped". Both keep the reviewer's numbers in `stated`. An edit without `current` (from an older
+    A reviewer gives the text it means to replace (`current`), and its line numbers are sometimes off.
+    So the edit goes where that text is (see _locate): "matched" at the stated lines, "moved" elsewhere.
+    If the text can't be placed, the edit is kept for the record but not applied: "dropped". Moved and
+    dropped edits keep the reviewer's numbers in `stated`. An edit without `current` (from an older
     review) is placed by its line numbers: "unverified"."""
     root = Path(worktree).resolve()
     target = (root / edit["file"]).resolve()
     if root not in target.parents or not target.is_file():
         return None
-    lines = target.read_text(errors="replace").splitlines()
+    text = target.read_text(errors="replace")
+    lines = text.removesuffix("\n").split("\n") if text else []  # at "\n" only, as `current` and GitHub count
     start, end = edit["start_line"], edit["end_line"]
     if edit.get("current") is None:
         if not 1 <= start <= end <= len(lines):
             return None
         return {**edit, "original": lines[start - 1:end], "anchor": "unverified"}
-    wanted = [line.rstrip() for line in edit["current"].removesuffix("\n").split("\n")]  # "" is one blank line
-    window = range(max(0, start - 1 - ANCHOR_WINDOW), min(len(lines) - len(wanted), start - 1 + ANCHOR_WINDOW) + 1)
-    nearest = sorted(window, key=lambda i: abs(i + 1 - start))  # 0-based first lines
-    found = next((i for i in nearest if [line.rstrip() for line in lines[i:i + len(wanted)]] == wanted), None)
+    wanted = edit["current"].split("\n")  # "" is one blank line
+    if len(wanted) > end - start + 1 and wanted[-1] == "":  # a final newline, not a blank last line
+        wanted.pop()
+    found = _locate(lines, [line.rstrip() for line in wanted], start)
     if found is None:
         return {**edit, "original": [], "anchor": "dropped", "stated": [start, end]}
     first, last = found + 1, found + len(wanted)
@@ -102,6 +102,24 @@ def check_edit(edit, worktree):
         return {**edit, "original": lines[found:last], "anchor": "matched"}
     return {**edit, "start_line": first, "end_line": last, "original": lines[found:last], "anchor": "moved",
             "stated": [start, end]}
+
+
+def _locate(lines, wanted, start):
+    """Where the lines `wanted` are in the file (0-based), ignoring trailing whitespace (often lost in
+    copying), or None. The copy nearest the stated start, at most ANCHOR_WINDOW lines away, wins; failing
+    that, the only copy in the file. Two copies equally near, or blank lines away from the stated ones,
+    say nothing about where the edit belongs."""
+    def at(i):
+        return [line.rstrip() for line in lines[i:i + len(wanted)]] == wanted
+    if not any(wanted):
+        return start - 1 if at(start - 1) else None
+    window = range(max(0, start - 1 - ANCHOR_WINDOW), min(len(lines) - len(wanted), start - 1 + ANCHOR_WINDOW) + 1)
+    near = sorted((i for i in window if at(i)), key=lambda i: abs(i + 1 - start))
+    if near:
+        tied = len(near) > 1 and abs(near[0] + 1 - start) == abs(near[1] + 1 - start)
+        return None if tied else near[0]
+    anywhere = [i for i in range(len(lines) - len(wanted) + 1) if at(i)]
+    return anywhere[0] if len(anywhere) == 1 else None
 
 
 def applied(edits):
@@ -136,7 +154,9 @@ def apply(review, *, worktree, hunks, test_paths):
     for item in review["findings"]:
         edits = [e for e in (check_edit(e, worktree) for e in item["edits"]) if e]
         delta = loc_delta(edits, test_paths)
-        final, notes = adjust(item["severity"], delta, item["readability"])
+        # Readability rates the proposed fix; if none of it can be applied, the review doesn't show it.
+        readability = item["readability"] if applied(edits) or not item["edits"] else "same"
+        final, notes = adjust(item["severity"], delta, readability)
         findings.append({**item, "edits": [_mark_inline(e, hunks) for e in edits], "loc_delta": delta,
                          "reviewer_severity": item["severity"], "severity": final, "severity_notes": notes})
     findings.sort(key=lambda f: LEVELS.index(f["severity"]), reverse=True)

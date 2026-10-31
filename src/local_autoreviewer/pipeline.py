@@ -387,7 +387,7 @@ class PreviousRound:
                  "trigger": f["occurs_when"],
                  "detail": f["detail"], "suggestion": f["suggestion"],
                  "proposed_edits": [{k: e[k] for k in ("file", "start_line", "end_line", "replacement")}
-                                    for e in json.loads(f["edits"] or "[]")]}
+                                    for e in suggestions.applied(json.loads(f["edits"] or "[]"))]}
                 for f in self.findings]
 
 

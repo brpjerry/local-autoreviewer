@@ -90,18 +90,27 @@ class SuggestionTests(unittest.TestCase):
         self.assertEqual(self.place("src/lib.py", 4, 4, "r", current="return x"), (5, 5, "moved", [4, 4]))
         self.assertEqual(self.place("src/lib.py", 2, 2, "r", current="return x"), (1, 1, "moved", [2, 2]))
         self.assertEqual(self.place("src/lib.py", 4, 4, "y = 3", current="y = 2"), (4, 4, "matched", None))
-        self.assertEqual(self.place("src/lib.py", 2, 2, "", current=""), (3, 3, "moved", [2, 2]))  # a blank line
+        self.assertEqual(self.place("src/lib.py", 3, 3, "r", current="return x"), (3, 3, "dropped", [3, 3]))  # a tie
+        self.assertEqual(self.place("src/lib.py", 3, 3, "", current=""), (3, 3, "matched", None))  # a blank line
+        self.assertEqual(self.place("src/lib.py", 2, 2, "", current=" "), (2, 2, "dropped", [2, 2]))  # not moved
         checked = suggestions.check_edit(edit("src/lib.py", 4, 4, "y = 3", current="y = 2"), self.worktree)
         self.assertEqual(checked["original"], ["y = 2  "])  # the file's text, for the shown diff and loc_delta
 
-    def test_anchoring_looks_only_near_the_stated_lines(self):
-        (self.worktree / "src/long.py").write_text("target\n" + "pad\n" * 100 + "tail\n")  # tail is line 102
-        near, far = 1 + suggestions.ANCHOR_WINDOW, 2 + suggestions.ANCHOR_WINDOW
-        self.assertEqual(self.place("src/long.py", near, near, "t", current="target"), (1, 1, "moved", [near, near]))
-        self.assertEqual(self.place("src/long.py", far, far, "t", current="target")[2], "dropped")
-        near, far = 102 - suggestions.ANCHOR_WINDOW, 101 - suggestions.ANCHOR_WINDOW
-        self.assertEqual(self.place("src/long.py", near, near, "t", current="tail"), (102, 102, "moved", [near, near]))
-        self.assertEqual(self.place("src/long.py", far, far, "t", current="tail")[2], "dropped")
+    def test_anchoring_beyond_the_window_needs_the_only_copy(self):
+        (self.worktree / "src/long.py").write_text("dup\n" + "pad\n" * 100 + "dup\nsolo\n")  # dup: 1 and 102
+        window = suggestions.ANCHOR_WINDOW
+        self.assertEqual(self.place("src/long.py", 1 + window, 1 + window, "d", current="dup")[:3], (1, 1, "moved"))
+        self.assertEqual(self.place("src/long.py", 2 + window, 2 + window, "d", current="dup")[2], "dropped")
+        self.assertEqual(self.place("src/long.py", 102 - window, 102 - window, "d", current="dup")[:3],
+                         (102, 102, "moved"))
+        self.assertEqual(self.place("src/long.py", 101 - window, 101 - window, "d", current="dup")[2], "dropped")
+        self.assertEqual(self.place("src/long.py", 1, 1, "s", current="solo"), (103, 103, "moved", [1, 1]))
+
+    def test_anchoring_counts_lines_as_github_does(self):
+        (self.worktree / "src/blank.py").write_text("a\n\nb\x0cc\nd\n")
+        self.assertEqual(self.place("src/blank.py", 1, 2, "", current="a\n"), (1, 2, "matched", None))  # a, blank
+        self.assertEqual(self.place("src/blank.py", 1, 1, "", current="a\n"), (1, 1, "matched", None))
+        self.assertEqual(self.place("src/blank.py", 4, 4, "", current="d"), (4, 4, "matched", None))  # not at \x0c
 
     def test_dropped_edits_count_for_nothing(self):
         edits = [suggestions.check_edit(e, self.worktree) for e in
@@ -114,6 +123,11 @@ class SuggestionTests(unittest.TestCase):
         self.assertEqual((finding["loc_delta"], finding["severity"]), (0, "minor"))  # not raised for removing a line
         self.assertEqual([(e["anchor"], e["inline"]) for e in finding["edits"]], [("dropped", False)])
         self.assertEqual(suggestions.comments(out, review.comment_label(out)), [])
+        unshown = self.finding("major", [edit("src/app.py", 1, 1, "", current="nope")], readability="worse")
+        no_edits = self.finding("major", readability="worse")
+        out = suggestions.apply({"findings": [unshown, no_edits], "nits": []}, worktree=self.worktree, hunks={},
+                                test_paths=DEFAULT_TEST_PATHS)
+        self.assertEqual([f["severity"] for f in out["findings"]], ["major", "nit"])  # a fix not shown isn't rated
 
     def test_loc_delta_ignores_tests(self):
         edits = [suggestions.check_edit(e, self.worktree) for e in
