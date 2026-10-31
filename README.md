@@ -177,6 +177,12 @@ tools/live teardown       # back to the installed package (install one at least 
 
 The live worktree is separate from the checkout you edit, so work in progress never runs.
 
+To see how a prompt change would have reviewed an earlier commit, replay it. The replay runs offline against the service's mirror, in a scratch state directory, and posts nothing:
+
+```sh
+tools/replay owner/repo#N <commit> [--agent claude] [--prompts <dir with review.md and review.schema.json>]
+```
+
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).
 
 Not built yet:

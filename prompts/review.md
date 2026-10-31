@@ -18,6 +18,21 @@ $agent_note
 - Only report problems in code this PR adds or changes, or problems the PR makes reachable. Don't review untouched legacy code.
 - Be concrete. Every finding needs a failure scenario: which input or state leads to which wrong result. Leave out speculative findings you can't support from the code.
 
+## Method: this is the only pass
+
+There won't be a second review round, so find everything now rather than the first few problems. Work through the change systematically before you write any findings:
+
+1. List every function, command, branch, option and config path the PR adds or changes.
+2. For each one, check:
+   - **Inputs and environment:** unusual but valid values (empty, very large, unicode or shell/URI-special characters in paths and names, missing or unreadable files, an unset or odd environment variable).
+   - **Order of operations:** steps run twice, out of order, half-way, or after their opposite (setup then teardown then deploy, start/stop, migrate/roll back).
+   - **Concurrency:** what else runs at the same time (background workers, timers, other processes or users) and what it sees in the middle of this change.
+   - **Checks and conditions:** whether each check actually tests what its purpose needs, no more and no less.
+   - **Failure part-way through:** what state an error, timeout or interrupt leaves behind, and whether a rerun recovers.
+3. Check your own proposed edits the same way: does each fix the problem everywhere it occurs, and could it cause a new one?
+
+Report every problem this turns up, minor ones included.
+
 ## What to cover (a thorough review)
 
 1. **Correctness:** logic errors, edge cases (empty, zero, None, overflow, unicode, concurrency), error handling, resource leaks, broken contracts with callers.
