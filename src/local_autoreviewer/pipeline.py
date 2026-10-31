@@ -391,25 +391,25 @@ class PreviousRound:
                 for f in self.findings]
 
 
-def previous_round(conn, job):
-    """The latest earlier round of reviews of this PR on the same base, or None for a full review. A full
+def previous_round(conn, job, base_contains=lambda base_sha: False):
+    """The latest earlier round of reviews of this PR, or None for a full review. A round on another base
+    counts only if base_contains(the base commit it was reviewed against): the PR was retargeted from a
+    branch whose changes are now in the new base, as when the PR below it in a stack merges. A full
     round's open issues are its findings; a follow-up round's are its regressions plus the findings it
     found not, or only partly, fixed. No-post trials don't count as rounds."""
-    scope = (f"repo=? AND number=? AND base_ref=? AND review_recorded=1 AND status IN ('posted', 'skipped')"
+    scope = (f"repo=? AND number=? AND review_recorded=1 AND status IN ('posted', 'skipped')"
              f" AND NOT {db.TRIAL_SQL}")
-    args = (job["repo"], job["number"], job["base_ref"])
-    row = conn.execute(f"SELECT id, head_sha FROM jobs WHERE {scope} AND head_sha!=? ORDER BY finished_at DESC, id DESC"
-                       " LIMIT 1", (*args, db.FOREGROUND, job["head_sha"])).fetchone()
+    args = (job["repo"], job["number"])
+    row = conn.execute(f"SELECT id, head_sha, base_ref, base_sha FROM jobs WHERE {scope} AND head_sha!=?"
+                       " ORDER BY finished_at DESC, id DESC LIMIT 1",
+                       (*args, db.FOREGROUND, job["head_sha"])).fetchone()
     if row is None:
         return None
-    retargeted = conn.execute(  # reviewed against another base since then: that round is stale
-        f"SELECT 1 FROM jobs WHERE repo=? AND number=? AND base_ref!=? AND id>? AND id<? AND NOT {db.TRIAL_SQL} LIMIT 1",
-        (*args, row["id"], job["id"], db.FOREGROUND)).fetchone()
-    if retargeted:
+    if row["base_ref"] != job["base_ref"] and not (row["base_sha"] and base_contains(row["base_sha"])):
         return None
     ids = set()
-    for previous in conn.execute(f"SELECT id, review_kind FROM jobs WHERE {scope} AND head_sha=?",
-                                 (*args, db.FOREGROUND, row["head_sha"])).fetchall():
+    for previous in conn.execute(f"SELECT id, review_kind FROM jobs WHERE {scope} AND head_sha=? AND base_ref=?",
+                                 (*args, db.FOREGROUND, row["head_sha"], row["base_ref"])).fetchall():
         if previous["review_kind"] == "followup":
             ids.update(r[0] for r in conn.execute(
                 "SELECT id FROM findings WHERE job_id=? AND kind='regression'", (previous["id"],)))
@@ -451,7 +451,8 @@ def _run(conn, svc, job, cancel):
             pr={"repo": job["repo"], "number": job["number"], "title": pr.get("title", ""),
                 "author": (pr.get("author") or {}).get("login", ""), "url": pr.get("url", ""),
                 "body": pr.get("body", ""), "base_ref": pr["baseRefName"]})
-        previous = previous_round(conn, job)
+        # A round on the PR's old base still counts if that base's changes are all in the new one.
+        previous = previous_round(conn, job, lambda old: svc.git.contains(mirror, base_sha, old))
         if previous and not svc.git.has_commit(mirror, previous.head_sha):
             log.info("job %s: previous head %s is gone from the mirror; doing a full review", job["id"],
                      previous.head_sha[:12])
