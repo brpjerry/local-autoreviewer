@@ -11,6 +11,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .suggestions import DEFAULT_TEST_PATHS
+
 AGENTS = ("claude", "codex")
 TOKEN_OWNER = "@token-owner"
 _REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
@@ -52,6 +54,7 @@ class RepoConfig:
     max_changed_files: int
     max_diff_bytes: int
     diff_exclude: tuple
+    test_paths: tuple
     post: bool
     extra_instructions: str
 
@@ -83,7 +86,8 @@ class Config:
 
 
 _SERVICE_KEYS = {"paused", "review_timeout", "settle", "max_reviews_per_day", "bootstrap", "retain_jobs", "max_attempts"}
-_REPO_KEYS = {"agents", "authors", "project_docs", "max_changed_files", "max_diff_bytes", "diff_exclude", "post", "extra_instructions"}
+_REPO_KEYS = {"agents", "authors", "project_docs", "max_changed_files", "max_diff_bytes", "diff_exclude", "test_paths",
+              "post", "extra_instructions"}
 _AGENT_KEYS = {"command", "model", "effort", "memory_max", "tasks_max", "mode"}
 _DEFAULTS = {
     "agents": ["claude", "codex"],
@@ -95,6 +99,7 @@ _DEFAULTS = {
         "**/*.lock", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock",
         "**/Cargo.lock", "**/go.sum", "**/dist/**", "**/*.min.js",
     ],
+    "test_paths": list(DEFAULT_TEST_PATHS),
     "post": True,
     "extra_instructions": "",
 }
@@ -138,6 +143,7 @@ def _repo_settings(table, base, where):
         "max_changed_files": _typed(merged["max_changed_files"], int, f"{where}.max_changed_files"),
         "max_diff_bytes": _typed(merged["max_diff_bytes"], int, f"{where}.max_diff_bytes"),
         "diff_exclude": _str_list(merged["diff_exclude"], f"{where}.diff_exclude"),
+        "test_paths": _str_list(merged["test_paths"], f"{where}.test_paths"),
         "post": _typed(merged["post"], bool, f"{where}.post"),
         "extra_instructions": _typed(merged["extra_instructions"], str, f"{where}.extra_instructions"),
     }

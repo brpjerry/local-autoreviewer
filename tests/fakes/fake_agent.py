@@ -16,10 +16,15 @@ REVIEW = {
     "findings": [{"severity": "major", "impact": 6, "likelihood": "common", "trigger": "Any caller passes b=0.",
                   "category": "correctness", "file": "src/calc.py", "line": 2,
                   "title": "Division by zero is unhandled", "detail": "divide(1, 0) raises ZeroDivisionError.",
-                  "suggestion": "Check b == 0 and raise ValueError."}],
+                  "suggestion": "Check b == 0 and raise ValueError.", "readability": "same",
+                  "edits": [{"file": "src/calc.py", "start_line": 2, "end_line": 2,
+                             "replacement": "    if b == 0:\n        raise ValueError(\"b must not be zero\")\n"
+                                            "    return a / b"}]}],
     "test_gaps": ["No test for b == 0."],
     "questions": [],
-    "nits": [{"file": "src/calc.py", "line": 1, "text": "Add a docstring."}],
+    "nits": [{"file": "src/calc.py", "line": 1, "text": "Add a docstring.",
+              "edits": [{"file": "src/calc.py", "start_line": 1, "end_line": 1,
+                         "replacement": "def divide(a, b):\n    \"\"\"Divide a by b.\"\"\""}]}],
 }
 
 
@@ -45,6 +50,10 @@ def main():
         return 3
     if mode == "leak":
         review["summary"] = "Found a token: ghp_" + "A" * 36
+    if mode == "leak_edit":  # only in a proposed change, which is posted as an inline suggestion
+        finding = dict(review["findings"][0])
+        finding["edits"] = [dict(finding["edits"][0], replacement="    TOKEN = 'ghp_" + "B" * 36 + "'")]
+        review["findings"] = [finding]
     if mode == "badjson":
         review = {"nope": True}
     if codex:

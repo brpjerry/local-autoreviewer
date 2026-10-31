@@ -7,13 +7,14 @@ import re
 from string import Template
 from urllib.parse import quote
 
-from . import paths
+from . import paths, suggestions
 
 MAX_BODY = 65_536
 MAX_FIELD = 6_000
 MAX_NITS = 15
-SEVERITIES = ("blocker", "major", "minor")
+SEVERITIES = ("blocker", "major", "minor")  # what a reviewer reports; a modifier can also make a finding a nit
 LIKELIHOODS = ("common", "occasional", "rare")
+READABILITY = ("better", "same", "worse")
 AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 _MENTION_RE = re.compile(r"(?<![\w`/.@])@(?=[A-Za-z0-9][A-Za-z0-9-]*)")
 _HTML_COMMENT_RE = re.compile(r"<!--|-->")
@@ -67,9 +68,16 @@ def validate(review):
     for item in review.get("findings") or []:
         if not isinstance(item, dict) or not isinstance(item.get("title"), str):
             raise ReviewFormatError("malformed finding")
-        severity = item.get("severity") if item.get("severity") in SEVERITIES else "minor"
+        severity = item.get("severity") if item.get("severity") in suggestions.LEVELS else "minor"
+        reviewer = item.get("reviewer_severity") if item.get("reviewer_severity") in SEVERITIES else severity
         findings.append({
             "severity": severity,
+            # Set by suggestions.apply(); kept so a saved review.json loads back unchanged.
+            "reviewer_severity": reviewer,
+            "severity_notes": [str(n) for n in item.get("severity_notes") or []],
+            "loc_delta": item.get("loc_delta") if isinstance(item.get("loc_delta"), int) else None,
+            "edits": _edits(item.get("edits")),
+            "readability": item.get("readability") if item.get("readability") in READABILITY else "same",
             # Reviews from before the calibrated schema have no impact, likelihood or trigger.
             "impact": _impact(item.get("impact")),
             "likelihood": item.get("likelihood") if item.get("likelihood") in LIKELIHOODS else "",
@@ -81,10 +89,11 @@ def validate(review):
             "detail": str(item.get("detail") or ""),
             "suggestion": str(item.get("suggestion") or ""),
         })
-    nits = [{"file": str(n.get("file") or ""), "line": _int(n.get("line")), "text": str(n.get("text") or "")}
+    nits = [{"file": str(n.get("file") or ""), "line": _int(n.get("line")), "text": str(n.get("text") or ""),
+             "edits": _edits(n.get("edits"))}
             for n in (review.get("nits") or []) if isinstance(n, dict) and n.get("text")]
     # In render order (by severity, stable), so a finding's position matches its number in the review.
-    findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
+    findings.sort(key=lambda f: suggestions.LEVELS.index(f["severity"]), reverse=True)
     return {
         "summary": summary,
         "findings": findings,
@@ -92,6 +101,25 @@ def validate(review):
         "questions": [str(q) for q in review.get("questions") or [] if str(q).strip()],
         "nits": nits,
     }
+
+
+def _edits(raw):
+    """Well-formed edits only; suggestions.check_edit() later checks them against the checkout."""
+    edits = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str) or not item["file"]:
+            continue
+        if not isinstance(item.get("replacement"), str) or len(item["replacement"]) > suggestions.MAX_REPLACEMENT:
+            continue
+        start, end = _int(item.get("start_line")), _int(item.get("end_line"))
+        if not 1 <= start <= end:
+            continue
+        edit = {"file": item["file"], "start_line": start, "end_line": end, "replacement": item["replacement"]}
+        if isinstance(item.get("original"), list):  # from a saved review
+            edit["original"] = [str(line) for line in item["original"]]
+            edit["inline"] = bool(item.get("inline"))
+        edits.append(edit)
+    return edits[:suggestions.MAX_EDITS]
 
 
 def _int(value):
@@ -137,6 +165,57 @@ def marker(job_id, sha, agent):
     return f"<!-- local-autoreviewer job={job_id} sha={sha} agent={agent} -->"
 
 
+def _proposed_changes(edits):
+    """Each proposed change as a collapsed diff, so the review stands on its own without its inline
+    suggestions. The diff is code; only marker-like HTML comments are broken up."""
+    lines = []
+    for edit in edits:
+        span = f"{edit['start_line']}" if edit["start_line"] == edit["end_line"] else \
+            f"{edit['start_line']}–{edit['end_line']}"
+        where = clean(f"{edit['file']}:{span}", 300)
+        note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
+        diff = suggestions.shown_diff(edit).replace("<!--", "<!\u200b--")
+        lines += [f"<details><summary>Proposed change to <code>{where}</code>{note}</summary>", "", diff, "",
+                  "</details>"]
+    return lines
+
+
+def _finding(number, item, repo, sha):
+    where = _location(repo, sha, item["file"], item["line"])
+    line = f"{number}. **{clean(item['title'], 500)}**"
+    if where:
+        line += f" — {where}"
+    rating = [clean(item["category"], 40)]
+    if item.get("impact") is not None:
+        rating.append(f"impact {item['impact']}/10")
+    if item.get("likelihood"):
+        rating.append(item["likelihood"])
+    rating = ", ".join(rating)
+    if item.get("severity_notes"):
+        moved = "raised" if suggestions.LEVELS.index(item["severity"]) > \
+            suggestions.LEVELS.index(item["reviewer_severity"]) else "lowered"
+        rating += f"; {moved} from {item['reviewer_severity']}: {', '.join(item['severity_notes'])}"
+    lines = [line + f" _({rating})_"]
+    if item.get("trigger"):
+        lines.append("**When:** " + clean(item["trigger"], 2000))
+    if item["detail"]:
+        lines.append(clean(item["detail"]))
+    if item["suggestion"]:
+        lines.append("> **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n> "))
+    lines += _proposed_changes(item.get("edits") or [])
+    # Indent everything after the first line so it stays inside the numbered item.
+    return [lines[0]] + ["   " + text.replace("\n", "\n   ") if text else "" for text in lines[1:]]
+
+
+def comment_label(review):
+    """Headings for inline suggestions, tying each to its numbered finding or nit in the body."""
+    def label(index, item):
+        if index is not None:
+            return f"**{index + 1}. {clean(item['title'], 300)}** (local-autoreviewer)"
+        return f"**Nit:** {clean(item['text'], 300)} (local-autoreviewer)"
+    return label
+
+
 def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
     agent_name = AGENT_NAMES.get(agent, agent)
     model_note = f" ({clean(model, 80)})" if model else ""
@@ -150,34 +229,17 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
         clean(review["summary"]),
         "",
     ]
+    # Findings are already in this order (blocker first, demoted nits last); numbering follows it.
+    numbered = list(enumerate(review["findings"], 1))
     findings = []
-    if review["findings"]:
+    if any(item["severity"] != "nit" for _, item in numbered):
         findings.append("#### Findings")
-        counter = 0
         for severity in SEVERITIES:
-            items = [f for f in review["findings"] if f["severity"] == severity]
-            if not items:
-                continue
-            findings.append(f"\n**{severity.capitalize()}**\n")
-            for item in items:
-                counter += 1
-                where = _location(repo, sha, item["file"], item["line"])
-                line = f"{counter}. **{clean(item['title'], 500)}**"
-                if where:
-                    line += f" — {where}"
-                rating = [clean(item["category"], 40)]
-                if item.get("impact") is not None:
-                    rating.append(f"impact {item['impact']}/10")
-                if item.get("likelihood"):
-                    rating.append(item["likelihood"])
-                line += f" _({', '.join(rating)})_"
-                findings.append(line)
-                if item.get("trigger"):
-                    findings.append("   **When:** " + clean(item["trigger"], 2000).replace("\n", "\n   "))
-                if item["detail"]:
-                    findings.append("   " + clean(item["detail"]).replace("\n", "\n   "))
-                if item["suggestion"]:
-                    findings.append("   > **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n   > "))
+            items = [(n, item) for n, item in numbered if item["severity"] == severity]
+            if items:
+                findings.append(f"\n**{severity.capitalize()}**\n")
+                for n, item in items:
+                    findings += _finding(n, item, repo, sha)
         findings.append("")
     else:
         findings += ["No significant issues found.", ""]
@@ -187,13 +249,17 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
             extras.append(f"#### {title}")
             extras += [f"- {clean(item, 2000)}" for item in items]
             extras.append("")
+    demoted = [(n, item) for n, item in numbered if item["severity"] == "nit"]
     nits = review["nits"][:MAX_NITS]
     nit_lines = []
-    if nits:
-        nit_lines += [f"<details><summary>Nits ({len(nits)})</summary>", ""]
+    if demoted or nits:
+        nit_lines += [f"<details><summary>Nits ({len(demoted) + len(nits)})</summary>", ""]
+        for n, item in demoted:
+            nit_lines += _finding(n, item, repo, sha)
         for nit in nits:
             where = _location(repo, sha, nit["file"], nit["line"])
             nit_lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}")
+            nit_lines += ["  " + text if text else "" for text in _proposed_changes(nit.get("edits") or [])]
         nit_lines += ["", "</details>", ""]
     footer = ["---", f"<sub>local-autoreviewer · job {job_id} · {agent_name}</sub>", marker(job_id, sha, agent)]
 

@@ -28,6 +28,14 @@ $agent_note
 6. **Readability and docs:** misleading names, missing or stale docs and comments for non-obvious behaviour.
 7. **Nits:** at most 15 minor style points. Skip anything a formatter or linter would catch.
 
+## Proposed changes
+
+Propose the exact fix for every finding, and for nits where it's simple, in `edits`, so it can be applied with one click:
+- Each edit replaces lines `start_line` to `end_line` (inclusive, numbered as in the PR's version of the file in `$worktree`) with `replacement`: the complete new text of those lines, with the file's own indentation, and no line numbers or diff markers. An empty `replacement` deletes the lines. To insert lines, replace a neighbouring line with itself plus the new ones.
+- Keep each edit to one contiguous range and as small as the fix allows; use several edits when a fix touches several places. Edits within the lines the PR's diff shows become one-click suggestions on the PR; others are shown as a diff in the review.
+- Leave `edits` empty only when the fix can't be written that way (a new file, or a restructuring too large to spell out), and say why in `suggestion`.
+- `readability`: whether your proposed edits make the code `better`, the `same` or `worse` to read than it is now. A fix can be correct and still be harder to read; say so when it is.
+
 ## Severity and impact
 
 Rate each finding by what it would realistically cost the people using this project, not by how subtle or interesting it is.

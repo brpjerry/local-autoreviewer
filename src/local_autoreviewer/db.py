@@ -2,6 +2,7 @@
 """SQLite state: PR snapshots, trigger events and the review job queue."""
 
 import contextlib
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -56,6 +57,7 @@ MIGRATIONS = [
         severity TEXT, impact INTEGER, likelihood TEXT, occurs_when TEXT, category TEXT,
         file TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL DEFAULT 0, title TEXT NOT NULL,
         detail TEXT NOT NULL DEFAULT '', suggestion TEXT NOT NULL DEFAULT '',
+        reviewer_severity TEXT, readability TEXT, loc_delta INTEGER, edits TEXT NOT NULL DEFAULT '[]',
         rated_impact INTEGER, disposition TEXT, fixed_in TEXT, note TEXT,
         triaged_by TEXT, triaged_at INTEGER,
         UNIQUE (job_id, kind, position));
@@ -160,18 +162,28 @@ def record_review(conn, job_id, review, *, effort=None, prompt_version=None):
     """Keep a validated review's contents for analysis, replacing any earlier record for the job."""
     conn.execute("DELETE FROM findings WHERE job_id=?", (job_id,))
     rows = [(job_id, "finding", i, f["severity"], f.get("impact"), f.get("likelihood") or None,
-             f.get("trigger") or None, f["category"], f["file"], f["line"], f["title"], f["detail"], f["suggestion"])
+             f.get("trigger") or None, f["category"], f["file"], f["line"], f["title"], f["detail"], f["suggestion"],
+             f.get("reviewer_severity"), f.get("readability"), f.get("loc_delta"), _edits_json(f))
             for i, f in enumerate(review["findings"])]
     for kind, texts in (("test_gap", review["test_gaps"]), ("question", review["questions"])):
-        rows += [(job_id, kind, i, None, None, None, None, None, "", 0, text, "", "") for i, text in enumerate(texts)]
-    rows += [(job_id, "nit", i, None, None, None, None, None, n["file"], n["line"], n["text"], "", "")
+        rows += [(job_id, kind, i, None, None, None, None, None, "", 0, text, "", "", None, None, None, "[]")
+                 for i, text in enumerate(texts)]
+    rows += [(job_id, "nit", i, None, None, None, None, None, n["file"], n["line"], n["text"], "", "",
+              None, None, None, _edits_json(n))
              for i, n in enumerate(review["nits"])]
     conn.executemany(
         "INSERT INTO findings (job_id, kind, position, severity, impact, likelihood, occurs_when, category, file,"
-        " line, title, detail, suggestion) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        " line, title, detail, suggestion, reviewer_severity, readability, loc_delta, edits)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     known = {"effort": effort, "prompt_version": prompt_version}
     update_job(conn, job_id, summary=review["summary"], review_recorded=1,
                **{key: value for key, value in known.items() if value is not None})
+
+
+def _edits_json(item):
+    """A finding's or nit's proposed edits, as recorded: where, what, and whether it was a one-click suggestion."""
+    return json.dumps([{key: edit.get(key) for key in ("file", "start_line", "end_line", "replacement", "inline")}
+                       for edit in item.get("edits") or []])
 
 
 def triage(conn, finding_id, *, now, rated_impact=None, disposition=None, fixed_in=None, note=None, by=None):

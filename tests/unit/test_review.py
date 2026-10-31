@@ -67,6 +67,18 @@ class RenderTests(unittest.TestCase):
         self.assertIn("_(security, impact 9/10, common)_", body)
         self.assertIn("**When:** Any search with a quote.", body)
 
+    def test_render_shows_severity_changes_and_demoted_findings(self):
+        raised = dict(SAMPLE["findings"][0], severity="major", reviewer_severity="minor",
+                      severity_notes=["removes 3 lines"], title="Shorter")
+        demoted = dict(SAMPLE["findings"][0], severity="nit", reviewer_severity="major",
+                       severity_notes=["less readable"], title="Clever")
+        body = self.render(dict(SAMPLE, findings=[raised, demoted], nits=[]))
+        self.assertIn("1. **Shorter**", body)
+        self.assertIn("raised from minor: removes 3 lines", body)
+        nits = body[body.index("<details><summary>Nits (1)</summary>"):]
+        self.assertIn("2. **Clever**", nits)
+        self.assertIn("lowered from major: less readable", nits)
+
     def test_prompt_version(self):
         self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")
         self.assertEqual(review.prompt_version(), review.prompt_version())

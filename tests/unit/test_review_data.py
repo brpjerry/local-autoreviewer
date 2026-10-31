@@ -79,6 +79,12 @@ class ReviewDataTests(EnvTestCase):
         self.assertEqual((job["review_recorded"], job["effort"], job["prompt_version"], job["summary"]),
                          (1, self.cfg.agents["claude"].effort, review.prompt_version(),
                           "Adds a divide helper; one real bug."))
+        (recorded,) = self.rows("SELECT reviewer_severity, readability, loc_delta, edits FROM findings"
+                                " WHERE job_id=? AND kind='finding'", job_id)
+        self.assertEqual({key: recorded[key] for key in ("reviewer_severity", "readability", "loc_delta")},
+                         {"reviewer_severity": "major", "readability": "same", "loc_delta": 2})
+        self.assertEqual([(e["file"], e["start_line"], e["inline"]) for e in json.loads(recorded["edits"])],
+                         [("src/calc.py", 2, True)])
         findings = self.rows("SELECT kind, position, severity, impact, likelihood, occurs_when, file, line, title"
                              " FROM findings WHERE job_id=? ORDER BY kind, position", job_id)
         self.assertEqual(findings, [

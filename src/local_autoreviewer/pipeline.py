@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, events, leakscan, review
+from . import db, events, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .github import GitHubError
@@ -441,11 +441,15 @@ def _run(conn, svc, job, cancel):
         return _retry(conn, svc, job, result.error or "agent failed")
 
     structured = review.validate(result.review)
+    hunks = suggestions.diff_hunks(Path(paths.context, "pr.diff").read_text(errors="replace"))
+    structured = suggestions.apply(structured, worktree=paths.worktree, hunks=hunks, test_paths=repo_cfg.test_paths)
     body = review.render(structured, repo=job["repo"], number=job["number"], sha=job["head_sha"],
                          base_ref=pr["baseRefName"], agent=job["agent"], model=job["model"], job_id=job["id"])
+    inline = suggestions.comments(structured, review.comment_label(structured))
     Path(paths.out, "review.json").write_text(json.dumps(structured, indent=2))
     Path(paths.out, "review.md").write_text(body)
-    hits = leakscan.scan(body, svc.secrets())
+    Path(paths.out, "comments.json").write_text(json.dumps(inline, indent=2))
+    hits = leakscan.scan("\n".join([body, *(comment["body"] for comment in inline)]), svc.secrets())
     if hits:
         raise Outcome("blocked", f"possible credential in review ({', '.join(hits)}); not posted, see "
                                  f"{paths.out}/review.md")
@@ -530,15 +534,30 @@ def recover_post(conn, svc, job):
         return _finish(conn, svc, job["id"], outcome.status, outcome.reason, **outcome.fields)
 
 
+def _post_review(svc, job, body, inline):
+    """Post the review with its inline suggestions. If GitHub refuses those (HTTP 422, e.g. a line it
+    doesn't count as part of the diff), post the body alone: it shows every proposed change too."""
+    try:
+        return svc.github.post_review(job["repo"], job["number"], job["head_sha"], body, comments=inline)
+    except GitHubError as exc:
+        if not inline or not re.search(r"\bHTTP 422\b", str(exc)):
+            raise
+        log.warning("job %s: GitHub refused the inline suggestions (%s); posting the review without them",
+                    job["id"], exc)
+        return svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
+
+
 def post(conn, svc, job):
     """Post out/review.md for a job, after confirming the PR still points at the reviewed head."""
     paths = job_paths(svc.state, job["id"])
     body = Path(paths.out, "review.md").read_text()
+    saved = Path(paths.out, "comments.json")
+    inline = json.loads(saved.read_text()) if saved.is_file() else []
     with db.transaction(conn):
         db.update_job(conn, job["id"], status="posting")
     try:
         _check_pr(svc, job)
-        response = svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
+        response = _post_review(svc, job, body, inline)
         review_id, review_url = response.get("id"), response.get("html_url")
     except Outcome:
         raise  # the PR closed, moved or was retargeted: not a failed post

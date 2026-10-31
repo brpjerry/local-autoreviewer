@@ -118,6 +118,40 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
         self.assertEqual(self.github.posted, [])
 
+    def test_proposed_changes_are_posted_as_suggestions(self):
+        svc, (job_id,) = self.queue()
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        (posted,) = self.github.posted
+        self.assertEqual([(c["path"], c["line"]) for c in posted["comments"]], [("src/calc.py", 2), ("src/calc.py", 1)])
+        self.assertIn('```suggestion\n    if b == 0:\n        raise ValueError("b must not be zero")\n    return a / b\n```',
+                      posted["comments"][0]["body"])
+        self.assertIn("**1. Division by zero is unhandled**", posted["comments"][0]["body"])
+        self.assertIn("Proposed change to <code>src/calc.py:2</code> (also a one-click suggestion on the PR)",
+                      posted["body"])  # the body stands on its own
+        saved = json.loads(Path(pipeline.job_paths(self.state, job_id).out, "comments.json").read_text())
+        self.assertEqual(saved, posted["comments"])
+
+    def test_refused_suggestions_fall_back_to_the_review_alone(self):
+        svc, (job_id,) = self.queue()
+        real_post = self.github.post_review
+
+        def no_inline(*args, comments=None):
+            if comments:
+                raise GitHubError("gh: Unprocessable Entity: pull_request_review_thread.line must be part of the diff"
+                                  " (HTTP 422)")
+            return real_post(*args)
+
+        self.github.post_review = no_inline
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        (posted,) = self.github.posted
+        self.assertEqual(posted["comments"], [])
+        self.assertIn("Proposed change to <code>src/calc.py:2</code>", posted["body"])
+
+    def test_a_token_in_a_proposed_change_blocks_posting(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, claude="leak_edit"))
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "blocked")
+        self.assertEqual(self.github.posted, [])
+
     def test_leaked_token_blocks_posting(self):
         cfg = make_config(self.tmp, claude="leak")
         svc, (job_id,) = self.queue(cfg)
@@ -217,8 +251,8 @@ class PipelineTests(EnvTestCase):
         svc, (job_id,) = self.queue()
         real_post = self.github.post_review
 
-        def post_then_time_out(*args):
-            real_post(*args)  # GitHub accepted it, but the response never arrived
+        def post_then_time_out(*args, **kwargs):
+            real_post(*args, **kwargs)  # GitHub accepted it, but the response never arrived
             raise GitHubError("timed out")
 
         self.github.post_review = post_then_time_out
@@ -232,7 +266,7 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(len(self.agent_log("claude")), 1)  # the agent didn't run again
 
     def failing_post(self, message):
-        def post_review(*args):
+        def post_review(*args, **kwargs):
             raise GitHubError(message)
         self.github.post_review = post_review
 
@@ -353,8 +387,8 @@ class PipelineTests(EnvTestCase):
         svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 1}))
         real_post = self.github.post_review
 
-        def post_then_time_out(*args):
-            real_post(*args)
+        def post_then_time_out(*args, **kwargs):
+            real_post(*args, **kwargs)
             raise GitHubError("gh api repos/o/r timed out")
 
         self.github.post_review = post_then_time_out
@@ -363,7 +397,7 @@ class PipelineTests(EnvTestCase):
 
     def test_a_garbled_response_to_the_first_post_does_not_rerun_the_agent(self):
         svc, (job_id,) = self.queue()
-        self.github.post_review = lambda *args: None  # no JSON object came back
+        self.github.post_review = lambda *args, **kwargs: None  # no JSON object came back
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
         self.assertEqual(len(self.agent_log("claude")), 1)
 
@@ -406,11 +440,11 @@ class PipelineTests(EnvTestCase):
         svc, (job_id,) = self.foreground(post=True)
         real_post, calls = self.github.post_review, []
 
-        def flaky_post(*args):
+        def flaky_post(*args, **kwargs):
             calls.append(args)
             if len(calls) == 1:
                 raise GitHubError("gh api repos/o/r timed out")
-            return real_post(*args)
+            return real_post(*args, **kwargs)
 
         self.github.post_review = flaky_post
         waits = []
@@ -764,7 +798,7 @@ class PipelineTests(EnvTestCase):
         out.mkdir(parents=True)
         (out / "review.md").write_text("Reviewed.\n")
 
-        def broken_post(*args):
+        def broken_post(*args, **kwargs):
             raise ValueError("unexpected response")
 
         self.github.post_review = broken_post
@@ -1102,6 +1136,17 @@ class WorkerTests(EnvTestCase):
             db.update_job(conn, job_id, status="posting")
         conn.close()
         return job_id
+
+    def test_interrupted_post_keeps_its_suggestions(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Looks good.\n")
+        comment = {"path": "src/calc.py", "line": 2, "side": "RIGHT", "body": "```suggestion\n    return a // b\n```"}
+        (out / "comments.json").write_text(json.dumps([comment]))
+        recover_posts(Worker(lambda c: svc, None), svc)
+        self.assertEqual([r["comments"] for r in self.github.posted], [[comment]])
 
     def test_interrupted_post_with_saved_output_is_posted_once(self):
         svc = self.services(make_config(self.tmp, agents=("claude",)))
