@@ -921,7 +921,8 @@ def post_failed(conn, svc, job, exc):
     `posting` for marker-checked recovery, without running the agent again, for max_attempts post
     attempts (counted apart from the agent's); a definite refusal fails it at once. The review stays
     in out/review.md either way."""
-    post_attempts = db.get_job(conn, job["id"])["post_attempts"] + 1
+    current = db.get_job(conn, job["id"])  # _round_post may have released the round since `job` was read
+    post_attempts = current["post_attempts"] + 1
     rejected = _rejected(exc)
     if not rejected and post_attempts >= svc.config.service.max_attempts:
         try:  # out of retries: one last look, in case a failure that wasn't a refusal did reach GitHub
@@ -933,7 +934,7 @@ def post_failed(conn, svc, job, exc):
                            post_attempts=post_attempts, review_id=existing.get("id"),
                            review_url=existing.get("html_url"))
     if rejected or post_attempts >= svc.config.service.max_attempts:
-        saved = f"review saved to {job_paths(svc.state, job['id']).out}/{'round' if job['posted_with'] else 'review'}.md"
+        saved = f"review saved to {job_paths(svc.state, job['id']).out}/{'round' if current['posted_with'] else 'review'}.md"
         return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000],
                        post_attempts=post_attempts, error=str(exc)[:2000])
     log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)

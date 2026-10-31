@@ -346,6 +346,15 @@ class RoundTests(EnvTestCase):
         self.assertEqual([p["body"].count("Automated review · ") for p in self.github.posted], [1, 1])
         self.assertEqual(self.rows(svc, "SELECT id FROM findings WHERE duplicate_of IS NOT NULL"), [])
 
+    def test_a_refused_fallback_post_points_at_the_review_it_tried(self):
+        svc, (claude, codex) = self.queue()
+        self.run_job(svc, claude)
+        Path(pipeline.job_paths(self.state, claude).out, "review.json").write_text("{not json")
+        self.github.post_review = mock.Mock(side_effect=GitHubError("gh api failed: Not Found (HTTP 404)"))
+        self.assertEqual(self.run_job(svc, codex), "failed")
+        self.assertIn(f"{pipeline.job_paths(self.state, codex).out}/review.md", self.job(svc, codex)["reason"])
+        self.assertEqual(self.job(svc, claude)["status"], "waiting")  # released before the post: not failed with it
+
     def test_a_carried_review_is_never_retried_on_its_own(self):
         svc, (claude, codex) = self.queue()
         real_post = self.github.post_review
