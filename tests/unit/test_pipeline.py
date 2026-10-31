@@ -245,17 +245,17 @@ class PipelineTests(EnvTestCase):
         self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
 
     def test_a_rate_limited_post_is_retried(self):
+        svc, (job_id,) = self.queue()
         for message in ("gh: API rate limit exceeded for user ID 1. (HTTP 403)",
                         "gh: You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)",
                         "gh: Too Many Requests (HTTP 429)", "gh: Request Timeout (HTTP 408)"):
             with self.subTest(message=message):
-                svc, (job_id,) = self.queue()
+                conn = svc.connect()
+                with db.transaction(conn):  # run the same job again from the start
+                    db.update_job(conn, job_id, status="running", post_attempts=0)
+                conn.close()
                 self.failing_post(message)
                 self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
-                conn = svc.connect()
-                with db.transaction(conn):  # the next subtest queues the same job again
-                    conn.execute("DELETE FROM jobs")
-                conn.close()
 
     def test_post_failures_end_after_max_attempts(self):
         svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 2}))
