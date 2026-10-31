@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import fcntl
 import sqlite3
 import threading
 import unittest
@@ -110,12 +111,18 @@ class PollTests(EnvTestCase):
         self.poll()
         self.github.set_pr(1, "a" * 40, state="CLOSED")
         real_view = self.github.pr_view
-        self.github.pr_view = lambda repo, number: (_ for _ in ()).throw(GitHubError("HTTP 502"))
+
+        def failing_view(repo, number):
+            raise GitHubError("HTTP 502")
+
+        self.github.pr_view = failing_view
         results, failures = poll_mod.poll(self.svc)
         self.assertEqual((results, failures), ({}, 1))
         self.assertEqual(len(self.jobs("status='queued'")), 2)  # the open PR's jobs are untouched
+        with open(self.state / "poll.lock") as handle:  # raises BlockingIOError if still held
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.github.pr_view = real_view
-        self.assertEqual(self.poll(), [(1, "closed")])  # lock released: the next poll runs
+        self.assertEqual(self.poll(), [(1, "closed")])
 
     def test_an_unconfirmed_open_pr_is_left_for_the_next_poll(self):
         conn = self.svc.connect()
