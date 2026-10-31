@@ -179,6 +179,15 @@ class FollowupTests(EnvTestCase):
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
 
+    def test_dropped_edits_are_not_shown_to_the_followup(self):
+        row = {"id": 1, "agent": "claude", "severity": "minor", "impact": 2, "title": "t", "file": "a.py", "line": 3,
+               "raised_at": "abc", "occurs_when": "w", "detail": "d", "suggestion": "s",
+               "edits": json.dumps([
+                   {"file": "a.py", "start_line": 3, "end_line": 3, "replacement": "x", "anchor": "moved"},
+                   {"file": "a.py", "start_line": 9, "end_line": 9, "replacement": "y", "anchor": "dropped"}])}
+        (finding,) = pipeline.PreviousRound("abc", [row]).for_agent()
+        self.assertEqual([e["replacement"] for e in finding["proposed_edits"]], ["x"])
+
     def stacked(self):
         """PR 1 rebuilt on top of another PR's branch, `lower`, and reviewed there. Returns PR 1's head."""
         work, bare = self.remote.work, str(self.remote.bare)

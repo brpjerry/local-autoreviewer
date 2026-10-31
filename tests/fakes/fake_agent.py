@@ -41,6 +41,21 @@ def followup(context):
             "regressions": [regression]}
 
 
+def anchored(review, offset):
+    """The review with each edit's `current` copied from the checkout (the working directory), as a careful
+    reviewer would; offset then shifts every stated range, as a reviewer that misremembers line numbers does."""
+    def edit(e):
+        path = Path(e["file"])
+        lines = path.read_text().splitlines() if path.is_file() else []
+        return {**e, "current": "\n".join(lines[e["start_line"] - 1:e["end_line"]]),
+                "start_line": e["start_line"] + offset, "end_line": e["end_line"] + offset}
+    out = dict(review)
+    for key in ("findings", "nits", "regressions"):
+        if key in out:
+            out[key] = [{**item, "edits": [edit(e) for e in item.get("edits", [])]} for item in out[key]]
+    return out
+
+
 def value_after(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
@@ -69,6 +84,7 @@ def main():
         finding = dict(review["findings"][0])
         finding["edits"] = [dict(finding["edits"][0], replacement="    TOKEN = 'ghp_" + "B" * 36 + "'")]
         review["findings"] = [finding]
+    review = anchored(review, 1 if mode == "offby1" else 0)
     if mode == "badjson":
         review = {"nope": True}
     if codex:

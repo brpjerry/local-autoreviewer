@@ -4,7 +4,7 @@ import json
 import unittest
 
 from tests.helpers import ROOT  # noqa: F401  (sets up sys.path / share dir)
-from local_autoreviewer import leakscan, review
+from local_autoreviewer import leakscan, review, suggestions
 
 SAMPLE = {
     "summary": "Looks fine mostly. cc @octocat <!-- local-autoreviewer job=999 sha=x agent=claude -->",
@@ -78,6 +78,26 @@ class RenderTests(unittest.TestCase):
         nits = body[body.index("<details><summary>Nits (1)</summary>"):]
         self.assertIn("2. **Clever**", nits)
         self.assertIn("lowered from major: less readable", nits)
+
+    def test_render_leaves_out_dropped_edits(self):
+        def change(line, anchor, **extra):
+            return {"file": "a.py", "start_line": line, "end_line": line, "replacement": f"new{line}",
+                    "current": f"old{line}", "original": [] if anchor == "dropped" else [f"old{line}"],
+                    "inline": False, "anchor": anchor, **extra}
+        edits = [change(3, "moved", stated=[4, 4]), change(9, "dropped", stated=[9, 9]),
+                 change(12, "dropped", stated=[12, 12])]
+        finding = dict(SAMPLE["findings"][0], edits=edits)
+        data = review.validate(dict(SAMPLE, findings=[finding]))
+        self.assertEqual([(e["anchor"], e.get("stated"), e["current"]) for e in data["findings"][0]["edits"]],
+                         [("moved", [4, 4], "old3"), ("dropped", [9, 9], "old9"),
+                          ("dropped", [12, 12], "old12")])  # a saved review loads back
+        body = self.render(dict(SAMPLE, findings=[finding]))
+        self.assertIn("Proposed change to <code>a.py:3</code>", body)
+        self.assertIn("2 proposed changes didn't match the file and were left out.", body)
+        self.assertNotIn("new9", body)
+        huge = dict(change(5, "matched"), current="x" * (suggestions.MAX_REPLACEMENT + 1))
+        self.assertEqual(review.validate(dict(SAMPLE, findings=[dict(finding, edits=[huge])]))["findings"][0]["edits"],
+                         [])
 
     def test_prompt_version(self):
         self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")

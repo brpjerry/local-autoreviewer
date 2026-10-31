@@ -67,6 +67,68 @@ class SuggestionTests(unittest.TestCase):
             with self.subTest(edit=bad):
                 self.assertIsNone(suggestions.check_edit(bad, self.worktree))
 
+    def place(self, *args, **extra):
+        checked = suggestions.check_edit(edit(*args, **extra), self.worktree)
+        return checked and (checked["start_line"], checked["end_line"], checked["anchor"], checked.get("stated"))
+
+    def test_edits_are_anchored_by_their_current_text(self):
+        self.assertEqual(self.place("src/app.py", 2, 3, "B", current="b\nc"), (2, 3, "matched", None))
+        self.assertEqual(self.place("src/app.py", 3, 4, "B", current="b\nc\n"), (2, 3, "moved", [3, 4]))
+        self.assertEqual(self.place("src/app.py", 4, 5, "D", current="d"), (4, 4, "moved", [4, 5]))  # past the end
+        self.assertEqual(self.place("src/app.py", 1, 1, "A", current="zzz"), (1, 1, "dropped", [1, 1]))
+        self.assertEqual(self.place("src/app.py", 4, 4, "D", current="c\nd\ne"), (4, 4, "dropped", [4, 4]))
+        self.assertEqual(self.place("src/app.py", 1, 1, "A"), (1, 1, "unverified", None))  # an older review
+        self.assertIsNone(self.place("src/app.py", 4, 5, "D"))
+        checked = suggestions.check_edit(edit("src/app.py", 2, 3, "B", current="b\nc"), self.worktree)
+        self.assertEqual(checked["original"], ["b", "c"])
+        dropped = suggestions.check_edit(edit("src/app.py", 1, 1, "A", current="zzz"), self.worktree)
+        self.assertEqual(dropped["original"], [])
+
+    def test_anchoring_prefers_the_nearest_copy_and_ignores_trailing_whitespace(self):
+        (self.worktree / "src/lib.py").write_text("return x\nq\n\ny = 2  \nreturn x\n")
+        self.assertEqual(self.place("src/lib.py", 5, 5, "r", current="return x"), (5, 5, "matched", None))
+        self.assertEqual(self.place("src/lib.py", 4, 4, "r", current="return x"), (5, 5, "moved", [4, 4]))
+        self.assertEqual(self.place("src/lib.py", 2, 2, "r", current="return x"), (1, 1, "moved", [2, 2]))
+        self.assertEqual(self.place("src/lib.py", 4, 4, "y = 3", current="y = 2"), (4, 4, "matched", None))
+        self.assertEqual(self.place("src/lib.py", 3, 3, "r", current="return x"), (3, 3, "dropped", [3, 3]))  # a tie
+        self.assertEqual(self.place("src/lib.py", 3, 3, "", current=""), (3, 3, "matched", None))  # a blank line
+        self.assertEqual(self.place("src/lib.py", 2, 2, "", current=" "), (2, 2, "dropped", [2, 2]))  # not moved
+        checked = suggestions.check_edit(edit("src/lib.py", 4, 4, "y = 3", current="y = 2"), self.worktree)
+        self.assertEqual(checked["original"], ["y = 2  "])  # the file's text, for the shown diff and loc_delta
+
+    def test_anchoring_beyond_the_window_needs_the_only_copy(self):
+        (self.worktree / "src/long.py").write_text("dup\n" + "pad\n" * 100 + "dup\nsolo\n")  # dup: 1 and 102
+        window = suggestions.ANCHOR_WINDOW
+        self.assertEqual(self.place("src/long.py", 1 + window, 1 + window, "d", current="dup")[:3], (1, 1, "moved"))
+        self.assertEqual(self.place("src/long.py", 2 + window, 2 + window, "d", current="dup")[2], "dropped")
+        self.assertEqual(self.place("src/long.py", 102 - window, 102 - window, "d", current="dup")[:3],
+                         (102, 102, "moved"))
+        self.assertEqual(self.place("src/long.py", 101 - window, 101 - window, "d", current="dup")[2], "dropped")
+        self.assertEqual(self.place("src/long.py", 1, 1, "s", current="solo"), (103, 103, "moved", [1, 1]))
+
+    def test_anchoring_counts_lines_as_github_does(self):
+        (self.worktree / "src/blank.py").write_text("a\n\nb\x0cc\nd\n")
+        self.assertEqual(self.place("src/blank.py", 1, 2, "", current="a\n"), (1, 2, "matched", None))  # a, blank
+        self.assertEqual(self.place("src/blank.py", 1, 1, "", current="a\n"), (1, 1, "matched", None))
+        self.assertEqual(self.place("src/blank.py", 4, 4, "", current="d"), (4, 4, "matched", None))  # not at \x0c
+
+    def test_dropped_edits_count_for_nothing(self):
+        edits = [suggestions.check_edit(e, self.worktree) for e in
+                 (edit("src/app.py", 1, 2, "", current="a\nb"), edit("src/app.py", 1, 3, "x\ny", current="nope"))]
+        self.assertEqual(suggestions.loc_delta(edits, DEFAULT_TEST_PATHS), -2)
+        data = {"findings": [self.finding("minor", [edit("src/app.py", 1, 1, "", current="nope")])], "nits": []}
+        out = suggestions.apply(data, worktree=self.worktree, hunks={"src/app.py": [(1, 4)]},
+                                test_paths=DEFAULT_TEST_PATHS)
+        (finding,) = out["findings"]
+        self.assertEqual((finding["loc_delta"], finding["severity"]), (0, "minor"))  # not raised for removing a line
+        self.assertEqual([(e["anchor"], e["inline"]) for e in finding["edits"]], [("dropped", False)])
+        self.assertEqual(suggestions.comments(out, review.comment_label(out)), [])
+        unshown = self.finding("major", [edit("src/app.py", 1, 1, "", current="nope")], readability="worse")
+        no_edits = self.finding("major", readability="worse")
+        out = suggestions.apply({"findings": [unshown, no_edits], "nits": []}, worktree=self.worktree, hunks={},
+                                test_paths=DEFAULT_TEST_PATHS)
+        self.assertEqual([f["severity"] for f in out["findings"]], ["major", "nit"])  # a fix not shown isn't rated
+
     def test_loc_delta_ignores_tests(self):
         edits = [suggestions.check_edit(e, self.worktree) for e in
                  (edit("src/app.py", 1, 3, "abc"), edit("tests/test_app.py", 1, 1, "t1\nt1b\nt1c"))]

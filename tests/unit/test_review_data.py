@@ -97,6 +97,16 @@ class ReviewDataTests(EnvTestCase):
              "occurs_when": None, "file": "", "line": 0, "title": "No test for b == 0."},
         ])
 
+    def test_misplaced_edits_are_moved_to_their_text(self):
+        job_id, status = self.run_job(make_config(self.tmp, claude="offby1"))  # every range stated a line late
+        self.assertEqual(status, "posted")
+        self.assertEqual([(c["path"], c["line"]) for c in self.github.posted[-1]["comments"]],
+                         [("src/calc.py", 2), ("src/calc.py", 1)])
+        edits = [json.loads(r["edits"]) for r in self.rows("SELECT edits FROM findings WHERE job_id=? AND kind IN"
+                                                          " ('finding', 'nit') ORDER BY kind", job_id)]
+        self.assertEqual([[(e["start_line"], e["anchor"], e["stated"]) for e in item] for item in edits],
+                         [[(2, "moved", [3, 3])], [(1, "moved", [2, 2])]])
+
     def test_a_no_post_review_is_recorded_too(self):
         job_id, status = self.run_job(post=False)
         self.assertEqual(status, "skipped")
