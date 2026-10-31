@@ -46,10 +46,13 @@ class RealAgentTests(EnvTestCase):
         self.outside = self.tmp / "outside-secret.txt"
         self.outside.write_text("OUTSIDE-CANARY-5521\n")
 
-    def run_agent(self, agent):
+    def svc(self):
         svc = self.services(self.cfg)
         if shutil.which("systemd-run"):
             svc.runner = LocalRunner()
+        return svc
+
+    def start_job(self, svc, agent):
         conn = svc.connect()
         with db.transaction(conn):
             job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent=agent,
@@ -57,6 +60,22 @@ class RealAgentTests(EnvTestCase):
                                    now=self.clock(), post=True)
             db.update_job(conn, job_id, status="running", started_at=self.clock())
         conn.close()
+        return job_id
+
+    def use_test_codex_home(self):
+        home = os.environ.get("LOCAL_AUTOREVIEWER_TEST_CODEX_HOME")
+        if home:
+            original = codex_mod.CodexAgent.__init__
+
+            def init(agent, cfg, state_dir):
+                original(agent, cfg, state_dir)
+                agent.home = Path(home)
+            codex_mod.CodexAgent.__init__ = init
+            self.addCleanup(setattr, codex_mod.CodexAgent, "__init__", original)
+
+    def run_agent(self, agent):
+        svc = self.svc()
+        job_id = self.start_job(svc, agent)
         status = pipeline.run_job(svc, job_id, pipeline.CancelToken())
         conn = svc.connect()
         job = dict(db.get_job(conn, job_id))
@@ -98,17 +117,25 @@ class RealAgentTests(EnvTestCase):
 
     @unittest.skipUnless("codex" in ENABLED, "codex not requested")
     def test_codex(self):
-        home = os.environ.get("LOCAL_AUTOREVIEWER_TEST_CODEX_HOME")
-        if home:
-            original = codex_mod.CodexAgent.__init__
-
-            def init(agent, cfg, state_dir):
-                original(agent, cfg, state_dir)
-                agent.home = Path(home)
-            codex_mod.CodexAgent.__init__ = init
-            self.addCleanup(setattr, codex_mod.CodexAgent, "__init__", original)
+        self.use_test_codex_home()
         job = self.run_agent("codex")
         self.assertTrue(job["session_id"])
+
+    @unittest.skipUnless({"claude", "codex"} <= ENABLED, "claude and codex not both requested")
+    def test_both_reviews_are_posted_as_one(self):
+        self.use_test_codex_home()
+        svc = self.svc()
+        ids = [self.start_job(svc, agent) for agent in ("claude", "codex")]
+        statuses = [pipeline.run_job(svc, job_id, pipeline.CancelToken()) for job_id in ids]
+        self.assertEqual(statuses, ["waiting", "posted"])
+        (posted,) = self.github.posted
+        print(f"\n--- both reviews (jobs {ids}) ---\n{posted['body']}\n")
+        self.assertIn("Claude Code (haiku) and Codex", posted["body"])
+        self.assertNotIn("OUTSIDE-CANARY", posted["body"])
+        record = json.loads(Path(pipeline.job_paths(svc.state, ids[1]).out, "round.json").read_text())
+        self.assertEqual(record["unchecked"], "")
+        self.assertIn("answer", record)  # Codex ran the duplicate check and answered in its schema
+        print(f"duplicates: {record['answer']}")
 
 
 if __name__ == "__main__":

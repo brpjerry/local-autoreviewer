@@ -44,12 +44,13 @@ def record(conn, event, now):
 
 
 def stop_jobs(conn, repo, number, status, reason, *, agent=None, keep=None):
-    """Supersede/cancel active jobs. Queued ones end now; running ones get a cancel request."""
+    """Supersede/cancel active jobs. Queued ones, and finished reviews still waiting to be posted, end
+    now; running and posting ones get a cancel request."""
     stopped = []
     for job in db.active_jobs(conn, repo, number, agent):
         if keep and keep(job):
             continue
-        if job["status"] == "queued":
+        if job["status"] in ("queued", "waiting"):
             db.update_job(conn, job["id"], status=status, reason=reason)
         else:
             db.update_job(conn, job["id"], cancel_requested=1, reason=reason)

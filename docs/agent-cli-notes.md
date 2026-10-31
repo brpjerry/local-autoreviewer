@@ -41,6 +41,10 @@ Method: a throwaway repo with planted root and nested `CLAUDE.md` files, an `AGE
 | Kill tree | `systemctl --user stop <scope>` kills every process in it, including a `setsid` child. |
 | Slice naming | Dashes nest slices: `foo-bar.slice` lives under `foo.slice`. Hence `autoreviewer.slice`. |
 
+## Duplicate check
+
+Before the reviews of a commit are posted as one, the agent whose review finished last runs once more to find the items both reviews share. It is the same invocation as a review, with the same locked flags, in the same checkout and context directory. Only the prompt (`prompts/duplicates.md`, with the items inline) and the output schema (`prompts/duplicates.schema.json`) differ, and the output goes to `out/duplicates/`. The schema follows the same rules as the review schema: every object has `additionalProperties: false` and lists all its properties in `required`, which Codex's `--output-schema` needs.
+
 ## Footprint
 
 A small review took about 25 s with Claude Haiku and about 28 s with Codex at low reasoning effort. Larger PRs with stronger models take minutes; the default timeout is 20 minutes.

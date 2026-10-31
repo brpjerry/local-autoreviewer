@@ -56,6 +56,15 @@ def anchored(review, offset):
     return out
 
 
+def duplicates(prompt):
+    """A duplicate check's answer: items of the same kind with the same title or text are duplicates."""
+    items = json.loads(prompt.split("```json\n", 1)[1].rsplit("\n```", 1)[0])
+    sets = {}
+    for item in items:
+        sets.setdefault((item["kind"], item.get("title") or item["text"]), []).append(item["id"])
+    return {"duplicates": [{"ids": ids, "reason": "same text"} for ids in sets.values() if len(ids) > 1]}
+
+
 def value_after(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
@@ -73,6 +82,14 @@ def main():
     review = dict(REVIEW)
     if "This is a follow-up, not a new review." in prompt:
         review = followup(Path(os.getcwd()).parent / "context")
+    if mode == "trivial":
+        review = dict(review, summary="Bumps the version.", trivial=True, findings=[], test_gaps=[], nits=[])
+    if "Your only job is to find the duplicates" in prompt:
+        if mode == "dupfail":
+            print("boom: duplicate check crashed", file=sys.stderr)
+            return 3
+        review = duplicates(prompt)
+        mode = {"dupsleep": "sleep", "dupratelimit": "ratelimit"}.get(mode, "ok")
     if mode == "sleep":
         time.sleep(60)
     if mode == "fail":

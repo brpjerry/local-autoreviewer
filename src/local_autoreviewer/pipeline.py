@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 
-from . import db, events, leakscan, review, suggestions
+from . import combine, db, events, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
+from .config import AGENTS
 from .github import GitHubError
 from .gitops import GitError, ShaMismatch
 
@@ -31,6 +32,7 @@ FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usag
 FOREGROUND_CANCEL_POLL = 2.0  # seconds between a foreground job's checks for cancel requests
 POST_RECOVERY_RETRY = FOREGROUND_MAX_WAIT  # seconds before retrying a post; `review --post` waits it out
 assert POST_RECOVERY_RETRY <= FOREGROUND_MAX_WAIT
+DUPLICATE_CHECK_TIMEOUT = 10 * 60  # the check over the reviews of a commit before they are posted as one
 
 
 @dataclass
@@ -97,6 +99,7 @@ def _finish(conn, svc, job_id, status, reason, **fields):
     with db.transaction(conn):
         db.update_job(conn, job_id, status=status, reason=reason[:1000] if reason else reason,
                       **({"finished_at": svc.now()} if final else {}), **fields)
+        _settle_round(conn, svc, job_id, status, reason, fields)
     level = logging.WARNING if status in ("failed", "blocked") else logging.INFO
     log.log(level, "job %s -> %s: %s", job_id, status, reason)
     return status
@@ -270,7 +273,8 @@ def _finish_post(svc, job_id, sleep, notify):
         while True:
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
-            if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT:
+            # A review another job's post carries is finished by that post, never posted on its own.
+            if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT or job["posted_with"] not in (None, job_id):
                 return job["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
@@ -329,6 +333,23 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             conn.close()
 
 
+def finish_waiting(svc, job_id, *, sleep=time.sleep, notify=lambda message: None):
+    """For `review --post`, once all its jobs have run: post its job if it still waits, as the worker would,
+    and retry the post in place (see _finish_post). A job that waits for another, still to finish, is
+    left to the worker. Returns the job's status."""
+    conn = svc.connect()
+    try:
+        try:
+            status = post_waiting(conn, svc, job_id)
+        except Exception as exc:  # as in the worker: a failed attempt, if it got as far as posting
+            log.exception("job %s: posting a waiting review failed", job_id)
+            fail_post_attempt(conn, svc, job_id, exc)
+            status = db.get_job(conn, job_id)["status"]
+    finally:
+        conn.close()
+    return _finish_post(svc, job_id, sleep, notify) if status == "posting" else status
+
+
 def abandon(svc, job_ids, reason):
     """Cancel foreground jobs that are still queued or running: this process's own after Ctrl-C or
     an error, or a dead process's (from the worker). It re-reads each job, so one that has just
@@ -360,6 +381,8 @@ def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running"))
             (reason[:1000], svc.now(), job["id"], *only_if)).rowcount
         if cancelled and job["post"]:
             events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.token_owner)
+        if cancelled:
+            _settle_round(conn, svc, job["id"], "cancelled", reason, {})
     if cancelled:
         log.info("job %s -> cancelled: %s", job["id"], reason)
     return bool(cancelled)
@@ -420,12 +443,23 @@ def previous_round(conn, job, base_contains=lambda base_sha: False):
         else:
             ids.update(r[0] for r in conn.execute(
                 "SELECT id FROM findings WHERE job_id=? AND kind='finding'", (previous["id"],)))
-    findings = [dict(r) for r in conn.execute(
-        f"SELECT f.*, j.agent, j.head_sha AS raised_at FROM findings f JOIN jobs j ON j.id=f.job_id"
-        f" WHERE f.id IN ({','.join('?' * len(ids))})"
-        # Triaged as declined, a false positive, a duplicate or deferred: not asked about again.
-        " AND (f.disposition IS NULL OR f.disposition='fixed') ORDER BY f.id", sorted(ids))] if ids else []
+    # Triaged as declined, a false positive, a duplicate or deferred: not asked about again. Nor is a
+    # duplicate merged into another finding when the reviews were posted: that one stands for it.
+    findings = _finding_rows(conn, f"f.id IN ({','.join('?' * len(ids))}) AND f.duplicate_of IS NULL"
+                                   " AND (f.disposition IS NULL OR f.disposition='fixed')", sorted(ids)) if ids else []
     return PreviousRound(row["head_sha"], findings)
+
+
+def _finding_rows(conn, where, params):
+    """Finding rows with the agent that raised each, the head it was raised at, and in also_found_by the
+    agents whose duplicates of it were merged into it."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT f.*, j.agent, j.head_sha AS raised_at, (SELECT json_group_array(DISTINCT dj.agent) FROM findings d"
+        " JOIN jobs dj ON dj.id=d.job_id WHERE d.duplicate_of=f.id) AS also_found_by"
+        f" FROM findings f JOIN jobs j ON j.id=f.job_id WHERE {where} ORDER BY f.id", params)]
+    for row in rows:
+        row["also_found_by"] = [agent for agent in json.loads(row["also_found_by"] or "[]") if agent != row["agent"]]
+    return rows
 
 
 def _run(conn, svc, job, cancel):
@@ -555,7 +589,321 @@ def _run(conn, svc, job, cancel):
                          prompt_version=prompt_version, followup_of=previous.head_sha if previous else None)
     if not job["post"]:
         raise Outcome("skipped", f"posting disabled; review saved to {paths.out}/review.md")
-    return post(conn, svc, job)
+    return _post_round(conn, svc, db.get_job(conn, job["id"]), agent, cancel, title=pr.get("title", ""))
+
+
+# One post per commit ----------------------------------------------------------------
+# The reviews of a commit (the jobs for the same PR, head and base that post) are posted as one. A finished
+# review waits, status 'waiting', for the others still to run, for up to combine_wait. The review that
+# finishes last leads: it runs the duplicate check over them all, then claims the waiting ones (status
+# 'posting', posted_with = the leader) and posts them together. Its post's outcome is theirs too
+# (_settle_round). The worker posts a waiting review on its own once nothing is left to wait for, or the
+# wait is over (post_waiting); a review that finishes after that is posted on its own as well.
+
+def _siblings(conn, job, statuses):
+    """The other jobs that post a review of the job's commit, in one of these statuses."""
+    marks = ",".join("?" * len(statuses))
+    return conn.execute(
+        f"SELECT * FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND post=1 AND id!=?"
+        f" AND status IN ({marks}) ORDER BY id",
+        (job["repo"], job["number"], job["head_sha"], job["base_ref"], job["id"], *statuses)).fetchall()
+
+
+def _pending(conn, job):
+    """Reviews of the job's commit that are still to finish."""
+    return _siblings(conn, job, ("queued", "running"))
+
+
+def _waiting_with(conn, job):
+    """Finished reviews of the job's commit waiting to be posted that go in one post with it: full reviews,
+    or follow-ups of the same round."""
+    return [row for row in _siblings(conn, job, ("waiting",)) if row["followup_of"] == job["followup_of"]]
+
+
+def due(conn, svc, job):
+    """Whether a waiting review should be posted now: nothing it waits for is left to finish, or its wait
+    is over and none of those is running (a running review finishes within review_timeout), or combining
+    is off (combine_wait = 0, set while it waited)."""
+    if svc.config.service.combine_wait <= 0:
+        return True
+    pending = _pending(conn, job)
+    return not pending or (job["not_before"] <= svc.now() and all(row["status"] != "running" for row in pending))
+
+
+def _display_order(rows):
+    return sorted(rows, key=lambda row: (AGENTS.index(row["agent"]) if row["agent"] in AGENTS else len(AGENTS),
+                                         row["id"]))
+
+
+def _wait(conn, svc, job, pending):
+    names = review.reviewer_names([row["agent"] for row in pending])
+    db.update_job(conn, job["id"], status="waiting", posted_with=None,
+                  reason=f"review ready; waiting to post it with {names}'s review of this commit",
+                  not_before=svc.now() + svc.config.service.combine_wait)
+    log.info("job %s -> waiting for job(s) %s", job["id"], ", ".join(str(row["id"]) for row in pending))
+    return "waiting"
+
+
+def _post_round(conn, svc, job, agent, cancel, *, title):
+    """Post the job's review, recorded and saved, with the other reviews of its commit: wait while any is
+    still to finish, then check the finished ones for duplicates and post them as one."""
+    wait = svc.config.service.combine_wait
+    with db.transaction(conn):
+        pending = _pending(conn, job)
+        if pending and wait > 0:
+            return _wait(conn, svc, job, pending)
+        # While this job runs the check, they wait for it: it is a running review of their commit (see due()).
+        others = _waiting_with(conn, job) if wait > 0 else []
+    check = None
+    if others:
+        check = _check_duplicates(conn, svc, job, others, agent, cancel, title=title)
+        if cancel.reason == "shutdown":  # stopped mid-check: after the restart it posts like a waiting review
+            with db.transaction(conn):
+                db.update_job(conn, job["id"], status="waiting", not_before=svc.now(),
+                              reason="review ready; posting it after a worker restart")
+            return "waiting"
+        if cancel():
+            return _cancelled(conn, svc, job, cancel)
+    with db.transaction(conn):
+        pending = _pending(conn, job)  # one started meanwhile, say by `enqueue --force`
+        if pending and wait > 0:
+            return _wait(conn, svc, job, pending)
+        still = {row["id"] for row in _waiting_with(conn, job)} if wait > 0 else set()
+        _claim(conn, svc, job, [row for row in others if row["id"] in still], check)
+    return post(conn, svc, db.get_job(conn, job["id"]))
+
+
+def post_waiting(conn, svc, job_id):
+    """Post a waiting review if it is due (see due()), with any other reviews of its commit still waiting.
+    These are the reviews of a round whose last review failed, was cancelled or took too long, or whose
+    worker stopped during the duplicate check. The check isn't run here: it needs an agent, and this runs
+    like a post retry, which runs none. Returns the job's status afterwards."""
+    with db.transaction(conn):
+        job = db.get_job(conn, job_id)
+        if job["status"] != "waiting" or not due(conn, svc, job):
+            return job["status"]
+        others = _waiting_with(conn, job) if svc.config.service.combine_wait > 0 else []
+        _claim(conn, svc, job, others, {"duplicates": [], "unchecked": "the check didn't run"} if others else None)
+    try:
+        return post(conn, svc, db.get_job(conn, job_id))
+    except Outcome as outcome:
+        return _finish(conn, svc, job_id, outcome.status, outcome.reason, **outcome.fields)
+
+
+def _saved_review(svc, job):
+    """A finished job's review as review.merge() takes it, from its saved review.json."""
+    data = json.loads(Path(job_paths(svc.state, job["id"]).out, "review.json").read_text())
+    structured = review.validate(data)
+    if isinstance(data.get("resolutions"), list):  # a follow-up's statuses of the previous findings
+        structured["resolutions"] = data["resolutions"]
+    return {"job_id": job["id"], "agent": job["agent"], "model": job["model"], "review": structured}
+
+
+def _check_duplicates(conn, svc, job, others, agent, cancel, *, title):
+    """Have the job's agent name the items its review and the others' (finished jobs' rows) share. Returns
+    the round's record for round.json: its members, the duplicates found as [repeat, kept] item pairs
+    (see review.merge), and why the reviews weren't checked if they couldn't be."""
+    rows = _display_order([job, *others])
+    record = {"members": [row["id"] for row in rows], "duplicates": [], "unchecked": "", "checked_by": job["agent"]}
+    paths = job_paths(svc.state, job["id"])
+    check = JobPaths(root=paths.root, worktree=paths.worktree, context=paths.context,
+                     out=str(Path(paths.out, "duplicates")))
+    try:
+        members = [_saved_review(svc, row) for row in rows]
+        if not combine.worth_checking(members):
+            return record
+        Path(check.out).mkdir(parents=True, exist_ok=True)
+        prompts = combine.snapshot()
+        schema = Path(paths.context, "duplicates.schema.json")  # its own copy, as for the review
+        schema.write_text(prompts["duplicates.schema.json"])
+        prompt = combine.build_prompt(members, prompts=prompts, repo=job["repo"], number=job["number"], title=title,
+                                      head_sha=job["head_sha"], worktree=paths.worktree, agent_note=agent.agent_note())
+        unit = f"{scope_unit(job['id'])}-duplicates"
+        with db.transaction(conn):  # so a restart or an abandoned `review` stops it, as it would the review
+            db.update_job(conn, job["id"], scope_unit=unit)
+        session_id = agent.new_session_id()
+        log.info("job %s: checking jobs %s for duplicates", job["id"], ", ".join(map(str, record["members"])))
+        run = svc.runner.run(agent.invocation(unit=unit, paths=check, prompt=prompt, session_id=session_id,
+                                              schema=schema),
+                             timeout=min(DUPLICATE_CHECK_TIMEOUT, svc.config.service.review_timeout),
+                             should_cancel=cancel)
+        result = agent.parse(run, check, session_id)
+        if run.cancelled or run.timed_out or result.error_kind:
+            why = ("it was cancelled" if run.cancelled else "it timed out" if run.timed_out
+                   else "it hit a usage limit" if result.error_kind == "rate_limit" else "it failed")
+            log.warning("job %s: duplicate check: %s %s", job["id"], why, result.error or "")
+            return {**record, "unchecked": f"the check {why.removeprefix('it ')}"}
+        sets = combine.groups(result.review, members)
+        record.update(duplicates=[[list(repeat), list(kept)] for repeat, kept in combine.duplicates(members, sets).items()],
+                      answer=result.review, usage={**result.usage, "seconds": round(run.duration, 1)},
+                      prompt_version=review.prompt_version(prompts))
+        log.info("job %s: %d duplicate(s) in %d set(s)", job["id"], len(record["duplicates"]), len(sets))
+        return record
+    except Exception as exc:  # the reviews still go out, unchecked
+        log.exception("job %s: duplicate check failed", job["id"])
+        return {**record, "unchecked": f"the check failed ({type(exc).__name__})"}
+
+
+_ITEM_KINDS = {"nits": "nit", "test_gaps": "test_gap", "questions": "question"}
+
+
+def _record_duplicates(conn, rows, pairs):
+    """Record which items repeat which (findings.duplicate_of), replacing what was recorded for these jobs."""
+    ids = [row["id"] for row in rows]
+    followup = {row["id"]: bool(row["followup_of"]) for row in rows}
+    conn.execute(f"UPDATE findings SET duplicate_of=NULL WHERE job_id IN ({','.join('?' * len(ids))})", ids)
+
+    def finding_id(ref):
+        job_id, key, position = ref
+        kind = ("regression" if followup[job_id] else "finding") if key == "findings" else _ITEM_KINDS[key]
+        row = conn.execute("SELECT id FROM findings WHERE job_id=? AND kind=? AND position=?",
+                           (job_id, kind, position)).fetchone()
+        return row[0] if row else None
+    for repeat, kept in pairs:
+        repeat_id, kept_id = finding_id(repeat), finding_id(kept)
+        if repeat_id and kept_id:
+            conn.execute("UPDATE findings SET duplicate_of=? WHERE id=?", (kept_id, repeat_id))
+
+
+def _claim(conn, svc, job, others, check):
+    """In the caller's transaction: make the job's post the one for its own review and the others' (waiting
+    jobs' rows), which are then posting with posted_with = the job, and record the duplicates among them.
+    The round's record goes to the job's out/round.json, written before the transaction commits."""
+    rows = _display_order([job, *others])
+    ids = [row["id"] for row in rows]
+    path = Path(job_paths(svc.state, job["id"]).out, "round.json")
+    if others:
+        record = {**(check or {}), "members": ids, "unchecked": (check or {}).get("unchecked", "")}
+        record["duplicates"] = [pair for pair in record.get("duplicates") or []
+                                if pair[0][0] in ids and pair[1][0] in ids]  # one may have been superseded since
+        _record_duplicates(conn, rows, record["duplicates"])
+        temp = path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(record, indent=2))
+        os.replace(temp, path)
+        for row in others:
+            db.update_job(conn, row["id"], status="posting", posted_with=job["id"],
+                          reason=f"posting with job {job['id']}")
+        log.info("job %s: posting with job(s) %s", job["id"], ", ".join(str(row["id"]) for row in others))
+    else:
+        path.unlink(missing_ok=True)
+    db.update_job(conn, job["id"], status="posting", posted_with=job["id"] if others else None, not_before=svc.now())
+
+
+def _members(conn, job):
+    return conn.execute("SELECT * FROM jobs WHERE posted_with=? AND id!=?", (job["id"], job["id"])).fetchall()
+
+
+def _release_round(conn, svc, job_id):
+    """The job's post won't carry the others after all: they wait again, for it among others, and the
+    duplicates recorded among them no longer stand (each may now be posted on its own)."""
+    members = _members(conn, {"id": job_id})
+    if members:
+        _record_duplicates(conn, [db.get_job(conn, job_id), *members], [])
+    for row in members:
+        db.update_job(conn, row["id"], status="waiting", posted_with=None, reason="review ready; waiting to post it",
+                      not_before=svc.now() + svc.config.service.combine_wait)
+    db.update_job(conn, job_id, posted_with=None)
+
+
+def _settle_round(conn, svc, job_id, status, reason, fields):
+    """In the caller's transaction: a post that carries other jobs' reviews ended, so they end the same way;
+    or it went back to the queue, so they wait again."""
+    if status not in db.FINAL:
+        if status != "posting":
+            _release_round(conn, svc, job_id)
+        return
+    shared = {key: fields[key] for key in ("posted_at", "review_id", "review_url", "error") if key in fields}
+    for row in _members(conn, {"id": job_id}):
+        db.update_job(conn, row["id"], status=status, reason=f"with job {job_id}: {reason}"[:1000],
+                      finished_at=svc.now(), **shared)
+
+
+def _round_post(conn, svc, job):
+    """What the job posts: its own review, or with the reviews it carries, all of them merged (saved as
+    round.md and round-comments.json and scanned for credentials like a single review)."""
+    out = Path(job_paths(svc.state, job["id"]).out)
+    others = _members(conn, job)
+    if not others:
+        saved = out / "comments.json"
+        return (out / "review.md").read_text(), json.loads(saved.read_text()) if saved.is_file() else []
+    rows = _display_order([job, *others])
+    try:
+        record = json.loads((out / "round.json").read_text())
+    except (OSError, ValueError):
+        record = {}
+    try:
+        body, inline = _render_round(conn, svc, rows, record)
+    except (OSError, ValueError, KeyError, TypeError) as exc:  # a review.json gone or garbled
+        log.warning("job %s: cannot merge the reviews of jobs %s (%s: %s); posting them separately", job["id"],
+                    ", ".join(str(row["id"]) for row in rows), type(exc).__name__, exc)
+        with db.transaction(conn):  # each still has its own review.md
+            _release_round(conn, svc, job["id"])
+        return _round_post(conn, svc, db.get_job(conn, job["id"]))
+    (out / "round.md").write_text(body)
+    (out / "round-comments.json").write_text(json.dumps(inline, indent=2))
+    hits = leakscan.scan("\n".join([body, *(comment["body"] for comment in inline)]), svc.secrets())
+    if hits:
+        raise Outcome("blocked", f"possible credential in review ({', '.join(hits)}); not posted, see {out}/round.md")
+    return body, inline
+
+
+def _render_round(conn, svc, rows, record):
+    """The body and inline comments of one post for several reviews of a commit (finished jobs' rows, in
+    display order), with the duplicates in record (see _check_duplicates) merged."""
+    ids = {row["id"] for row in rows}
+    pairs = {tuple(repeat): tuple(kept) for repeat, kept in record.get("duplicates") or []
+             if repeat[0] in ids and kept[0] in ids}
+    merged = review.merge([_saved_review(svc, row) for row in rows], pairs, unchecked=record.get("unchecked") or "")
+    lead = rows[0]
+    if lead["followup_of"]:
+        marks = ",".join("?" * len(ids))
+        previous = _finding_rows(conn, f"f.id IN (SELECT finding_id FROM resolutions WHERE job_id IN ({marks}))",
+                                 sorted(ids))
+        body = review.render_followup_round(merged, previous, repo=lead["repo"], number=lead["number"],
+                                            sha=lead["head_sha"], previous_sha=lead["followup_of"])
+    else:
+        body = review.render_round(merged, repo=lead["repo"], number=lead["number"], sha=lead["head_sha"],
+                                   base_ref=lead["base_ref"])
+    return body, suggestions.comments(merged, review.comment_label(merged))
+
+
+def preview_round(svc, job_ids, *, title=""):
+    """For `review` without --post: its jobs' reviews merged as the service would post them, checked for
+    duplicates by the last job's agent, saved as round.md in that job's out/. Returns the path, or None
+    with fewer than two reviews to merge, or with combine_wait = 0 (the service posts each on its own)."""
+    if svc.config.service.combine_wait <= 0:
+        return None
+    conn = svc.connect()
+    try:
+        rows = [db.get_job(conn, job_id) for job_id in job_ids]
+        rows = [row for row in rows if row is not None and row["status"] == "skipped" and row["review_recorded"]
+                and Path(job_paths(svc.state, row["id"]).out, "review.json").is_file()]
+        if not rows:
+            return None
+        lead = rows[-1]
+        others = [row for row in rows[:-1] if row["followup_of"] == lead["followup_of"]]
+        if not others:
+            return None
+        agent = make_agent(svc.config.agents[lead["agent"]], svc.state)
+        # Running again while its agent runs: `tools/live` and `tools/replay` count it, and if this process
+        # dies, the worker's orphan cleanup stops the check (it cancels the job, whose review is saved).
+        with db.transaction(conn):
+            db.update_job(conn, lead["id"], status="running")
+        try:
+            record = _check_duplicates(conn, svc, lead, others, agent, CancelToken(), title=title)
+        finally:
+            with db.transaction(conn):
+                conn.execute("UPDATE jobs SET status='skipped' WHERE id=? AND status='running'", (lead["id"],))
+        rows = _display_order([lead, *others])
+        with db.transaction(conn):
+            _record_duplicates(conn, rows, record["duplicates"])
+        body, _inline = _render_round(conn, svc, rows, record)
+        out = Path(job_paths(svc.state, lead["id"]).out)
+        (out / "round.json").write_text(json.dumps(record, indent=2))
+        (out / "round.md").write_text(body)
+        return out / "round.md"
+    finally:
+        conn.close()
 
 
 def _rejected(exc):
@@ -573,7 +921,8 @@ def post_failed(conn, svc, job, exc):
     `posting` for marker-checked recovery, without running the agent again, for max_attempts post
     attempts (counted apart from the agent's); a definite refusal fails it at once. The review stays
     in out/review.md either way."""
-    post_attempts = db.get_job(conn, job["id"])["post_attempts"] + 1
+    current = db.get_job(conn, job["id"])  # _round_post may have released the round since `job` was read
+    post_attempts = current["post_attempts"] + 1
     rejected = _rejected(exc)
     if not rejected and post_attempts >= svc.config.service.max_attempts:
         try:  # out of retries: one last look, in case a failure that wasn't a refusal did reach GitHub
@@ -585,7 +934,7 @@ def post_failed(conn, svc, job, exc):
                            post_attempts=post_attempts, review_id=existing.get("id"),
                            review_url=existing.get("html_url"))
     if rejected or post_attempts >= svc.config.service.max_attempts:
-        saved = f"review saved to {job_paths(svc.state, job['id']).out}/review.md"
+        saved = f"review saved to {job_paths(svc.state, job['id']).out}/{'round' if current['posted_with'] else 'review'}.md"
         return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000],
                        post_attempts=post_attempts, error=str(exc)[:2000])
     log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)
@@ -621,6 +970,8 @@ def recover_post(conn, svc, job):
         reason = job["reason"] or "cancelled"
         return _finish(conn, svc, job["id"], "superseded" if reason.startswith("superseded") else "cancelled", reason)
     if not Path(job_paths(svc.state, job["id"]).out, "review.md").is_file():
+        with db.transaction(conn):  # the reviews it was to carry can still be posted
+            _release_round(conn, svc, job["id"])
         if job["source"] == db.FOREGROUND:  # no owner left to run it again
             _cancel_foreground(conn, svc, job, "interrupted post had no saved review", only_if=("posting",))
             return db.get_job(conn, job["id"])["status"]
@@ -645,14 +996,12 @@ def _post_review(svc, job, body, inline):
 
 
 def post(conn, svc, job):
-    """Post out/review.md for a job, after confirming the PR still points at the reviewed head."""
-    paths = job_paths(svc.state, job["id"])
-    body = Path(paths.out, "review.md").read_text()
-    saved = Path(paths.out, "comments.json")
-    inline = json.loads(saved.read_text()) if saved.is_file() else []
+    """Post a job's review (out/review.md, or the round it posts, see _round_post), after confirming the PR
+    still points at the reviewed head."""
     with db.transaction(conn):
         db.update_job(conn, job["id"], status="posting")
     try:
+        body, inline = _round_post(conn, svc, job)
         _check_pr(svc, job)
         response = _post_review(svc, job, body, inline)
         review_id, review_url = response.get("id"), response.get("html_url")

@@ -26,9 +26,10 @@ def held_agents(state):
 
     The worker checks holds inside the write transaction that claims a queued review, and an owner
     waiting for the worker to go idle counts running jobs inside a write transaction of its own, after
-    taking the hold. So a claim either sees the hold or is counted. Holds don't stop a post retry (no
-    agent runs, and a retry is safe to repeat) or a foreground `review`, which runs in its own process;
-    the idle count includes them only while they run."""
+    taking the hold. So a claim either sees the hold or is counted. Holds don't stop a post retry or the
+    post of a review that waited for another (no agent runs, and a retry is safe to repeat), or a
+    foreground `review`, which runs in its own process; the idle count includes them only while they run.
+    A review's duplicate check runs before its post, while the job still counts as running."""
     held = set()
     for path in (Path(state) / "holds").glob("*.lock"):
         try:
@@ -116,10 +117,26 @@ class Worker:
         stall the loop, and occupies its agent's slot."""
         conn = svc.connect()
         try:
-            rows = conn.execute("SELECT id, source, agent FROM jobs WHERE status='posting' AND not_before<=?",
-                                (svc.now(),)).fetchall()
+            # A job whose review another job's post carries (posted_with) is finished with that post.
+            rows = conn.execute("SELECT id, source, agent FROM jobs WHERE status='posting' AND not_before<=?"
+                                " AND (posted_with IS NULL OR posted_with=id)", (svc.now(),)).fetchall()
         finally:
             conn.close()
+        self._start_posts(svc, rows, self._recover_post, "recover")
+
+    def post_waiting(self, svc):
+        """Post finished reviews that waited for the other reviews of their commit, once none of those is
+        left to finish or the wait is over (see pipeline.post_waiting). Like post recovery, each runs in a
+        thread and occupies its agent's slot."""
+        conn = svc.connect()
+        try:
+            rows = [row for row in conn.execute("SELECT * FROM jobs WHERE status='waiting' ORDER BY id").fetchall()
+                    if pipeline.due(conn, svc, row)]
+        finally:
+            conn.close()
+        self._start_posts(svc, rows, self._post_waiting, "post")
+
+    def _start_posts(self, svc, rows, target, name):
         for row in rows:
             if row["id"] in self.threads:
                 continue  # one of our job threads is posting it right now
@@ -127,9 +144,22 @@ class Worker:
                 with pipeline.orphaned_foreground(svc.state, row["id"]) as orphaned:
                     if not orphaned:
                         continue  # its `review` is still posting it
-            thread = threading.Thread(target=self._recover_post, args=(svc, row["id"]), name=f"recover-{row['id']}")
+            thread = threading.Thread(target=target, args=(svc, row["id"]), name=f"{name}-{row['id']}")
             self.threads[row["id"]] = (thread, pipeline.CancelToken(), row["agent"])
             thread.start()
+
+    def _post_waiting(self, svc, job_id):
+        conn = svc.connect()
+        try:
+            pipeline.post_waiting(conn, svc, job_id)
+        except Exception as exc:
+            log.exception("job %s: posting a waiting review failed", job_id)
+            try:  # once claimed it is posting: a failed attempt, retried like any post
+                pipeline.fail_post_attempt(conn, svc, job_id, exc)
+            except Exception:
+                log.exception("job %s: cannot schedule the retry", job_id)
+        finally:
+            conn.close()
 
     def _recover_post(self, svc, job_id):
         conn = svc.connect()
@@ -156,7 +186,7 @@ class Worker:
             svc = self.make_services(self.watcher.get())
             self.reap()
             self.sync_cancels(svc)
-            self.run_guarded(svc, self.release_orphaned_foreground, self.recover_posts)
+            self.run_guarded(svc, self.release_orphaned_foreground, self.recover_posts, self.post_waiting)
             if self.upgrade_pending():
                 if not self.threads:
                     log.info("package version changed to %s; exiting to restart on new code", paths.read_version())

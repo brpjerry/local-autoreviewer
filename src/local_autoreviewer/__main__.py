@@ -148,29 +148,44 @@ def cmd_review(args):
                     owned.append(job_id)
             finally:
                 conn.close()
+        def notify(message):
+            print(message, file=sys.stderr)
+
         for job_id in owned:
-            status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
-            conn = svc.connect()
-            job = db.get_job(conn, job_id)
+            pipeline.run_foreground(svc, job_id, notify=notify)
+        for job_id in owned:  # a review that waited for one of the others, which then failed or was cancelled
+            pipeline.finish_waiting(svc, job_id, notify=notify)
+        merged = pipeline.preview_round(svc, owned, title=pr.get("title", "")) if not args.post else None
+        conn = svc.connect()
+        try:
+            jobs = [db.get_job(conn, job_id) for job_id in owned]
+        finally:
             conn.close()
-            out = Path(pipeline.job_paths(svc.state, job_id).out, "review.md")
-            print(f"job {job_id} [{job['agent']}]: {status} — {job['reason']}")
+        for job in jobs:
+            out = Path(pipeline.job_paths(svc.state, job["id"]).out, "review.md")
+            print(f"job {job['id']} [{job['agent']}]: {job['status']} — {job['reason']}")
             if job["review_url"]:
                 print(f"  posted: {job['review_url']}")
             elif out.is_file():
                 print(f"  review: {out}")
-            if status not in ("posted", "skipped"):
+            if job["status"] not in ("posted", "skipped", "waiting"):  # a waiting review is posted by the worker
                 worst = 1
+        if merged:
+            print(f"reviews merged as they would be posted: {merged}")
     finally:
         # Never leave this command's jobs for the worker, even after Ctrl-C or an error.
         pipeline.abandon(svc, owned, "foreground review ended before the job finished")
         if owned:
             conn = svc.connect()
-            mid_post = [job_id for job_id in owned if db.get_job(conn, job_id)["status"] == "posting"]
+            left = [(job_id, db.get_job(conn, job_id)["status"]) for job_id in owned]
             conn.close()
-            for job_id in mid_post:
-                print(f"job {job_id}'s post didn't complete; the worker, when it runs, will check whether it "
-                      "reached GitHub and finish posting it if not", file=sys.stderr)
+            for job_id, status in left:
+                if status == "posting":
+                    print(f"job {job_id}'s post didn't complete; the worker, when it runs, will check whether it "
+                          "reached GitHub and finish posting it if not", file=sys.stderr)
+                elif status == "waiting":
+                    print(f"job {job_id}'s review is ready and waits for another review of this commit; the worker, "
+                          "when it runs, will post it", file=sys.stderr)
         for job_id, handle in locks.items():
             pipeline.release_foreground_lock(svc.state, job_id, handle)
     return worst
@@ -234,7 +249,7 @@ def cmd_status(args):
 
 FINDING_COLUMNS = ("f.*, j.repo, j.number, j.head_sha, j.base_ref, j.agent, j.model, j.effort, j.prompt_version, "
                    "j.source, j.status AS job_status, j.created_at AS job_created_at, j.review_url, j.usage_json, "
-                   "j.review_kind, j.followup_of, (SELECT json_group_array(json_object('job_id', r.job_id, 'status', "
+                   "j.review_kind, j.followup_of, j.trivial, j.posted_with, (SELECT json_group_array(json_object('job_id', r.job_id, 'status', "
                    "r.status, 'detail', r.detail)) FROM resolutions r WHERE r.finding_id=f.id) AS resolutions")
 
 
@@ -271,6 +286,8 @@ def cmd_findings(args):
         if row["disposition"] or row["rated_impact"] is not None:
             rated = "" if row["rated_impact"] is None else f" {row['rated_impact']}/10"
             rating += f"  [{row['disposition'] or 'rated'}{rated}]"
+        if row["duplicate_of"]:
+            rating += f"  (duplicate of {row['duplicate_of']})"
         location = f"  {row['file']}:{row['line']}" if row["file"] else ""
         print(f"{row['id']:>5}  job {row['job_id']:<4} {row['agent']:<6} {row['repo']}#{row['number']} "
               f"@{row['head_sha'][:7]}  {rating}")

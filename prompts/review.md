@@ -18,6 +18,15 @@ $agent_note
 - Only report problems in code this PR adds or changes, or problems the PR makes reachable. Don't review untouched legacy code.
 - Be concrete. Every finding needs a failure scenario: which input or state leads to which wrong result. Leave out speculative findings you can't support from the code.
 
+## Trivial PRs
+
+Some PRs are too small to need a full review: they only change strings, comments or documentation, bump a version or a dependency pin, or rename something without changing what it does. If this one is like that, you may end the review early:
+- read the whole diff and check the change itself: a typo, a version bumped in one place but not in another, a string a test or a caller depends on;
+- set `trivial` to true, say in one or two sentences in `summary` what the PR changes and why it needs no full review, and report anything the check above found as usual;
+- skip the method below, and leave the lists empty unless you found something.
+
+A PR that changes behaviour in any way, however few lines it touches, is not trivial. When unsure, do the full review and set `trivial` to false.
+
 ## Method: this is the only pass
 
 There won't be a second review round, so find everything now rather than the first few problems. Work through the change systematically before you write any findings:

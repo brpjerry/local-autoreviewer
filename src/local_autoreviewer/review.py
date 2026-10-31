@@ -180,6 +180,8 @@ def validate(review):
     findings.sort(key=lambda f: suggestions.LEVELS.index(f["severity"]), reverse=True)
     return {
         "summary": summary,
+        # The reviewer found the PR trivial and ended the review early; reviews from before this have no flag.
+        "trivial": review.get("trivial") is True,
         "findings": findings,
         "test_gaps": [str(t) for t in review.get("test_gaps") or [] if str(t).strip()],
         "questions": [str(q) for q in review.get("questions") or [] if str(q).strip()],
@@ -276,7 +278,13 @@ def _proposed_changes(edits):
     return lines
 
 
-def _finding(number, item, repo, sha):
+def reviewer_names(agents):
+    """Reviewers' display names: "Claude Code", "Claude Code and Codex"."""
+    names = [AGENT_NAMES.get(agent, agent) for agent in dict.fromkeys(agents)]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _finding(number, item, repo, sha, attribute=False):
     where = _location(repo, sha, item["file"], item["line"])
     line = f"{number}. **{clean(item['title'], 500)}**"
     if where:
@@ -287,11 +295,19 @@ def _finding(number, item, repo, sha):
     if item.get("likelihood"):
         rating.append(item["likelihood"])
     rating = ", ".join(rating)
+    if attribute:
+        rating = f"{reviewer_names(item['reviewers'])}; {rating}"
     if item.get("severity_notes"):
         moved = "raised" if suggestions.LEVELS.index(item["severity"]) > \
             suggestions.LEVELS.index(item["reviewer_severity"]) else "lowered"
         rating += f"; {moved} from {item['reviewer_severity']}: {', '.join(item['severity_notes'])}"
     lines = [line + f" _({rating})_"]
+    for other in item.get("also") or []:  # the same issue from another reviewer, rated differently
+        if other["severity"] == "nit":
+            lines.append(f"{reviewer_names([other['agent']])} reported it as a nit.")
+        elif other["severity"] != (item.get("reviewer_severity") or item["severity"]):
+            impact = f" (impact {other['impact']}/10)" if other.get("impact") is not None else ""
+            lines.append(f"{reviewer_names([other['agent']])} rated it {other['severity']}{impact}.")
     if item.get("trigger"):
         lines.append("**When:** " + clean(item["trigger"], 2000))
     if item["detail"]:
@@ -303,30 +319,136 @@ def _finding(number, item, repo, sha):
     return [lines[0]] + ["   " + text.replace("\n", "\n   ") if text else "" for text in lines[1:]]
 
 
+ITEM_KEYS = ("findings", "nits", "test_gaps", "questions")
+
+
+def merge(members, duplicates=None, *, unchecked=""):
+    """One or more reviews of a commit as one, the shape the renderers take. members: dicts with job_id,
+    agent, model and review (validated), in display order. duplicates maps an item that repeats another, as
+    (job_id, key, position), to the item it repeats, which is kept and credited to both reviewers.
+    unchecked: why the reviews couldn't be checked for duplicates, if they couldn't."""
+    duplicates = duplicates or {}
+    agent_of = {m["job_id"]: m["agent"] for m in members}
+    reviews = {m["job_id"]: m["review"] for m in members}
+    repeats = {}
+    for dropped, kept in duplicates.items():
+        repeats.setdefault(tuple(kept), []).append(tuple(dropped))
+    order = {m["job_id"]: n for n, m in enumerate(members)}
+    merged = {"members": [{"job_id": m["job_id"], "agent": m["agent"], "model": m.get("model") or "",
+                           "summary": m["review"]["summary"], "trivial": bool(m["review"].get("trivial"))}
+                          for m in members],
+              "unchecked": unchecked, **{key: [] for key in ITEM_KEYS}}
+    for m in members:
+        for key in ITEM_KEYS:
+            for position, item in enumerate(m["review"].get(key) or []):
+                ref = (m["job_id"], key, position)
+                if ref in duplicates:
+                    continue
+                others = sorted(repeats.get(ref, []), key=lambda r: (order[r[0]], r[1], r[2]))
+                entry = {"text": item} if isinstance(item, str) else dict(item)
+                jobs = sorted({m["job_id"], *(r[0] for r in others)}, key=order.get)
+                entry["reviewers"] = list(dict.fromkeys(agent_of[job_id] for job_id in jobs))
+                if key == "findings":
+                    entry["also"] = []
+                    for job_id, other_key, other_position in others:
+                        other = reviews[job_id][other_key][other_position]
+                        # As the other reviewer reported it, before the severity modifiers.
+                        severity = (other.get("reviewer_severity") or other["severity"]) if other_key == "findings" \
+                            else "nit"
+                        entry["also"].append({"agent": agent_of[job_id], "impact": other.get("impact"),
+                                              "severity": severity})
+                merged[key].append(entry)
+    # By final severity, as each review is; within a level, by reviewer, then each reviewer's own order.
+    merged["findings"].sort(key=lambda f: suggestions.LEVELS.index(f["severity"]), reverse=True)
+    merged["resolutions"] = {}
+    for m in members:
+        for item in m["review"].get("resolutions") or []:
+            merged["resolutions"].setdefault(item["finding"], []).append({"agent": m["agent"], **item})
+    return merged
+
+
+def _alone(review, agent, model, job_id):
+    return merge([{"job_id": job_id, "agent": agent, "model": model, "review": review}])
+
+
 def comment_label(review):
-    """Headings for inline suggestions, tying each to its numbered finding or nit in the body."""
+    """Headings for inline suggestions, tying each to its numbered finding or nit in the body (and, in a
+    post of several reviews, to the reviewers that proposed it)."""
+    attribute = len(review.get("members") or ()) > 1
+
     def label(index, item):
+        by = f" · {reviewer_names(item['reviewers'])}" if attribute else ""
         if index is not None:
-            return f"**{index + 1}. {clean(item['title'], 300)}** (local-autoreviewer)"
-        return f"**Nit:** {clean(item['text'], 300)} (local-autoreviewer)"
+            return f"**{index + 1}. {clean(item['title'], 300)}** (local-autoreviewer{by})"
+        return f"**Nit:** {clean(item['text'], 300)} (local-autoreviewer{by})"
     return label
 
 
+def _by(item, attribute):
+    return f" _({reviewer_names(item['reviewers'])})_" if attribute else ""
+
+
+def _heading(kind, members):
+    def reviewer(member):
+        model = f" ({clean(member['model'], 80)})" if member["model"] else ""
+        return AGENT_NAMES.get(member["agent"], member["agent"]) + model
+    return f"### {kind} · {' and '.join(reviewer(m) for m in members)}"
+
+
+def _summaries(merged):
+    """The reviewers' summaries: one paragraph, or one per reviewer, named."""
+    members = merged["members"]
+    trivial = "_Trivial change, so the review ended early._"
+    if len(members) == 1:
+        (member,) = members
+        return [clean(member["summary"]), ""] + ([trivial, ""] if member["trivial"] else [])
+    lines = []
+    for member in members:
+        note = " _(trivial change, so the review ended early)_" if member["trivial"] else ""
+        lines += [f"**{reviewer_names([member['agent']])}:**{note} {clean(member['summary'])}", ""]
+    if merged["unchecked"]:
+        lines += [f"_The reviews weren't checked for duplicates ({clean(merged['unchecked'], 300)}), so an issue "
+                  "both reviewers found may be listed twice._", ""]
+    return lines
+
+
+def _footer(merged, sha, kind=""):
+    members = merged["members"]
+    jobs = (f"job {members[0]['job_id']}" if len(members) == 1
+            else "jobs " + ", ".join(str(m["job_id"]) for m in members))
+    who = reviewer_names([m["agent"] for m in members])
+    return ["---", f"<sub>local-autoreviewer · {jobs} · {who}{' · ' + kind if kind else ''}</sub>",
+            *(marker(m["job_id"], sha, m["agent"]) for m in members)]
+
+
+def _fit(body, footer, *, shorter=None):
+    """Keep the body within GitHub's limit: first the shorter version, if given, then a cut."""
+    if len(body) > MAX_BODY and shorter is not None:
+        body = shorter
+    if len(body) > MAX_BODY:
+        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
+        body = body[:MAX_BODY - len(tail) - 100] + tail
+    return body
+
+
 def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
-    agent_name = AGENT_NAMES.get(agent, agent)
-    model_note = f" ({clean(model, 80)})" if model else ""
+    return render_round(_alone(review, agent, model, job_id), repo=repo, number=number, sha=sha, base_ref=base_ref)
+
+
+def render_round(merged, *, repo, number, sha, base_ref):
+    """A review, or several reviews of one commit merged (see merge()): then each item says who found it."""
+    attribute = len(merged["members"]) > 1
     commit_url = f"https://github.com/{repo}/pull/{number}/commits/{sha}"
     head = [
-        f"### Automated review · {agent_name}{model_note}",
+        _heading("Automated review", merged["members"]),
         "",
         f"Reviewed commit [`{sha[:7]}`]({commit_url}) against `{clean(base_ref, 200)}`. "
         "Automated read-only review.",
         "",
-        clean(review["summary"]),
-        "",
+        *_summaries(merged),
     ]
     # Findings are already in this order (blocker first, demoted nits last); numbering follows it.
-    numbered = list(enumerate(review["findings"], 1))
+    numbered = list(enumerate(merged["findings"], 1))
     findings = []
     if any(item["severity"] != "nit" for _, item in numbered):
         findings.append("#### Findings")
@@ -335,74 +457,81 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
             if items:
                 findings.append(f"\n**{severity.capitalize()}**\n")
                 for n, item in items:
-                    findings += _finding(n, item, repo, sha)
+                    findings += _finding(n, item, repo, sha, attribute)
         findings.append("")
     else:
         findings += ["No significant issues found.", ""]
     extras = []
-    for title, items in (("Test gaps", review["test_gaps"]), ("Questions", review["questions"])):
+    for title, items in (("Test gaps", merged["test_gaps"]), ("Questions", merged["questions"])):
         if items:
             extras.append(f"#### {title}")
-            extras += [f"- {clean(item, 2000)}" for item in items]
+            extras += [f"- {clean(item['text'], 2000)}{_by(item, attribute)}" for item in items]
             extras.append("")
     demoted = [(n, item) for n, item in numbered if item["severity"] == "nit"]
-    nits = review["nits"][:MAX_NITS]
+    nits = merged["nits"][:MAX_NITS * len(merged["members"])]
     nit_lines = []
     if demoted or nits:
         nit_lines += [f"<details><summary>Nits ({len(demoted) + len(nits)})</summary>", ""]
         for n, item in demoted:
-            nit_lines += _finding(n, item, repo, sha)
+            nit_lines += _finding(n, item, repo, sha, attribute)
         for nit in nits:
             where = _location(repo, sha, nit["file"], nit["line"])
-            nit_lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}")
+            nit_lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}{_by(nit, attribute)}")
             nit_lines += ["  " + text if text else "" for text in _proposed_changes(nit.get("edits") or [])]
         nit_lines += ["", "</details>", ""]
-    footer = ["---", f"<sub>local-autoreviewer · job {job_id} · {agent_name}</sub>", marker(job_id, sha, agent)]
-
-    body = "\n".join(head + findings + extras + nit_lines + footer)
-    if len(body) > MAX_BODY:
-        body = "\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer)
-    if len(body) > MAX_BODY:
-        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
-        body = body[:MAX_BODY - len(tail) - 100] + tail
-    return body
+    footer = _footer(merged, sha)
+    return _fit("\n".join(head + findings + extras + nit_lines + footer), footer,
+                shorter="\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer))
 
 
 def render_followup(review, previous, *, repo, number, sha, previous_sha, agent, model, job_id):
-    """A follow-up: each previous finding's status, then any regressions as numbered findings."""
-    agent_name = AGENT_NAMES.get(agent, agent)
-    model_note = f" ({clean(model, 80)})" if model else ""
+    return render_followup_round(_alone(review, agent, model, job_id), previous, repo=repo, number=number, sha=sha,
+                                 previous_sha=previous_sha)
+
+
+def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
+    """A follow-up, or several merged: each previous finding's status (from each reviewer), then any
+    regressions as numbered findings. previous: the finding rows checked, with the agent that raised each
+    and, in also_found_by, the agents whose duplicates of it were merged into it."""
+    attribute = len(merged["members"]) > 1
     commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
     before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
-    lines = [f"### Follow-up review · {agent_name}{model_note}", "",
+    lines = [_heading("Follow-up review", merged["members"]), "",
              f"Checked commit {commit} for the {len(previous)} issue(s) open after {before}, and for regressions in "
-             "the changes since. Automated read-only review.", "", clean(review["summary"]), ""]
-    status = {r["finding"]: r for r in review["resolutions"]}
+             "the changes since. Automated read-only review.", "", *_summaries(merged)]
     if previous:
         lines.append("#### Previous findings")
         for item in previous:
-            resolution = status.get(item["id"])
-            who = AGENT_NAMES.get(item["agent"], item["agent"])
+            answers = merged["resolutions"].get(item["id"]) or []
+            who = reviewer_names([item["agent"], *(item.get("also_found_by") or [])])
             where = _location(repo, item.get("raised_at") or previous_sha, item["file"], item["line"])
-            line = (f"- {STATUS_LABELS[resolution['status'] if resolution else None]}: {clean(item['title'], 500)} "
-                    f"_({who}, {item['severity']}{', ' + where if where else ''})_")
-            if resolution and resolution["detail"]:
-                line += " — " + clean(resolution["detail"], 2000).replace("\n", " ")
-            lines.append(line)
+            raised = f"_({who}, {item['severity']}{', ' + where if where else ''})_"
+            if not attribute:
+                resolution = answers[0] if answers else None
+                line = (f"- {STATUS_LABELS[resolution['status'] if resolution else None]}: {clean(item['title'], 500)} "
+                        f"{raised}")
+                if resolution and resolution["detail"]:
+                    line += " — " + clean(resolution["detail"], 2000).replace("\n", " ")
+                lines.append(line)
+                continue
+            lines.append(f"- {clean(item['title'], 500)} {raised}")
+            by_agent = {answer["agent"]: answer for answer in answers}
+            for member in merged["members"]:
+                answer = by_agent.get(member["agent"])
+                line = f"  - {reviewer_names([member['agent']])}: {STATUS_LABELS[answer['status'] if answer else None]}"
+                if answer and answer["detail"]:
+                    line += " — " + clean(answer["detail"], 2000).replace("\n", " ")
+                lines.append(line)
         lines.append("")
-    if review["findings"]:
+    if merged["findings"]:
         lines.append("#### Regressions")
-        for n, item in enumerate(review["findings"], 1):
-            lines += _finding(n, item, repo, sha)
+        for n, item in enumerate(merged["findings"], 1):
+            lines += _finding(n, item, repo, sha, attribute)
         lines.append("")
     else:
         lines += ["No regressions found.", ""]
-    footer = ["---", f"<sub>local-autoreviewer · job {job_id} · {agent_name} · follow-up</sub>", marker(job_id, sha, agent)]
-    body = "\n".join(lines + footer)
-    if len(body) > MAX_BODY:
-        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
-        body = body[:MAX_BODY - len(tail) - 100] + tail
-    return body
+    footer = _footer(merged, sha, "follow-up")
+    return _fit("\n".join(lines + footer), footer)
 
 
 def render_skipped(*, reason, sha, job_id, agent):
