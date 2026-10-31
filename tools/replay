@@ -129,12 +129,17 @@ def main():
     if "codex" in agents:  # a shared CODEX_HOME races the service's token refreshes (see above)
         hold = hold_codex(live_state)  # first, so the worker can't start one after the check below  # noqa: F841
         try:
-            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
-            try:
+            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=rw", uri=True,
+                                   timeout=30, isolation_level=None)
+            try:  # in a write transaction, changing no rows: a claim begun before the hold is counted
+                live.execute("BEGIN IMMEDIATE")
                 busy = live.execute("SELECT COUNT(*) FROM jobs WHERE agent='codex' AND status='running'").fetchone()[0]
+                live.execute("ROLLBACK")
             finally:
                 live.close()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if (live_state / "state.sqlite3").exists():  # locked or unwritable: don't assume the service is idle
+                sys.exit(f"tools/replay: cannot check whether the service is running a Codex review: {exc}")
             busy = 0  # no service database yet
         if busy:
             sys.exit("tools/replay: the service is running a Codex review; wait for it or pass --agent claude")
