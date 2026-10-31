@@ -16,7 +16,7 @@ For each update to one of your open PRs on a configured repo, every enabled agen
 - **Severity:** reviewers rate each finding's impact from 0 to 10, its likelihood and its trigger, and severity follows from impact. Then two adjustments apply to anything below Blocker: a fix that removes lines outside the tests (`test_paths`) moves the finding up a level, and a fix the reviewer rates less readable moves it down two, as far as Nit.
 - **Links:** every finding links to the file and line at that commit.
 - **Pushes:** a burst of pushes produces one review. A push during a review cancels it in favour of the new commit.
-- **Follow-ups:** after the first review, later commits get a follow-up instead of a full review. Each agent checks whether the previous round's issues (both agents' findings, or a previous follow-up's open ones) are fixed, partly fixed, not fixed or obsolete. It also reports regressions in what changed since, and nothing else. A retarget, or a previous commit that is gone from the mirror, means a full review again.
+- **Follow-ups:** after the first review, later commits get a follow-up instead of a full review. Each agent checks whether the previous round's issues (both agents' findings, or a previous follow-up's open ones) are fixed, partly fixed, not fixed or obsolete. It also reports regressions in what changed since, and nothing else. A previous commit that is gone from the mirror means a full review again, and so does a retarget, unless the old base's changes are all in the new one. That usually covers a stacked PR whose PR below has merged, even by squash, so it carries on with follow-ups. If the PR below changed the same lines again after the last review, it's a full review.
 
 > **Security model: built for your own PRs.**
 >
