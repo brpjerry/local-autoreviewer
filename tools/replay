@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Replay a review of an earlier commit of a PR, optionally with other prompts, to compare prompt changes.
 
-  tools/replay owner/repo#N HEAD [--base-sha SHA] [--agent claude|codex] [--prompts DIR] [--json]
+  tools/replay owner/repo#N COMMIT [--base-sha SHA] [--agent claude|codex] [--prompts DIR] [--json]
 
-HEAD and the base commit must still be in the service's mirror of the repository. It keeps open PRs' current
+COMMIT and the base commit must still be in the service's mirror of the repository. It keeps open PRs' current
 heads and bases and the commits of unexpired job checkouts; housekeeping drops a closed PR's refs. The review
 runs through the real pipeline against a scratch copy laid out like GitHub, in a scratch state directory, and
 is never posted. Only the PR's title, description, author and base branch are read from GitHub. --prompts
@@ -17,6 +17,8 @@ running a Codex review.
 import argparse
 import json
 import os
+import signal
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -58,10 +60,15 @@ def main():
     parser.add_argument("ref", help="owner/repo#N")
     parser.add_argument("head", help="the PR commit to review")
     parser.add_argument("--base-sha", help="the base commit (default: the one the service last fetched)")
-    parser.add_argument("--agent", action="append", choices=config_mod.AGENTS)
+    parser.add_argument("--agent", action="append", choices=config_mod.AGENTS,
+                        help="agent to run; repeatable (default: the repo's configured agents)")
     parser.add_argument("--prompts", type=Path, help="directory with review.md and review.schema.json")
     parser.add_argument("--json", action="store_true", help="print the structured reviews")
     args = parser.parse_args()
+    if args.prompts:
+        missing = [name for name in ("review.md", "review.schema.json") if not (args.prompts / name).is_file()]
+        if missing:
+            sys.exit(f"tools/replay: {args.prompts} has no {' or '.join(missing)}")
 
     repo, number = parse_ref(args.ref)
     live_state = paths.state_dir()
@@ -77,10 +84,14 @@ def main():
     pr = GitHub(token, live_state / "gh").pr_view(repo, number)
 
     scratch = Path(tempfile.mkdtemp(prefix="local-autoreviewer-replay-"))
+    print(f"scratch directory (remove it when done): {scratch}", file=sys.stderr, flush=True)
     remote = scratch / "remote" / f"{repo_cfg.name}.git"  # the name the pipeline's origin URL uses
     git("init", "--quiet", "--bare", "--template=", str(remote))
-    git("-C", str(mirror), "push", "--quiet", str(remote), f"{head}:refs/pull/{number}/head",
-        f"{base_sha}:refs/heads/{pr['baseRefName']}")
+    # Borrow the mirror's objects instead of copying its whole history.
+    (remote / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (remote / "objects" / "info" / "alternates").write_text(f"{mirror.resolve() / 'objects'}\n")
+    git("-C", str(remote), "update-ref", f"refs/pull/{number}/head", head)
+    git("-C", str(remote), "update-ref", f"refs/heads/{pr['baseRefName']}", base_sha)
     state = scratch / "state"
     state.mkdir()
     (state / "codex-home").symlink_to(live_state / "codex-home")
@@ -98,6 +109,17 @@ def main():
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
     agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
+    if "codex" in agents:  # a shared CODEX_HOME races the service's token refreshes (see above)
+        try:
+            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                busy = live.execute("SELECT COUNT(*) FROM jobs WHERE agent='codex' AND status='running'").fetchone()[0]
+            finally:
+                live.close()
+        except sqlite3.Error:
+            busy = 0  # no service database yet
+        if busy:
+            sys.exit("tools/replay: the service is running a Codex review; wait for it or pass --agent claude")
     reviews = {}
     for agent in agents:
         conn = svc.connect()
@@ -126,14 +148,16 @@ def main():
                       f"{item['title'][:110]}")
             print(f"     test gaps {len(reviews[agent]['test_gaps'])}, questions {len(reviews[agent]['questions'])}, "
                   f"nits {len(reviews[agent]['nits'])}")
-    print(f"scratch directory (remove it when done): {scratch}", file=sys.stderr)
     if args.json:
         print(json.dumps(reviews, indent=2))
     return 0 if len(reviews) == len(agents) else 1
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal.default_int_handler)  # stop the agent as Ctrl-C does
     try:
         sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
     except (CliError, GitError, GitHubError, config_mod.ConfigError) as exc:
         sys.exit(f"tools/replay: {exc}")
