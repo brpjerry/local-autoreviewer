@@ -400,9 +400,10 @@ def previous_round(conn, job, base_contains=lambda base_sha: False):
     scope = (f"repo=? AND number=? AND review_recorded=1 AND status IN ('posted', 'skipped')"
              f" AND NOT {db.TRIAL_SQL}")
     args = (job["repo"], job["number"])
-    row = conn.execute(f"SELECT id, head_sha, base_ref, base_sha FROM jobs WHERE {scope} AND head_sha!=?"
-                       " ORDER BY finished_at DESC, id DESC LIMIT 1",
-                       (*args, db.FOREGROUND, job["head_sha"])).fetchone()
+    # A round at this head counts only on another base: a retarget without a push carries its findings on.
+    row = conn.execute(f"SELECT id, head_sha, base_ref, base_sha FROM jobs WHERE {scope}"
+                       " AND (head_sha!=? OR base_ref!=?) ORDER BY finished_at DESC, id DESC LIMIT 1",
+                       (*args, db.FOREGROUND, job["head_sha"], job["base_ref"])).fetchone()
     if row is None:
         return None
     if row["base_ref"] != job["base_ref"] and not (row["base_sha"] and base_contains(row["base_sha"])):

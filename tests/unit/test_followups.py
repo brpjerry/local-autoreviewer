@@ -170,10 +170,11 @@ class FollowupTests(EnvTestCase):
     def test_a_retarget_away_and_back_means_a_full_review(self):
         self.review_at(self.head_a)
         conn = self.svc.connect()
-        with db.transaction(conn):  # reviewed against another base in between
+        with db.transaction(conn):  # reviewed since against another base, one with changes main doesn't have
             other = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head_a, base_ref="release", agent="claude",
                                   model="", source="poll", not_before=0, now=self.clock())
-            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock())
+            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock(),
+                          base_sha=self.head_a)
         conn.close()
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
@@ -193,12 +194,16 @@ class FollowupTests(EnvTestCase):
         self.review_at(head, base="lower")
         return head
 
+    def squash_the_pr_below(self):
+        self.remote.write("README.md", "demo, with docs\n")  # as stacked() made it on `lower`
+        squashed = self.remote.commit("the PR below (squashed)")
+        git("push", "-q", str(self.remote.bare), "main", cwd=self.remote.work)
+        return squashed
+
     def test_a_retarget_after_the_pr_below_merges_continues_with_a_followup(self):
         stacked = self.stacked()
-        work, bare = self.remote.work, str(self.remote.bare)
-        self.remote.write("README.md", "demo, with docs\n")  # the PR below is squash-merged into main
-        self.remote.commit("the PR below (squashed)")
-        git("push", "-q", bare, "main", cwd=work)
+        self.squash_the_pr_below()
+        work = self.remote.work
         git("checkout", "-q", "pr1", cwd=work)  # this PR is retargeted to main, merges it, and fixes its finding
         git("merge", "-q", "-m", "merge main", "main", cwd=work)
         head = self.remote.push_pr(1, {"src/calc.py": FIXED})
@@ -214,8 +219,39 @@ class FollowupTests(EnvTestCase):
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
 
+    def test_a_retarget_without_a_push_carries_the_findings_on(self):
+        stacked = self.stacked()
+        (finding,) = self.rows("SELECT id FROM findings WHERE kind='finding'")
+        self.squash_the_pr_below()
+        second, _ = self.review_at(stacked)  # GitHub retargets this PR to main; its head doesn't change
+        self.assertEqual(self.rows("SELECT review_kind, followup_of FROM jobs WHERE id=?", second),
+                         [{"review_kind": "followup", "followup_of": stacked}])
+        self.assertEqual([f["id"] for f in json.loads(self.context(second, "previous-findings.json").read_text())],
+                         [finding["id"]])
+        self.assertEqual(self.context(second, "since-review.diff").read_text(), "")
+
+    def test_contains(self):
+        work = self.remote.work
+        contains = lambda sha, other: self.svc.git.contains(work, sha, other)  # noqa: E731
+        initial = self.remote.base_sha
+        self.assertTrue(contains(self.head_a, initial))  # an ancestor
+        git("checkout", "-q", "-B", "lower", "main", cwd=work)
+        self.remote.write("README.md", "demo, with docs\n")
+        lower = self.remote.commit("the PR below")
+        git("checkout", "-q", "main", cwd=work)
+        self.assertFalse(contains("main", lower))  # not merged
+        squashed = self.squash_the_pr_below()
+        self.assertTrue(contains(squashed, lower))  # merged by squash: not an ancestor, but nothing to add
+        git("checkout", "-q", "lower", cwd=work)
+        self.remote.write("README.md", "demo, with other docs\n")
+        later = self.remote.commit("the PR below, changed again")
+        git("checkout", "-q", "main", cwd=work)
+        self.assertFalse(contains(squashed, later))  # conflicts with what merged
+        self.assertFalse(contains(squashed, "f" * 40))  # not in the repository
+
     def test_a_round_on_the_old_base_gone_from_the_mirror_means_a_full_review(self):
         self.stacked()
+        self.squash_the_pr_below()  # so the real old base would count
         conn = self.svc.connect()
         with db.transaction(conn):
             conn.execute("UPDATE jobs SET base_sha=?", ("f" * 40,))
@@ -224,11 +260,21 @@ class FollowupTests(EnvTestCase):
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
 
     def test_only_the_latest_rounds_base_counts(self):
-        self.review_at(self.head_a)
+        first, _ = self.review_at(self.head_a)
+        conn = self.svc.connect()
+        with db.transaction(conn):  # a later full round at the same head on another base
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head_a, base_ref="lower", agent="claude",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock() + 1,
+                          base_sha=self.remote.base_sha)
+            conn.execute("INSERT INTO findings (job_id, kind, position, title) VALUES (?, 'finding', 0, 'other')",
+                         (other,))
+        conn.close()
+        self.clock.advance(60)
         git("push", "-q", str(self.remote.bare), "main:refs/heads/lower", cwd=self.remote.work)
-        self.review_at(self.head_a, base="lower")  # retargeted without a push: a new round at the same head
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}), base="lower")
-        self.assertEqual(len(json.loads(self.context(second, "previous-findings.json").read_text())), 1)
+        self.assertEqual([f["title"] for f in json.loads(self.context(second, "previous-findings.json").read_text())],
+                         ["other"])
 
     def test_the_followup_prompt_closes_once(self):
         self.review_at(self.head_a)
