@@ -72,7 +72,7 @@ class ServiceConfig:
     bootstrap: str = "baseline"
     retain_jobs: int = 14 * 86400
     max_attempts: int = 3
-    combine_wait: int = 30 * 60  # how long a finished review waits for the other reviews of its commit
+    combine_wait: int = 30 * 60  # how long a finished review waits for a queued review of its commit (see pipeline.due)
 
 
 @dataclass(frozen=True)

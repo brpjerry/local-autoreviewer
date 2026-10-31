@@ -168,7 +168,7 @@ def cmd_review(args):
                 print(f"  posted: {job['review_url']}")
             elif out.is_file():
                 print(f"  review: {out}")
-            if job["status"] not in ("posted", "skipped"):
+            if job["status"] not in ("posted", "skipped", "waiting"):  # a waiting review is posted by the worker
                 worst = 1
         if merged:
             print(f"reviews merged as they would be posted: {merged}")

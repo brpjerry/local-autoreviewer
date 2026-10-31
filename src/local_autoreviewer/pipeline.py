@@ -273,7 +273,8 @@ def _finish_post(svc, job_id, sleep, notify):
         while True:
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
-            if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT:
+            # A review another job's post carries is finished by that post, never posted on its own.
+            if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT or job["posted_with"] not in (None, job_id):
                 return job["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
@@ -620,8 +621,13 @@ def _waiting_with(conn, job):
 
 
 def due(conn, svc, job):
-    """Whether a waiting review should be posted now: nothing it waits for is left to finish, or its wait is over."""
-    return job["not_before"] <= svc.now() or not _pending(conn, job)
+    """Whether a waiting review should be posted now: nothing it waits for is left to finish, or its wait
+    is over and none of those is running (a running review finishes within review_timeout), or combining
+    is off (combine_wait = 0, set while it waited)."""
+    if svc.config.service.combine_wait <= 0:
+        return True
+    pending = _pending(conn, job)
+    return not pending or (job["not_before"] <= svc.now() and all(row["status"] != "running" for row in pending))
 
 
 def _display_order(rows):
@@ -646,10 +652,8 @@ def _post_round(conn, svc, job, agent, cancel, *, title):
         pending = _pending(conn, job)
         if pending and wait > 0:
             return _wait(conn, svc, job, pending)
-        others = _waiting_with(conn, job)
-        for row in others:  # keep them from giving up on this post while the check runs
-            db.update_job(conn, row["id"], not_before=max(row["not_before"],
-                                                          svc.now() + DUPLICATE_CHECK_TIMEOUT + 5 * 60))
+        # While this job runs the check, they wait for it: it is a running review of their commit (see due()).
+        others = _waiting_with(conn, job) if wait > 0 else []
     check = None
     if others:
         check = _check_duplicates(conn, svc, job, others, agent, cancel, title=title)
@@ -664,7 +668,7 @@ def _post_round(conn, svc, job, agent, cancel, *, title):
         pending = _pending(conn, job)  # one started meanwhile, say by `enqueue --force`
         if pending and wait > 0:
             return _wait(conn, svc, job, pending)
-        still = {row["id"] for row in _waiting_with(conn, job)}
+        still = {row["id"] for row in _waiting_with(conn, job)} if wait > 0 else set()
         _claim(conn, svc, job, [row for row in others if row["id"] in still], check)
     return post(conn, svc, db.get_job(conn, job["id"]))
 
@@ -678,7 +682,7 @@ def post_waiting(conn, svc, job_id):
         job = db.get_job(conn, job_id)
         if job["status"] != "waiting" or not due(conn, svc, job):
             return job["status"]
-        others = _waiting_with(conn, job)
+        others = _waiting_with(conn, job) if svc.config.service.combine_wait > 0 else []
         _claim(conn, svc, job, others, {"duplicates": [], "unchecked": "the check didn't run"} if others else None)
     try:
         return post(conn, svc, db.get_job(conn, job_id))
@@ -790,8 +794,12 @@ def _members(conn, job):
 
 
 def _release_round(conn, svc, job_id):
-    """The job's post won't carry the others after all: they wait again, for it among others."""
-    for row in _members(conn, {"id": job_id}):
+    """The job's post won't carry the others after all: they wait again, for it among others, and the
+    duplicates recorded among them no longer stand (each may now be posted on its own)."""
+    members = _members(conn, {"id": job_id})
+    if members:
+        _record_duplicates(conn, [db.get_job(conn, job_id), *members], [])
+    for row in members:
         db.update_job(conn, row["id"], status="waiting", posted_with=None, reason="review ready; waiting to post it",
                       not_before=svc.now() + svc.config.service.combine_wait)
     db.update_job(conn, job_id, posted_with=None)
@@ -823,7 +831,14 @@ def _round_post(conn, svc, job):
         record = json.loads((out / "round.json").read_text())
     except (OSError, ValueError):
         record = {}
-    body, inline = _render_round(conn, svc, rows, record)
+    try:
+        body, inline = _render_round(conn, svc, rows, record)
+    except (OSError, ValueError, KeyError, TypeError) as exc:  # a review.json gone or garbled
+        log.warning("job %s: cannot merge the reviews of jobs %s (%s: %s); posting them separately", job["id"],
+                    ", ".join(str(row["id"]) for row in rows), type(exc).__name__, exc)
+        with db.transaction(conn):  # each still has its own review.md
+            _release_round(conn, svc, job["id"])
+        return _round_post(conn, svc, db.get_job(conn, job["id"]))
     (out / "round.md").write_text(body)
     (out / "round-comments.json").write_text(json.dumps(inline, indent=2))
     hits = leakscan.scan("\n".join([body, *(comment["body"] for comment in inline)]), svc.secrets())
@@ -855,7 +870,9 @@ def _render_round(conn, svc, rows, record):
 def preview_round(svc, job_ids, *, title=""):
     """For `review` without --post: its jobs' reviews merged as the service would post them, checked for
     duplicates by the last job's agent, saved as round.md in that job's out/. Returns the path, or None
-    with fewer than two reviews to merge."""
+    with fewer than two reviews to merge, or with combine_wait = 0 (the service posts each on its own)."""
+    if svc.config.service.combine_wait <= 0:
+        return None
     conn = svc.connect()
     try:
         rows = [db.get_job(conn, job_id) for job_id in job_ids]
@@ -868,7 +885,15 @@ def preview_round(svc, job_ids, *, title=""):
         if not others:
             return None
         agent = make_agent(svc.config.agents[lead["agent"]], svc.state)
-        record = _check_duplicates(conn, svc, lead, others, agent, CancelToken(), title=title)
+        # Running again while its agent runs: `tools/live` and `tools/replay` count it, and if this process
+        # dies, the worker's orphan cleanup stops the check (it cancels the job, whose review is saved).
+        with db.transaction(conn):
+            db.update_job(conn, lead["id"], status="running")
+        try:
+            record = _check_duplicates(conn, svc, lead, others, agent, CancelToken(), title=title)
+        finally:
+            with db.transaction(conn):
+                conn.execute("UPDATE jobs SET status='skipped' WHERE id=? AND status='running'", (lead["id"],))
         rows = _display_order([lead, *others])
         with db.transaction(conn):
             _record_duplicates(conn, rows, record["duplicates"])
@@ -908,7 +933,7 @@ def post_failed(conn, svc, job, exc):
                            post_attempts=post_attempts, review_id=existing.get("id"),
                            review_url=existing.get("html_url"))
     if rejected or post_attempts >= svc.config.service.max_attempts:
-        saved = f"review saved to {job_paths(svc.state, job['id']).out}/review.md"
+        saved = f"review saved to {job_paths(svc.state, job['id']).out}/{'round' if job['posted_with'] else 'review'}.md"
         return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000],
                        post_attempts=post_attempts, error=str(exc)[:2000])
     log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)

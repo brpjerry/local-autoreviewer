@@ -70,8 +70,8 @@ def groups(raw, members):
     answer = raw.get("duplicates") if isinstance(raw, dict) else None
     for entry in answer if isinstance(answer, list) else []:
         named = entry.get("ids") if isinstance(entry, dict) else None
-        refs = [ids[i] for i in dict.fromkeys(named if isinstance(named, list) else [])
-                if isinstance(i, str) and i in ids and ids[i] not in seen]
+        named = [i for i in named if isinstance(i, str)] if isinstance(named, list) else []
+        refs = [ids[i] for i in dict.fromkeys(named) if i in ids and ids[i] not in seen]
         kinds = {key for _, key, _ in refs}
         if len({job_id for job_id, _, _ in refs}) < 2 or (len(kinds) > 1 and not kinds <= {"findings", "nits"}):
             continue

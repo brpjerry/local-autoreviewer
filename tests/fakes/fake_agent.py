@@ -89,7 +89,7 @@ def main():
             print("boom: duplicate check crashed", file=sys.stderr)
             return 3
         review = duplicates(prompt)
-        mode = "sleep" if mode == "dupsleep" else "ok"
+        mode = {"dupsleep": "sleep", "dupratelimit": "ratelimit"}.get(mode, "ok")
     if mode == "sleep":
         time.sleep(60)
     if mode == "fail":

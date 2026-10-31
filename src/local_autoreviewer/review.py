@@ -305,7 +305,7 @@ def _finding(number, item, repo, sha, attribute=False):
     for other in item.get("also") or []:  # the same issue from another reviewer, rated differently
         if other["severity"] == "nit":
             lines.append(f"{reviewer_names([other['agent']])} reported it as a nit.")
-        elif other["severity"] != item["severity"]:
+        elif other["severity"] != (item.get("reviewer_severity") or item["severity"]):
             impact = f" (impact {other['impact']}/10)" if other.get("impact") is not None else ""
             lines.append(f"{reviewer_names([other['agent']])} rated it {other['severity']}{impact}.")
     if item.get("trigger"):
@@ -352,8 +352,11 @@ def merge(members, duplicates=None, *, unchecked=""):
                     entry["also"] = []
                     for job_id, other_key, other_position in others:
                         other = reviews[job_id][other_key][other_position]
+                        # As the other reviewer reported it, before the severity modifiers.
+                        severity = (other.get("reviewer_severity") or other["severity"]) if other_key == "findings" \
+                            else "nit"
                         entry["also"].append({"agent": agent_of[job_id], "impact": other.get("impact"),
-                                              "severity": other["severity"] if other_key == "findings" else "nit"})
+                                              "severity": severity})
                 merged[key].append(entry)
     # By final severity, as each review is; within a level, by reviewer, then each reviewer's own order.
     merged["findings"].sort(key=lambda f: suggestions.LEVELS.index(f["severity"]), reverse=True)
