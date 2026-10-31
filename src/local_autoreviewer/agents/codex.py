@@ -82,10 +82,10 @@ class CodexAgent:
             size += len(chunk)
         return "".join(parts)
 
-    def invocation(self, *, unit, paths, prompt, session_id):
+    def invocation(self, *, unit, paths, prompt, session_id, schema=None):
         argv = [self.cfg.command, "exec", *self._locked_flags(), "--sandbox", "read-only",
                 "-C", paths.worktree, "--skip-git-repo-check", "--json",
-                "-o", f"{paths.out}/review.json", "--output-schema", str(review.schema_path()),
+                "-o", f"{paths.out}/review.json", "--output-schema", str(schema or review.schema_path()),
                 *self._model_flags(), "-"]
         if self.cfg.mode == "inline":
             prompt += self.inline_context(paths)

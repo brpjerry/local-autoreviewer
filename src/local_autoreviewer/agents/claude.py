@@ -48,9 +48,9 @@ class ClaudeAgent:
     def agent_note(self):
         return "You have read-only file tools (Read, Grep, Glob) confined to the checkout and the context directory."
 
-    def invocation(self, *, unit, paths, prompt, session_id):
+    def invocation(self, *, unit, paths, prompt, session_id, schema=None):
         argv = [self.cfg.command, "-p", *self._locked_flags(paths), "--session-id", session_id,
-                "--output-format", "json", "--json-schema", review.schema_text(), *self._model_flags()]
+                "--output-format", "json", "--json-schema", review.schema_text(schema), *self._model_flags()]
         return Invocation(argv=argv, cwd=paths.worktree, env=agent_env(QUIET_ENV), stdin=prompt.encode(),
                           stdout_path=f"{paths.out}/agent.stdout", stderr_path=f"{paths.out}/agent.stderr",
                           unit=unit, memory_max=self.cfg.memory_max, tasks_max=self.cfg.tasks_max)

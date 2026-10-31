@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import contextlib
+import fcntl
 import io
 import json
 import sqlite3
@@ -117,6 +118,15 @@ class PipelineTests(EnvTestCase):
         self.github.pr_view = pr_view
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
         self.assertEqual(self.github.posted, [])
+
+    def test_the_agent_gets_its_own_copy_of_the_schema(self):
+        svc, (job_id,) = self.queue(agents=("codex",))
+        pipeline.run_job(svc, job_id, pipeline.CancelToken())
+        (call,) = self.agent_log("codex")
+        schema = Path(call["argv"][call["argv"].index("--output-schema") + 1])
+        self.assertEqual(schema, Path(pipeline.job_paths(self.state, job_id).context, "review.schema.json"))
+        self.assertEqual(schema.read_text(), review.schema_path().read_text())
+        self.assertEqual(self.job(svc, job_id)["prompt_version"], review.prompt_version())
 
     def test_proposed_changes_are_posted_as_suggestions(self):
         svc, (job_id,) = self.queue()
@@ -1048,6 +1058,40 @@ class WorkerTests(EnvTestCase):
                 return jobs
             time.sleep(0.05)
         self.fail(f"timed out; jobs: {jobs}")
+
+    def hold(self, name, content):
+        """Take a hold as tools/live or tools/replay would; the caller closes the handle to end it."""
+        (self.state / "holds").mkdir(exist_ok=True)
+        handle = open(self.state / "holds" / f"{name}.lock", "w")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(content)
+        handle.flush()
+        return handle
+
+    def test_held_agents(self):
+        from local_autoreviewer.worker import held_agents
+        self.assertEqual(held_agents(self.state), set())
+        codex = self.hold("replay-1", "codex\n")
+        (self.state / "holds" / "stale.lock").write_text("claude\n")  # its owner exited without removing it
+        self.assertEqual(held_agents(self.state), {"codex"})
+        everything = self.hold("tools-live", "")
+        self.assertEqual(held_agents(self.state), {"codex", "all"})
+        codex.close()
+        everything.close()
+        self.assertEqual(held_agents(self.state), set())
+
+    def test_a_held_worker_starts_nothing_until_the_hold_ends(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        self.enqueue(svc)
+        worker = Worker(lambda c: svc, None)
+        hold = self.hold("tools-live", "all")
+        worker.claim(svc)
+        self.assertEqual(worker.threads, {})
+        hold.close()
+        worker.claim(svc)
+        self.assertEqual(len(worker.threads), 1)
+        for thread, _token, _agent in worker.threads.values():
+            thread.join(30)
 
     def test_worker_reviews_with_both_agents(self):
         worker, thread, svc = self.start(self.cfg)

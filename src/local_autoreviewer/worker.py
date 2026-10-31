@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Long-running worker: claims queued jobs, runs at most one per agent, honours cancels."""
 
+import fcntl
 import json
 import logging
 import os
@@ -8,12 +9,31 @@ import signal
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import db, paths, pipeline
 
 log = logging.getLogger(__name__)
 TICK = 2.0
 STATUS_EVERY = 10.0
+
+
+def held_agents(state):
+    """Agents the worker must not start new reviews for: the union of live holds. A hold is a file in
+    state/holds that its owner keeps locked (tools/live while it deploys, tools/replay while it runs
+    Codex); its content names the agents, or is "all" (also if empty). A file whose owner has exited is
+    no longer locked and doesn't count. Owners remove their own files."""
+    held = set()
+    for path in (Path(state) / "holds").glob("*.lock"):
+        try:
+            with open(path) as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:  # its owner holds it
+                    held.update(handle.read().split() or ["all"])
+        except OSError:
+            continue
+    return held
 
 
 def start_of_local_day(now):
@@ -169,7 +189,8 @@ class Worker:
 
     def claim(self, svc):
         busy = {agent for (_t, _c, agent) in self.threads.values()}
-        free = [agent for agent in svc.config.agents if agent not in busy]
+        held = held_agents(svc.state)
+        free = [agent for agent in svc.config.agents if agent not in busy and agent not in held and "all" not in held]
         if not free:
             return
         now = svc.now()

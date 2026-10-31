@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Run the review service from a git worktree of this repository instead of the installed package,
+# so a change goes live in seconds rather than through a release.
+#
+#   tools/live setup [REF]    create the live worktree at REF (default: main) and point the user units at it
+#   tools/live deploy [REF]   move the live worktree to REF; the worker restarts on it once it is idle
+#   tools/live status         show what is live
+#   tools/live teardown       point the units back at the installed package
+#
+# The live worktree is separate from the checkout you edit, so work in progress never runs. Each deploy
+# writes a VERSION file into it; the worker notices the change and restarts once idle, as it does after
+# a package upgrade. `local-autoreviewer-live` (in ~/.local/bin) runs the live code from a shell.
+#
+# The live code may migrate the state database. An older installed package then refuses to open it,
+# so install a package at least as new before `teardown`.
+set -euo pipefail
+
+repo=$(git -C "$(dirname "$(realpath "$0")")/.." rev-parse --show-toplevel)
+live=${LOCAL_AUTOREVIEWER_LIVE:-${XDG_DATA_HOME:-$HOME/.local/share}/local-autoreviewer/live}
+units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+state=${XDG_STATE_HOME:-$HOME/.local/state}/local-autoreviewer
+command_link=$HOME/.local/bin/local-autoreviewer-live
+
+deploy() {
+    local commit
+    commit=$(git -C "$repo" rev-parse --verify --quiet "${1:-main}^{commit}") || {
+        echo "tools/live: unknown ref ${1:-main}" >&2
+        exit 2
+    }
+    # The poll unit runs the new code on its next tick; a new migration would stop a busy old worker.
+    if ! git -C "$live" diff --quiet HEAD "$commit" -- src/local_autoreviewer/db.py; then
+        hold
+        wait_idle
+    fi
+    git -C "$live" checkout --quiet --detach "$commit"
+    echo "live-$(git -C "$live" rev-parse --short=12 HEAD)" >"$live/VERSION"
+    echo "live: $(git -C "$live" log -1 --format='%h %s')"
+}
+
+hold() {
+    # Keep the worker from starting new reviews until this script exits, so it can go idle even with a
+    # backlog (see worker.held_agents). The hold ends when the lock's file descriptor closes at exit.
+    [ -z "${holding:-}" ] || return 0
+    holding=1
+    mkdir -p "$state/holds"
+    exec 9>"$state/holds/tools-live.lock"
+    # Wait a little: the worker briefly takes a shared lock on this file when it checks holds.
+    flock -w 10 9 || { echo "tools/live: another tools/live is running" >&2; exit 1; }
+    echo all >&9
+    trap 'rm -f "$state/holds/tools-live.lock"' EXIT
+}
+
+wait_idle() {
+    # Read-only and without the app's code, so it never migrates the database under an older worker.
+    [ -f "$state/state.sqlite3" ] || return 0
+    local busy announced=
+    for _ in $(seq 1 180); do
+        # Only the worker's own work counts: foreground `review` jobs, and posts waiting out a retry,
+        # aren't affected by a restart.
+        busy=$(python3 -I -c 'import sqlite3, sys, time
+from pathlib import Path
+conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+print(conn.execute("SELECT COUNT(*) FROM jobs WHERE source != ? AND (status = ? OR status = ? AND not_before <= ?)",
+                   ("foreground", "running", "posting", int(time.time()))).fetchone()[0])' \
+            "$state/state.sqlite3")
+        [ "$busy" = 0 ] && return 0
+        [ "${announced:-}" ] || echo "waiting for $busy running review(s) to finish..."
+        announced=1
+        sleep 10
+    done
+    echo "tools/live: reviews still running after 30 minutes; not restarting the worker" >&2
+    exit 1
+}
+
+restart() {
+    hold
+    wait_idle
+    systemctl --user daemon-reload
+    systemctl --user restart local-autoreviewer-worker.service
+    systemctl --user is-active local-autoreviewer-worker.service
+}
+
+case ${1:-} in
+setup)
+    if [ ! -e "$live/.git" ]; then
+        mkdir -p "$(dirname "$live")"
+        git -C "$repo" worktree add --quiet --detach "$live" "${2:-main}"
+    fi
+    hold
+    wait_idle
+    deploy "${2:-main}"
+    for unit in worker poll; do
+        mkdir -p "$units/local-autoreviewer-$unit.service.d"
+        printf '# Written by tools/live; "tools/live teardown" removes it.\n[Service]\nExecStart=\nExecStart="%s" %s\n' \
+            "$live/bin/local-autoreviewer" "$unit" >"$units/local-autoreviewer-$unit.service.d/live.conf"
+    done
+    mkdir -p "$(dirname "$command_link")"
+    ln -sfn "$live/bin/local-autoreviewer" "$command_link"
+    restart
+    ;;
+deploy)
+    if [ ! -e "$live/.git" ] || [ ! -e "$units/local-autoreviewer-worker.service.d/live.conf" ]; then
+        echo "tools/live: run 'tools/live setup' first" >&2
+        exit 2
+    fi
+    deploy "${2:-main}"
+    ;;
+status)
+    if [ -e "$units/local-autoreviewer-worker.service.d/live.conf" ]; then
+        echo "units: live worktree $live"
+        echo "live: $(git -C "$live" log -1 --format='%h %s') ($(cat "$live/VERSION" 2>/dev/null || echo 'no VERSION'))"
+    else
+        echo "units: installed package"
+    fi
+    systemctl --user show local-autoreviewer-worker.service -p ExecStart --value | head -1
+    ;;
+teardown)
+    hold
+    wait_idle
+    rm -f "$units/local-autoreviewer-worker.service.d/live.conf" "$units/local-autoreviewer-poll.service.d/live.conf"
+    rmdir "$units/local-autoreviewer-worker.service.d" "$units/local-autoreviewer-poll.service.d" 2>/dev/null || true
+    rm -f "$command_link"
+    restart
+    echo "units: installed package (the live worktree is kept; 'git worktree remove $live' deletes it)"
+    ;;
+*)
+    awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
+    exit 2
+    ;;
+esac

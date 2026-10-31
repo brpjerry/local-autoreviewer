@@ -5,3 +5,4 @@ __pycache__/
 /src/*.egg-info/
 *.pkg.tar.zst
 /dist/
+/VERSION
