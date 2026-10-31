@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.helpers import REPO, EnvTestCase, make_config
+from tests.helpers import REPO, EnvTestCase, git, make_config
 from local_autoreviewer import db, maintenance, pipeline, review
 from local_autoreviewer.agents import claude as claude_mod
 from local_autoreviewer.agents import codex as codex_mod
@@ -69,6 +69,23 @@ class FollowupTests(EnvTestCase):
         self.assertIn(f"✅ Fixed: {finding['title']}", posted["body"])
         self.assertIn("1. **The fix dropped the docstring**", posted["body"])
         self.assertEqual([(c["path"], c["line"]) for c in posted["comments"]], [("src/calc.py", 1)])
+
+    def test_base_commits_merged_into_the_pr_are_not_its_changes(self):
+        self.review_at(self.head_a)
+        work = self.remote.work
+        git("checkout", "-q", "main", cwd=work)
+        self.remote.write("BASE_ONLY.txt", "from main\n")
+        self.remote.commit("main moves on")
+        git("push", "-q", str(self.remote.bare), "main", cwd=work)
+        git("checkout", "-q", "pr1", cwd=work)
+        git("merge", "-q", "--no-edit", "main", cwd=work)  # the PR catches up with its base
+        self.remote.write("src/calc.py", FIXED)
+        head = self.remote.commit("fix the division")
+        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
+        second, _ = self.review_at(head)
+        diff = self.context(second, "since-review.diff").read_text()
+        self.assertIn("raise ValueError", diff)
+        self.assertNotIn("BASE_ONLY", diff)
 
     def test_a_chain_of_followups_carries_the_open_issues(self):
         self.review_at(self.head_a)

@@ -448,7 +448,7 @@ def _run(conn, svc, job, cancel):
                      previous.head_sha[:12])
             previous = None
         if previous:
-            svc.git.write_followup_context(mirror, previous.head_sha, job["head_sha"], paths.context,
+            svc.git.write_followup_context(mirror, previous.head_sha, job["head_sha"], base_sha, paths.context,
                                            exclude=repo_cfg.diff_exclude, previous=previous.for_agent())
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))

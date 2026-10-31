@@ -180,11 +180,23 @@ class Git:
     def has_commit(self, mirror, sha):
         return self.run(["-C", str(mirror), "cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode == 0
 
-    def write_followup_context(self, mirror, previous_sha, head_sha, ctx_dir, *, exclude, previous):
-        """A follow-up's extra context: what changed since the previous review, and that review's findings."""
+    def since_review_start(self, mirror, previous_sha, head_sha, base_sha):
+        """What to compare head_sha with to see only the PR's own changes since previous_sha. If the PR has
+        merged (or been rebased onto) newer base commits since, that is previous_sha with those base commits
+        merged in, so they don't show up as the PR's changes; if that merge conflicts, previous_sha."""
+        m = str(mirror)
+        merge_base = self.out(["-C", m, "merge-base", base_sha, head_sha])
+        if self.run(["-C", m, "merge-base", "--is-ancestor", merge_base, previous_sha], check=False).returncode == 0:
+            return previous_sha
+        merged = self.run(["-C", m, "merge-tree", "--write-tree", merge_base, previous_sha], check=False)
+        return merged.stdout.split()[0] if merged.returncode == 0 else previous_sha
+
+    def write_followup_context(self, mirror, previous_sha, head_sha, base_sha, ctx_dir, *, exclude, previous):
+        """A follow-up's extra context: what the PR changed since the previous review, and that review's findings."""
         excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
+        start = self.since_review_start(mirror, previous_sha, head_sha, base_sha)
         diff = self.run(["-C", str(mirror), "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
-                         previous_sha, head_sha, "--", ".", *excludes], text=False).stdout
+                         start, head_sha, "--", ".", *excludes], text=False).stdout
         (Path(ctx_dir) / "since-review.diff").write_bytes(diff)
         (Path(ctx_dir) / "previous-findings.json").write_text(json.dumps(previous, indent=2))
         return len(diff)
