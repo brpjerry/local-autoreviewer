@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import sqlite3
+import threading
 import unittest
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
@@ -58,6 +59,36 @@ class PollTests(EnvTestCase):
         self.github.pr_view = probe(self.github.pr_view)
         self.assertEqual(self.poll(), [(1, "closed")])
         self.assertEqual(probes, ["list_open_prs", "pr_view"])
+
+    def test_polls_run_one_at_a_time(self):
+        self.github.set_pr(1, "a" * 40)
+        started, result = threading.Event(), {}
+        listing = self.github.list_open_prs
+
+        def list_open_prs(repo, limit=500):
+            started.set()
+            return listing(repo, limit)
+
+        self.github.list_open_prs = list_open_prs
+        with poll_mod.poll_lock(self.state):  # another poll is running
+            thread = threading.Thread(target=lambda: result.setdefault("r", poll_mod.poll(self.svc)))
+            thread.start()
+            self.assertFalse(started.wait(0.3))
+        thread.join(10)
+        self.assertTrue(started.is_set())
+        self.assertEqual(result["r"][1], 0)
+
+    def test_pr_opened_between_fetch_and_apply_is_left_for_the_next_poll(self):
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                         " head_changed_at, last_seen_at) VALUES (?, 5, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                         (REPO, "c" * 40, OWNER))
+            produced = poll_mod.poll_repo(conn, self.svc, self.svc.config.repo(REPO), self.clock(),
+                                          prs=[], gone={})
+            state = conn.execute("SELECT state FROM prs WHERE number=5").fetchone()[0]
+        conn.close()
+        self.assertEqual((produced, state), ([], "open"))
 
     def test_lifecycle(self):
         self.github.set_pr(1, "a" * 40)

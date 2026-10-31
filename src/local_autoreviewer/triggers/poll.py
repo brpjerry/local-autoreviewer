@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Polling trigger: diff `gh pr list` snapshots against the prs table."""
 
+import fcntl
 import logging
+from contextlib import contextmanager
+from pathlib import Path
 
 from .. import db, events
 from ..events import PrEvent
@@ -27,9 +30,22 @@ def _action(row, pr):
     return None
 
 
-def fetch(conn, svc, repo):
+@contextmanager
+def poll_lock(state):
+    """Run one poll at a time (the timer and a manual `poll`). GitHub is fetched outside the
+    database write lock, so without this an older snapshot could be applied over a newer one.
+    Unlike the write lock, it doesn't block the worker."""
+    path = Path(state) / "poll.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def fetch_repo(conn, svc, repo):
     """Everything poll_repo needs from GitHub, fetched before taking the write lock: holding it
-    across network calls would stall the worker's writes for as long as GitHub takes."""
+    across network calls would stall the worker's writes for as long as GitHub takes.
+    Returns the open PRs and, for each known-open PR missing from them, its current state."""
     prs = svc.github.list_open_prs(repo)
     listed = {pr["number"] for pr in prs}
     known_open = [row["number"] for row in conn.execute("SELECT number FROM prs WHERE repo=? AND state='open'",
@@ -39,10 +55,9 @@ def fetch(conn, svc, repo):
     return prs, gone
 
 
-def poll_repo(conn, svc, repo_cfg, now, fetched):
+def poll_repo(conn, svc, repo_cfg, now, prs, gone):
     """Apply one repo's fetched state inside the caller's transaction; return the events produced."""
     repo = repo_cfg.name
-    prs, gone = fetched
     known = {row["number"]: row for row in conn.execute("SELECT * FROM prs WHERE repo=?", (repo,))}
     bootstrap_key = f"bootstrapped:{repo.lower()}"
     review_existing = db.kv_get(conn, bootstrap_key) is not None or svc.config.service.bootstrap == "review"
@@ -89,15 +104,20 @@ def poll_repo(conn, svc, repo_cfg, now, fetched):
 
 def poll(svc, *, dry_run=False):
     """Poll every configured repo. Each repo commits separately so one failure doesn't block others."""
+    with poll_lock(svc.state):
+        return _poll(svc, dry_run)
+
+
+def _poll(svc, dry_run):
     conn = svc.connect()
     results, failures = {}, 0
     try:
         for repo_cfg in svc.config.repos.values():
             now = svc.now()
             try:
-                fetched = fetch(conn, svc, repo_cfg.name)
+                prs, gone = fetch_repo(conn, svc, repo_cfg.name)
                 conn.execute("BEGIN IMMEDIATE")
-                produced = poll_repo(conn, svc, repo_cfg, now, fetched)
+                produced = poll_repo(conn, svc, repo_cfg, now, prs, gone)
                 conn.execute("ROLLBACK" if dry_run else "COMMIT")
                 results[repo_cfg.name] = produced
             except Exception as exc:
