@@ -175,20 +175,23 @@ def cmd_enqueue(args):
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
     svc = build_services(cfg)
-    pr = svc.github.pr_view(repo_cfg.name, number)
-    if pr["state"] != "OPEN":
-        raise CliError(f"{repo}#{number} is {pr['state'].lower()}")
-    event = events.PrEvent(repo=repo_cfg.name, number=number, action="opened", head_sha=pr["headRefOid"],
-                           base_ref=pr["baseRefName"], is_draft=pr["isDraft"],
-                           author=(pr.get("author") or {}).get("login", ""), source="manual",
-                           force=args.force, agents=tuple(args.agent) if args.agent else None)
-    conn = svc.connect()
-    try:
-        with db.transaction(conn):
-            events.record(conn, event, svc.now())
-            created = events.ingest(conn, cfg, event, now=svc.now(), token_owner=svc.token_owner)
-    finally:
-        conn.close()
+    # Like a poll, fetch and ingest under the poll lock: a poll applying an older snapshot
+    # after this commits would otherwise supersede the newer job queued here.
+    with poll_mod.poll_lock(svc.state):
+        pr = svc.github.pr_view(repo_cfg.name, number)
+        if pr["state"] != "OPEN":
+            raise CliError(f"{repo}#{number} is {pr['state'].lower()}")
+        event = events.PrEvent(repo=repo_cfg.name, number=number, action="opened", head_sha=pr["headRefOid"],
+                               base_ref=pr["baseRefName"], is_draft=pr["isDraft"],
+                               author=(pr.get("author") or {}).get("login", ""), source="manual",
+                               force=args.force, agents=tuple(args.agent) if args.agent else None)
+        conn = svc.connect()
+        try:
+            with db.transaction(conn):
+                events.record(conn, event, svc.now())
+                created = events.ingest(conn, cfg, event, now=svc.now(), token_owner=svc.token_owner)
+        finally:
+            conn.close()
     if created:
         print("queued job(s): " + ", ".join(map(str, created)))
     else:
@@ -372,6 +375,7 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="local-autoreviewer",
                                      description="Review your GitHub PRs with local Claude Code / Codex sessions.")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {paths.read_version()}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("poll", help="poll configured repos once and queue reviews")
