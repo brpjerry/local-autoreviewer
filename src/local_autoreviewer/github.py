@@ -110,8 +110,12 @@ class GitHub:
                 return review
         return None
 
-    def post_review(self, repo, number, commit_sha, body):
-        payload = json.dumps({"commit_id": commit_sha, "event": "COMMENT", "body": body})
+    def post_review(self, repo, number, commit_sha, body, comments=None):
+        """Post a COMMENT review pinned to commit_sha, with optional inline comments (suggested changes)."""
+        review = {"commit_id": commit_sha, "event": "COMMENT", "body": body}
+        if comments:
+            review["comments"] = comments
+        payload = json.dumps(review)
         return self._json(["api", "--method", "POST", f"repos/{repo}/pulls/{number}/reviews",
                            "--input", "-"], stdin=payload)
 

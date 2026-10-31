@@ -28,11 +28,32 @@ $agent_note
 6. **Readability and docs:** misleading names, missing or stale docs and comments for non-obvious behaviour.
 7. **Nits:** at most 15 minor style points. Skip anything a formatter or linter would catch.
 
-## Severity
+## Proposed changes
 
-- **blocker:** must be fixed before merge: data loss, a security hole, broken core behaviour.
-- **major:** a real bug or design problem that should be fixed in this PR.
-- **minor:** worth fixing but not urgent.
+Propose the exact fix for every finding, and for nits where it's simple, in `edits`, so it can be applied with one click:
+- Each edit replaces lines `start_line` to `end_line` (inclusive, numbered as in the PR's version of the file in `$worktree`) with `replacement`: the complete new text of those lines, with the file's own indentation, and no line numbers or diff markers. An empty `replacement` deletes the lines. To insert lines, replace a neighbouring line with itself plus the new ones.
+- Keep each edit to one contiguous range and as small as the fix allows; use several edits when a fix touches several places. Edits within the lines the PR's diff shows become one-click suggestions on the PR; others are shown as a diff in the review.
+- Leave `edits` empty only when the fix can't be written that way (a new file, or a restructuring too large to spell out), and say why in `suggestion`.
+- `readability`: whether your proposed edits make the code `better`, the `same` or `worse` to read than it is now. A fix can be correct and still be harder to read; say so when it is.
+
+## Severity and impact
+
+Rate each finding by what it would realistically cost the people using this project, not by how subtle or interesting it is.
+
+- `trigger`: the concrete sequence of events, inputs or state that has to happen for the problem to occur.
+- `likelihood`: `common` if a normal workflow hits it, `occasional` if it needs an unusual but legitimate situation, `rare` if it needs a narrow race, a failing disk or network, or several unlikely events at once.
+- `impact`, from 0 to 10. Weigh how bad the result is together with its likelihood, using these anchors:
+  - 0: it would only matter for something like a cosmic-ray bit flip;
+  - 2: a rare race or failure that corrects itself (on the next run or retry, say) or only wastes some work;
+  - 5: a normal workflow sometimes gets a wrong result that someone will notice and have to put right by hand;
+  - 8: a common case breaks, data is lost, or a security hole opens;
+  - 10: the app would not work at all with this change.
+- `severity` follows from impact:
+  - **blocker** (8–10): core behaviour breaks, data is lost or a security hole opens;
+  - **major** (5–7): a normal workflow will hit it and get a wrong result;
+  - **minor** (0–4): narrow edge cases, rare races, problems that heal themselves, and polish.
+
+A problem needing several unlikely events at once is minor, however bad its result sounds. Report minor findings too; just label them honestly.
 
 Return your review in the required structured format. `line` refers to the new version of the file; use 0 when a finding isn't tied to a line. If the PR looks good, say so in the summary and leave `findings` empty. Don't invent problems.
 $extra_instructions

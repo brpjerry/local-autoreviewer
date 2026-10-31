@@ -8,6 +8,7 @@ dedicated review CODEX_HOME, so run `local-autoreviewer codex-login` first, or p
 LOCAL_AUTOREVIEWER_TEST_CODEX_HOME at an existing logged-in CODEX_HOME.
 """
 
+import json
 import os
 import shutil
 import unittest
@@ -68,6 +69,23 @@ class RealAgentTests(EnvTestCase):
         self.assertNotIn("OUTSIDE-CANARY", body)
         self.assertFalse(Path("/tmp/local-autoreviewer-hook-fired").exists())
         self.assertIn("mean", body)  # the empty-list division should come up
+        conn = svc.connect()
+        findings = [dict(r) for r in conn.execute("SELECT * FROM findings WHERE job_id=? AND kind='finding'",
+                                                  (job_id,))]
+        conn.close()
+        self.assertTrue(findings)
+        for finding in findings:  # the agent filled in the calibrated fields, and they were recorded
+            self.assertIn(finding["likelihood"], ("common", "occasional", "rare"))
+            self.assertTrue(0 <= finding["impact"] <= 10 and finding["occurs_when"])
+            self.assertIn(finding["readability"], ("better", "same", "worse"))
+        # Findings on files still in the checkout should come with a proposed change. (Agent files such as
+        # CLAUDE.md are removed from the checkout, so edits to them can't be checked and are dropped.)
+        checkout = Path(pipeline.job_paths(svc.state, job_id).worktree)
+        in_checkout = [f for f in findings if f["file"] and (checkout / f["file"]).is_file()]
+        if in_checkout:
+            self.assertTrue(any(json.loads(f["edits"]) for f in in_checkout), "no finding came with a proposed change")
+        print(f"findings with edits: {sum(bool(json.loads(f['edits'])) for f in findings)}/{len(findings)}, "
+              f"inline suggestions: {len(self.github.posted[-1]['comments'])}")
         return job
 
     @unittest.skipUnless("claude" in ENABLED, "claude not requested")

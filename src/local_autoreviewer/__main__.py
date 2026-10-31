@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -231,6 +232,73 @@ def cmd_status(args):
     return 0
 
 
+FINDING_COLUMNS = ("f.*, j.repo, j.number, j.head_sha, j.base_ref, j.agent, j.model, j.effort, j.prompt_version, "
+                   "j.source, j.status AS job_status, j.created_at AS job_created_at, j.review_url, j.usage_json")
+
+
+def cmd_findings(args):
+    where, params = [], []
+    if args.ref:
+        repo, number = parse_ref(args.ref)
+        where.append("j.repo=? COLLATE NOCASE AND j.number=?")
+        params += [repo, number]
+    if args.job is not None:
+        where.append("f.job_id=?")
+        params.append(args.job)
+    if args.kind:
+        where.append(f"f.kind IN ({','.join('?' * len(args.kind))})")
+        params += args.kind
+    if args.untriaged:
+        where.append("f.disposition IS NULL")
+    sql = (f"SELECT {FINDING_COLUMNS} FROM findings f JOIN jobs j ON j.id=f.job_id"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY f.job_id, f.kind, f.position")
+    conn = db.connect(paths.state_dir() / "state.sqlite3")
+    try:
+        rows = [dict(r) for r in conn.execute(sql, params)]
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for row in rows:
+        rating = row["severity"] or row["kind"].replace("_", " ")
+        if row["impact"] is not None:
+            rating += f" {row['impact']}/10"
+        if row["disposition"] or row["rated_impact"] is not None:
+            rated = "" if row["rated_impact"] is None else f" {row['rated_impact']}/10"
+            rating += f"  [{row['disposition'] or 'rated'}{rated}]"
+        location = f"  {row['file']}:{row['line']}" if row["file"] else ""
+        print(f"{row['id']:>5}  job {row['job_id']:<4} {row['agent']:<6} {row['repo']}#{row['number']} "
+              f"@{row['head_sha'][:7]}  {rating}")
+        print(f"       {row['title'][:150]}{location}")
+    return 0
+
+
+def _impact_arg(value):
+    impact = int(value)
+    if not 0 <= impact <= 10:
+        raise argparse.ArgumentTypeError("impact must be between 0 and 10")
+    return impact
+
+
+def cmd_triage(args):
+    if all(value is None for value in (args.impact, args.disposition, args.commit, args.note)):
+        raise CliError("give at least one of --impact, --disposition, --commit or --note")
+    conn = db.connect(paths.state_dir() / "state.sqlite3")
+    try:
+        with db.transaction(conn):  # all or nothing
+            for finding_id in args.ids:
+                try:
+                    db.triage(conn, finding_id, now=int(time.time()), rated_impact=args.impact,
+                              disposition=args.disposition, fixed_in=args.commit, note=args.note, by=args.by)
+                except KeyError:
+                    raise CliError(f"no finding {finding_id}") from None
+    finally:
+        conn.close()
+    print(f"triaged {len(args.ids)} finding(s)")
+    return 0
+
+
 def _job_and_agent(job_id):
     cfg = load_config()
     state = paths.state_dir()
@@ -414,6 +482,24 @@ def build_parser():
     p.add_argument("job", type=int)
     p.add_argument("question")
     p.set_defaults(func=cmd_ask)
+
+    p = sub.add_parser("findings", help="list recorded review findings (--json exports them for analysis)")
+    p.add_argument("ref", nargs="?", help="owner/repo#N: only this PR")
+    p.add_argument("--job", type=int, help="only this job")
+    p.add_argument("--kind", action="append", choices=db.FINDING_KINDS)
+    p.add_argument("--untriaged", action="store_true", help="only items with no disposition yet")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_findings)
+
+    p = sub.add_parser("triage", help="record what was done about findings")
+    p.add_argument("ids", type=int, nargs="+", metavar="ID", help="finding ids, as `findings` lists them")
+    p.add_argument("--impact", type=_impact_arg,
+                   help="your rating, 0-10: 0 = matters only for a cosmic-ray bit flip, 10 = the app would not work")
+    p.add_argument("--disposition", choices=db.DISPOSITIONS)
+    p.add_argument("--commit", help="the commit that fixed it")
+    p.add_argument("--note")
+    p.add_argument("--by", default=os.environ.get("USER", ""), help="who triaged (default: $USER)")
+    p.set_defaults(func=cmd_triage)
 
     sub.add_parser("doctor", help="check config, credentials, agents and units").set_defaults(func=cmd_doctor)
     sub.add_parser("codex-login", help="log Codex in for reviews (separate CODEX_HOME)").set_defaults(

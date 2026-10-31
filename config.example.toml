@@ -19,6 +19,8 @@ project_docs = true        # give the agent the base branch's CLAUDE.md/AGENTS.m
 max_changed_files = 300
 max_diff_bytes = 1_500_000
 # diff_exclude = ["**/*.lock", "**/package-lock.json", "**/dist/**"]   # left out of pr.diff
+# test_paths = ["tests/**", "**/test_*", "**/*.test.*"]   # proposed changes here don't count towards the
+#                                                          # lines-removed severity bump (defaults cover common layouts)
 post = true                # false: write reviews to the state dir only
 # extra_instructions = ""
 

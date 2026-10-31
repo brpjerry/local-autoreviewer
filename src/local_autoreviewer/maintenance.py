@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Daily housekeeping: expire job directories and prune mirrors. Touches only the state dir."""
+"""Daily housekeeping: expire job checkouts, record saved reviews, prune mirrors. Touches only the state dir."""
 
+import json
 import logging
 import shutil
 from pathlib import Path
 
-from . import db, pipeline
+from . import db, pipeline, review
 from .pipeline import job_paths
 
 log = logging.getLogger(__name__)
@@ -27,15 +28,18 @@ def housekeeping(svc):
             f"AND status NOT IN ({','.join('?' * len(db.ACTIVE))})", (cutoff, *db.ACTIVE)).fetchall()
         removed = 0
         for row in rows:
+            # The checkout and context go; out/ (the agent's output and the review) is kept for analysis.
             paths = job_paths(svc.state, row["id"])
-            if not Path(paths.root).exists():
+            if not (Path(paths.worktree).exists() or Path(paths.context).exists()):
                 continue
             mirror = svc.git.mirror_path(svc.state, row["repo"])
             if Path(paths.worktree).exists() and mirror.exists():
                 svc.git.remove_worktree(mirror, paths.worktree)
-            shutil.rmtree(paths.root, ignore_errors=True)
+            shutil.rmtree(paths.worktree, ignore_errors=True)
+            shutil.rmtree(paths.context, ignore_errors=True)
             removed += 1
         _remove_stale_locks(conn, svc)
+        recorded = record_saved_reviews(conn, svc)
         mirrors = 0
         for repo in {r["repo"] for r in conn.execute("SELECT DISTINCT repo FROM prs")}:
             mirror = svc.git.mirror_path(svc.state, repo)
@@ -53,7 +57,8 @@ def housekeeping(svc):
             mirrors += 1
         with db.transaction(conn):
             db.kv_set(conn, "last_housekeeping", now)
-        log.info("housekeeping: removed %d expired job dir(s), pruned %d mirror(s)", removed, mirrors)
+        log.info("housekeeping: removed %d expired job checkout(s), recorded %d saved review(s), "
+                 "pruned %d mirror(s)", removed, recorded, mirrors)
     finally:
         conn.close()
 
@@ -70,3 +75,25 @@ def _remove_stale_locks(conn, svc):
         job = db.get_job(conn, job_id)
         if job is not None and job["status"] not in db.ACTIVE:
             pipeline.remove_lock_if_free(svc.state, job_id)
+
+
+def record_saved_reviews(conn, svc):
+    """Record reviews that are on disk but not in the database: ones from before review data was
+    kept, or whose recording failed. Blocked reviews (a possible credential) are never recorded."""
+    rows = conn.execute(
+        f"SELECT id FROM jobs WHERE review_recorded=0 AND status NOT IN ({','.join('?' * len(db.ACTIVE))}, 'blocked')",
+        db.ACTIVE).fetchall()
+    recorded = 0
+    for row in rows:
+        path = Path(job_paths(svc.state, row["id"]).out, "review.json")
+        if not path.is_file():
+            continue
+        try:
+            structured = review.validate(json.loads(path.read_text()))
+        except (OSError, ValueError) as exc:  # ReviewFormatError and JSONDecodeError are ValueErrors
+            log.warning("job %s: cannot record saved review %s: %s", row["id"], path, exc)
+            continue
+        with db.transaction(conn):
+            db.record_review(conn, row["id"], structured)
+        recorded += 1
+    return recorded

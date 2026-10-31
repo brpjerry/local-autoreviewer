@@ -103,10 +103,10 @@ class FakeGitHub:
     def pr_view(self, repo, number):
         return dict(self.prs[(repo, number)])
 
-    def post_review(self, repo, number, commit_sha, body):
+    def post_review(self, repo, number, commit_sha, body, comments=None):
         review_id = next(self.ids)
         self.posted.append({"repo": repo, "number": number, "commit_id": commit_sha, "body": body,
-                            "id": review_id, "user": {"login": self.login}})
+                            "comments": comments or [], "id": review_id, "user": {"login": self.login}})
         return {"id": review_id, "html_url": f"https://github.com/{repo}/pull/{number}#review-{review_id}"}
 
     def find_marked_review(self, repo, number, job_id, login):

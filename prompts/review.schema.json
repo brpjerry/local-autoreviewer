@@ -13,9 +13,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "category", "file", "line", "title", "detail", "suggestion"],
+        "required": ["severity", "impact", "likelihood", "trigger", "category", "file", "line", "title", "detail",
+                     "suggestion", "edits", "readability"],
         "properties": {
           "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+          "impact": {
+            "type": "integer",
+            "description": "0-10: 0 = matters only for something like a cosmic-ray bit flip, 10 = the app would not work at all."
+          },
+          "likelihood": {"type": "string", "enum": ["common", "occasional", "rare"]},
+          "trigger": {"type": "string", "description": "What has to happen for the problem to occur."},
           "category": {
             "type": "string",
             "enum": ["correctness", "security", "performance", "design", "tests", "readability", "docs", "other"]
@@ -24,7 +31,43 @@
           "line": {"type": "integer", "description": "Line in the new version of the file, or 0 if not applicable."},
           "title": {"type": "string", "description": "One-line statement of the problem."},
           "detail": {"type": "string", "description": "Why it is a problem, with the concrete failure scenario."},
-          "suggestion": {"type": "string", "description": "How to fix it, or empty."}
+          "suggestion": {"type": "string", "description": "How to fix it, or empty."},
+          "edits": {
+            "type": "array",
+            "description": "The exact change, as replacements of line ranges in the PR's version of each file. Empty only if it can't be written as edits.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "file",
+                "start_line",
+                "end_line",
+                "replacement"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Repository-relative path."
+                },
+                "start_line": {
+                  "type": "integer",
+                  "description": "First line replaced, in the PR's version of the file."
+                },
+                "end_line": {
+                  "type": "integer",
+                  "description": "Last line replaced (inclusive)."
+                },
+                "replacement": {
+                  "type": "string",
+                  "description": "The complete new text of those lines; empty deletes them."
+                }
+              }
+            }
+          },
+          "readability": {
+            "type": "string", "enum": ["better", "same", "worse"],
+            "description": "Whether the proposed edits make the code better, the same or worse to read."
+          }
         }
       }
     },
@@ -44,11 +87,43 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "line", "text"],
+        "required": ["file", "line", "text", "edits"],
         "properties": {
           "file": {"type": "string"},
           "line": {"type": "integer"},
-          "text": {"type": "string"}
+          "text": {"type": "string"},
+          "edits": {
+            "type": "array",
+            "description": "The exact change, as replacements of line ranges in the PR's version of each file. Empty only if it can't be written as edits.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "file",
+                "start_line",
+                "end_line",
+                "replacement"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "description": "Repository-relative path."
+                },
+                "start_line": {
+                  "type": "integer",
+                  "description": "First line replaced, in the PR's version of the file."
+                },
+                "end_line": {
+                  "type": "integer",
+                  "description": "Last line replaced (inclusive)."
+                },
+                "replacement": {
+                  "type": "string",
+                  "description": "The complete new text of those lines; empty deletes them."
+                }
+              }
+            }
+          }
         }
       }
     }
