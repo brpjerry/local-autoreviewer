@@ -411,9 +411,13 @@ def _run(conn, svc, job, cancel):
 
 
 def _rejected(exc):
-    """True for a definite refusal (HTTP 4xx other than a timeout or rate limit): retrying won't help."""
-    match = re.search(r"\bHTTP (4\d\d)\b", str(exc))
-    return bool(match) and match.group(1) not in ("408", "429")
+    """True for a definite refusal (HTTP 4xx other than a timeout or rate limit): retrying won't help.
+    GitHub reports primary and secondary rate limits as 403 too, so those are recognized by wording."""
+    text = str(exc)
+    match = re.search(r"\bHTTP (4\d\d)\b", text)
+    if not match or match.group(1) in ("408", "429"):
+        return False
+    return not re.search(r"rate limit", text, re.IGNORECASE)
 
 
 def post_failed(conn, svc, job, exc):

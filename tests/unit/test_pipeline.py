@@ -244,6 +244,19 @@ class PipelineTests(EnvTestCase):
         self.assertIn("review saved to", job["reason"])
         self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
 
+    def test_a_rate_limited_post_is_retried(self):
+        for message in ("gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+                        "gh: You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)",
+                        "gh: Too Many Requests (HTTP 429)"):
+            with self.subTest(message=message):
+                svc, (job_id,) = self.queue()
+                self.failing_post(message)
+                self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+                conn = svc.connect()
+                with db.transaction(conn):  # the next subtest queues the same job again
+                    conn.execute("DELETE FROM jobs")
+                conn.close()
+
     def test_post_failures_end_after_max_attempts(self):
         svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 2}))
         self.failing_post("gh api repos/o/r failed: HTTP 502: Bad Gateway")
@@ -806,6 +819,20 @@ class WorkerTests(EnvTestCase):
             finally:
                 worker.stop.set()
                 thread.join(30)
+
+    def test_a_paused_worker_still_finishes_an_interrupted_post(self):
+        cfg = make_config(self.tmp, agents=("claude",), service={"paused": True})
+        svc = self.services(cfg)
+        job_id = self.interrupted_post(svc)
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Reviewed.\n")
+        worker, thread, svc = self.start(cfg)
+        try:
+            self.wait_for(svc, lambda js: [j["status"] for j in js] == ["posted"])
+        finally:
+            worker.stop.set()
+            thread.join(30)
 
     def interrupted_post(self, svc):
         (job_id,) = self.enqueue(svc)
