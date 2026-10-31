@@ -29,10 +29,25 @@ deploy() {
         exit 2
     }
     # The poll unit runs the new code on its next tick; a new migration would stop a busy old worker.
-    git -C "$live" diff --quiet HEAD "$commit" -- src/local_autoreviewer/db.py || wait_idle
+    if ! git -C "$live" diff --quiet HEAD "$commit" -- src/local_autoreviewer/db.py; then
+        hold
+        wait_idle
+    fi
     git -C "$live" checkout --quiet --detach "$commit"
     echo "live-$(git -C "$live" rev-parse --short=12 HEAD)" >"$live/VERSION"
     echo "live: $(git -C "$live" log -1 --format='%h %s')"
+}
+
+hold() {
+    # Keep the worker from starting new reviews until this script exits, so it can go idle even with a
+    # backlog (see worker.held_agents). The hold ends when the lock's file descriptor closes at exit.
+    [ -z "${holding:-}" ] || return 0
+    holding=1
+    mkdir -p "$state/holds"
+    exec 9>"$state/holds/tools-live.lock"
+    flock -n 9 || { echo "tools/live: another tools/live is running" >&2; exit 1; }
+    echo all >&9
+    trap 'rm -f "$state/holds/tools-live.lock"' EXIT
 }
 
 wait_idle() {
@@ -58,6 +73,7 @@ print(conn.execute("SELECT COUNT(*) FROM jobs WHERE source != ? AND (status = ? 
 }
 
 restart() {
+    hold
     wait_idle
     systemctl --user daemon-reload
     systemctl --user restart local-autoreviewer-worker.service
@@ -70,6 +86,7 @@ setup)
         mkdir -p "$(dirname "$live")"
         git -C "$repo" worktree add --quiet --detach "$live" "${2:-main}"
     fi
+    hold
     wait_idle
     deploy "${2:-main}"
     for unit in worker poll; do
@@ -98,6 +115,7 @@ status)
     systemctl --user show local-autoreviewer-worker.service -p ExecStart --value | head -1
     ;;
 teardown)
+    hold
     wait_idle
     rm -f "$units/local-autoreviewer-worker.service.d/live.conf" "$units/local-autoreviewer-poll.service.d/live.conf"
     rmdir "$units/local-autoreviewer-worker.service.d" "$units/local-autoreviewer-poll.service.d" 2>/dev/null || true

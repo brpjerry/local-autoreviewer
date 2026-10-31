@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 
 from . import db, events, leakscan, review, suggestions
 from .agents import make_agent
@@ -481,22 +482,23 @@ def _run(conn, svc, job, cancel):
     unit = scope_unit(job["id"])
     with db.transaction(conn):
         db.update_job(conn, job["id"], session_id=session_id, scope_unit=unit)
-    # Now, not after the run: a deploy may replace the prompts meanwhile.
-    prompt_version = review.prompt_version(followup=bool(previous))
+    prompts = review.snapshot(followup=bool(previous))  # read once: a deploy may replace the prompts meanwhile
+    prompt_version = review.prompt_version(prompts)
     fields = dict(
         repo=job["repo"], number=job["number"], title=pr.get("title", ""),
         author=(pr.get("author") or {}).get("login", ""), base_ref=pr["baseRefName"], head_sha=job["head_sha"],
         worktree=paths.worktree, context=paths.context, agent_note=agent.agent_note(),
         extra_instructions=repo_cfg.extra_instructions,
         project_docs=repo_cfg.project_docs and Path(paths.context, "project-docs").is_dir())
-    schema = None
     if previous:
-        prompt = review.build_followup_prompt(previous_sha=previous.head_sha, previous_count=len(previous.findings),
-                                              **fields)
-        schema = Path(paths.context, "followup.schema.json")
-        schema.write_text(json.dumps(review.followup_schema()))
+        prompt = review.build_followup_prompt(prompts=prompts, previous_sha=previous.head_sha,
+                                              previous_count=len(previous.findings), **fields)
+        schema = Path(paths.context, "followup.schema.json")  # the agent reads its own copy, not the live files
+        schema.write_text(json.dumps(review.followup_schema(prompts)))
     else:
-        prompt = review.build_prompt(**fields)
+        prompt = review.build_prompt(template=Template(prompts["review.md"]), **fields)
+        schema = Path(paths.context, "review.schema.json")
+        schema.write_text(prompts["review.schema.json"])
     invocation = agent.invocation(unit=unit, paths=paths, prompt=prompt, session_id=session_id, schema=schema)
     log.info("job %s: running %s on %s#%s @%s%s", job["id"], job["agent"], job["repo"], job["number"],
              job["head_sha"][:12], f" (follow-up of {previous.head_sha[:12]})" if previous else "")

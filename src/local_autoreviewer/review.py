@@ -34,14 +34,24 @@ def schema_text(path=None):
     return json.dumps(json.loads(Path(path or schema_path()).read_text()), separators=(",", ":"))
 
 
-def prompt_version(followup=False):
+PROMPT_FILES = ("review.md", "review.schema.json")
+
+
+def snapshot(followup=False):
+    """The prompt files, read once for a review: it is hashed, built and handed to the agent from these
+    same texts, so a deploy during the review can't mix two versions."""
+    names = PROMPT_FILES + (("followup.md",) if followup else ())
+    return {name: (paths.prompts_dir() / name).read_text() for name in names}
+
+
+def prompt_version(prompts=None, followup=False):
     """Short hash of the prompt template(s) and schema, recorded with each review."""
+    prompts = prompts or snapshot(followup)
     digest = hashlib.sha256()
-    names = ("review.md", "review.schema.json") + (("followup.md",) if followup else ())
-    for name in names:
-        digest.update((paths.prompts_dir() / name).read_bytes())
-    if followup:
-        digest.update(json.dumps(followup_schema(), sort_keys=True).encode())
+    for name in sorted(prompts):
+        digest.update(prompts[name].encode())
+    if "followup.md" in prompts:  # its schema is built in code, from the review schema
+        digest.update(json.dumps(followup_schema(prompts), sort_keys=True).encode())
     return digest.hexdigest()[:12]
 
 
@@ -51,9 +61,11 @@ STATUS_LABELS = {"fixed": "✅ Fixed", "partly_fixed": "🟡 Partly fixed", "not
                  "obsolete": "➖ No longer applies", "unchecked": "❔ Not checked", None: "❔ Not checked"}
 
 
-def followup_schema():
-    """The follow-up schema, built from the review schema so a finding has one definition."""
-    finding = json.loads(schema_path().read_text())["properties"]["findings"]["items"]
+def followup_schema(prompts=None):
+    """The follow-up schema, built from the review schema (from a snapshot if given) so a finding has one
+    definition."""
+    text = (prompts or {}).get("review.schema.json") or schema_path().read_text()
+    finding = json.loads(text)["properties"]["findings"]["items"]
     return {
         "type": "object", "additionalProperties": False, "required": ["summary", "resolutions", "regressions"],
         "properties": {
@@ -100,12 +112,13 @@ def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, c
         project_docs_note=docs_note, extra_instructions=extra)
 
 
-def build_followup_prompt(*, previous_sha, previous_count, **fields):
+def build_followup_prompt(*, previous_sha, previous_count, prompts=None, **fields):
     """The follow-up prompt. It shares the review prompt's sections on proposed changes and severity, so
     the two can't drift apart."""
-    full = (paths.prompts_dir() / "review.md").read_text()
+    prompts = prompts or snapshot(followup=True)
+    full = prompts["review.md"]
     # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
-    text = Template((paths.prompts_dir() / "followup.md").read_text()).safe_substitute(
+    text = Template(prompts["followup.md"]).safe_substitute(
         proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
         previous_sha=previous_sha, previous_count=previous_count)
     return build_prompt(**fields, template=Template(text))
