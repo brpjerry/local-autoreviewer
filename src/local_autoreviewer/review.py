@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+from pathlib import Path
 from string import Template
 from urllib.parse import quote
 
@@ -29,21 +30,31 @@ def schema_path():
     return paths.prompts_dir() / "review.schema.json"
 
 
-def schema_text():
-    return json.dumps(json.loads(schema_path().read_text()), separators=(",", ":"))
+def schema_text(path=None):
+    return json.dumps(json.loads(Path(path or schema_path()).read_text()), separators=(",", ":"))
 
 
-def prompt_version():
+PROMPT_FILES = ("review.md", "review.schema.json")
+
+
+def snapshot():
+    """The prompt files, read once for a review: it is hashed, built and handed to the agent from these
+    same texts, so a deploy during the review can't mix two versions."""
+    return {name: (paths.prompts_dir() / name).read_text() for name in PROMPT_FILES}
+
+
+def prompt_version(prompts=None):
     """Short hash of the prompt template and schema, recorded with each review."""
+    prompts = prompts or snapshot()
     digest = hashlib.sha256()
-    for path in (paths.prompts_dir() / "review.md", schema_path()):
-        digest.update(path.read_bytes())
+    for name in sorted(prompts):
+        digest.update(prompts[name].encode())
     return digest.hexdigest()[:12]
 
 
 def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, context, agent_note="",
-                 extra_instructions="", project_docs=False):
-    template = Template((paths.prompts_dir() / "review.md").read_text())
+                 extra_instructions="", project_docs=False, template=None):
+    template = template or Template((paths.prompts_dir() / "review.md").read_text())
     docs_note = ""
     if project_docs:
         docs_note = (f"- `{context}/project-docs/`: CLAUDE.md/AGENTS.md from the base branch, if present. "
