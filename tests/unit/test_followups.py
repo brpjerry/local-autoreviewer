@@ -108,6 +108,63 @@ class FollowupTests(EnvTestCase):
         ids = {p["id"] for p in json.loads(self.context(third, "previous-findings.json").read_text())}
         self.assertIn(resolution["finding_id"], ids)
 
+    def set_resolution(self, job_id, status):
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            conn.execute("UPDATE resolutions SET status=? WHERE job_id=?", (status, job_id))
+        conn.close()
+
+    def test_an_unanswered_finding_stays_open(self):
+        self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.set_resolution(second, "unchecked")
+        (resolution,) = self.rows("SELECT finding_id FROM resolutions WHERE job_id=?", second)
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "# tidy\n"}))
+        ids = {p["id"] for p in json.loads(self.context(third, "previous-findings.json").read_text())}
+        self.assertIn(resolution["finding_id"], ids)
+
+    def test_a_declined_finding_is_not_asked_about_again(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id FROM findings WHERE job_id=? AND kind='finding'", first)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            db.triage(conn, finding["id"], now=self.clock(), disposition="declined")
+        conn.close()
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(json.loads(self.context(second, "previous-findings.json").read_text()), [])
+
+    def test_a_retarget_away_and_back_means_a_full_review(self):
+        self.review_at(self.head_a)
+        conn = self.svc.connect()
+        with db.transaction(conn):  # reviewed against another base in between
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head_a, base_ref="release", agent="claude",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock())
+        conn.close()
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
+
+    def test_the_followup_prompt_closes_once(self):
+        self.review_at(self.head_a)
+        self.svc = self.services(make_config(self.tmp, agents=("claude",),
+                                             repo_extra={"extra_instructions": "Prefer the stdlib."}))
+        self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        prompt = self.agent_log("claude")[-1]["prompt"]
+        self.assertEqual(prompt.count("Return your "), 1)
+        self.assertEqual(prompt.count("Prefer the stdlib."), 1)
+
+    def test_findings_export_includes_followup_statuses(self):
+        import contextlib, io, os
+        from unittest import mock
+        from local_autoreviewer import __main__ as cli
+        first, _ = self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"STATE_DIRECTORY": str(self.state)}), contextlib.redirect_stdout(out):
+            cli.main(["findings", "--json", "--job", str(first), "--kind", "finding"])
+        (row,) = json.loads(out.getvalue())
+        self.assertEqual([(r["job_id"], r["status"]) for r in row["resolutions"]], [(second, "fixed")])
+
     def test_a_trial_is_not_a_round(self):
         self.review_at(self.head_a, post=False, source=db.FOREGROUND)
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
@@ -148,8 +205,9 @@ class FollowupFormatTests(unittest.TestCase):
                                {"finding": 1, "status": "not_fixed", "detail": "dup"},
                                {"finding": 9, "status": "fixed", "detail": "unknown"},
                                {"finding": 2, "status": "maybe", "detail": "bad status"}]}
-        self.assertEqual(review.validate_followup(raw, {1, 2})["resolutions"],
-                         [{"finding": 1, "status": "fixed", "detail": "a"}])
+        self.assertEqual(review.validate_followup(raw, {1, 2})["resolutions"],  # 2 had no valid answer
+                         [{"finding": 1, "status": "fixed", "detail": "a"},
+                          {"finding": 2, "status": "unchecked", "detail": ""}])
         with self.assertRaises(review.ReviewFormatError):
             review.validate_followup({"summary": ""}, set())
 
@@ -161,7 +219,8 @@ class FollowupFormatTests(unittest.TestCase):
                                                                           "detail": "closed in a with block"}]}
         body = review.render_followup(data, previous, repo="o/r", number=5, sha="b" * 40, previous_sha="a" * 40,
                                       agent="claude", model="opus", job_id=7)
-        self.assertIn("for the 2 issue(s) raised on [`aaaaaaa`]", body)
+        self.assertIn("for the 2 issue(s) open after [`aaaaaaa`]", body)
+        self.assertIn("https://github.com/o/r/blob/" + "a" * 40 + "/a.py#L3", body)  # where it was raised
         self.assertIn("- ✅ Fixed: Leaks a handle _(Codex, major, [`a.py:3`]", body)
         self.assertIn("— closed in a with block", body)
         self.assertIn("- ❔ Not checked: Typo _(Claude Code, minor)_", body)

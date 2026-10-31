@@ -99,7 +99,7 @@ def record_saved_reviews(conn, svc):
             known = {r[0] for r in conn.execute("SELECT id FROM findings")}
             structured["resolutions"] = [
                 r for r in data.get("resolutions") or [] if isinstance(r, dict)
-                and r.get("status") in review.FOLLOWUP_STATUSES and r.get("finding") in known]
+                and r.get("status") in (*review.FOLLOWUP_STATUSES, "unchecked") and r.get("finding") in known]
         with db.transaction(conn):
             db.record_review(conn, row["id"], structured, followup_of=followup_of)
         recorded += 1

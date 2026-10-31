@@ -40,12 +40,15 @@ def prompt_version(followup=False):
     names = ("review.md", "review.schema.json") + (("followup.md",) if followup else ())
     for name in names:
         digest.update((paths.prompts_dir() / name).read_bytes())
+    if followup:
+        digest.update(json.dumps(followup_schema(), sort_keys=True).encode())
     return digest.hexdigest()[:12]
 
 
 FOLLOWUP_STATUSES = ("fixed", "partly_fixed", "not_fixed", "obsolete")
+OPEN_STATUSES = ("not_fixed", "partly_fixed", "unchecked")  # unchecked: the follow-up gave no status
 STATUS_LABELS = {"fixed": "✅ Fixed", "partly_fixed": "🟡 Partly fixed", "not_fixed": "❌ Not fixed",
-                 "obsolete": "➖ No longer applies", None: "❔ Not checked"}
+                 "obsolete": "➖ No longer applies", "unchecked": "❔ Not checked", None: "❔ Not checked"}
 
 
 def followup_schema():
@@ -75,10 +78,11 @@ def followup_schema():
 
 
 def _section(text, heading):
-    """One '## heading' section of a prompt, up to the next '## ' heading."""
+    """One '## heading' section of a prompt, up to the next '## ' heading or the closing 'Return your ...' line."""
     start = text.index(f"## {heading}\n")
-    end = text.find("\n## ", start + 1)
-    return text[start:end if end != -1 else len(text)].strip() + "\n"
+    ends = [i for i in (text.find("\n## ", start + 1), text.find("\nReturn your ", start + 1)) if i != -1]
+    return text[start:min(ends, default=len(text))].strip() + "\n"
+
 
 def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, context, agent_note="",
                  extra_instructions="", project_docs=False, template=None):
@@ -102,9 +106,9 @@ def build_followup_prompt(*, previous_sha, previous_count, **fields):
     full = (paths.prompts_dir() / "review.md").read_text()
     # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
     text = Template((paths.prompts_dir() / "followup.md").read_text()).safe_substitute(
-        proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"))
-    prompt = build_prompt(**fields, template=Template(text))
-    return Template(prompt).safe_substitute(previous_sha=previous_sha, previous_count=previous_count)
+        proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
+        previous_sha=previous_sha, previous_count=previous_count)
+    return build_prompt(**fields, template=Template(text))
 
 
 def validate_followup(raw, previous_ids):
@@ -119,6 +123,8 @@ def validate_followup(raw, previous_ids):
         finding = _int(item.get("finding"))
         if finding in previous_ids and finding not in resolutions:  # unknown ids and repeats are dropped
             resolutions[finding] = {"finding": finding, "status": item["status"], "detail": str(item.get("detail") or "")}
+    for finding in sorted(set(previous_ids) - resolutions.keys()):  # unanswered: still open next round
+        resolutions[finding] = {"finding": finding, "status": "unchecked", "detail": ""}
     return {**base, "resolutions": list(resolutions.values())}
 
 
@@ -344,7 +350,7 @@ def render_followup(review, previous, *, repo, number, sha, previous_sha, agent,
     commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
     before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
     lines = [f"### Follow-up review · {agent_name}{model_note}", "",
-             f"Checked commit {commit} for the {len(previous)} issue(s) raised on {before}, and for regressions in "
+             f"Checked commit {commit} for the {len(previous)} issue(s) open after {before}, and for regressions in "
              "the changes since. Automated read-only review.", "", clean(review["summary"]), ""]
     status = {r["finding"]: r for r in review["resolutions"]}
     if previous:
@@ -352,7 +358,7 @@ def render_followup(review, previous, *, repo, number, sha, previous_sha, agent,
         for item in previous:
             resolution = status.get(item["id"])
             who = AGENT_NAMES.get(item["agent"], item["agent"])
-            where = _location(repo, sha, item["file"], item["line"])
+            where = _location(repo, item.get("raised_at") or previous_sha, item["file"], item["line"])
             line = (f"- {STATUS_LABELS[resolution['status'] if resolution else None]}: {clean(item['title'], 500)} "
                     f"_({who}, {item['severity']}{', ' + where if where else ''})_")
             if resolution and resolution["detail"]:

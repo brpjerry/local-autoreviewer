@@ -382,7 +382,8 @@ class PreviousRound:
     def for_agent(self):
         """The findings as the follow-up agent sees them (previous-findings.json)."""
         return [{"id": f["id"], "reviewer": f["agent"], "severity": f["severity"], "impact": f["impact"],
-                 "title": f["title"], "file": f["file"], "line": f["line"], "trigger": f["occurs_when"],
+                 "title": f["title"], "file": f["file"], "line": f["line"], "raised_at": f["raised_at"],
+                 "trigger": f["occurs_when"],
                  "detail": f["detail"], "suggestion": f["suggestion"],
                  "proposed_edits": [{k: e[k] for k in ("file", "start_line", "end_line", "replacement")}
                                     for e in json.loads(f["edits"] or "[]")]}
@@ -396,9 +397,14 @@ def previous_round(conn, job):
     scope = (f"repo=? AND number=? AND base_ref=? AND review_recorded=1 AND status IN ('posted', 'skipped')"
              f" AND NOT {db.TRIAL_SQL}")
     args = (job["repo"], job["number"], job["base_ref"])
-    row = conn.execute(f"SELECT head_sha FROM jobs WHERE {scope} AND head_sha!=? ORDER BY finished_at DESC, id DESC"
+    row = conn.execute(f"SELECT id, head_sha FROM jobs WHERE {scope} AND head_sha!=? ORDER BY finished_at DESC, id DESC"
                        " LIMIT 1", (*args, db.FOREGROUND, job["head_sha"])).fetchone()
     if row is None:
+        return None
+    retargeted = conn.execute(  # reviewed against another base since then: that round is stale
+        f"SELECT 1 FROM jobs WHERE repo=? AND number=? AND base_ref!=? AND id>? AND id<? AND NOT {db.TRIAL_SQL} LIMIT 1",
+        (*args, row["id"], job["id"], db.FOREGROUND)).fetchone()
+    if retargeted:
         return None
     ids = set()
     for previous in conn.execute(f"SELECT id, review_kind FROM jobs WHERE {scope} AND head_sha=?",
@@ -407,14 +413,16 @@ def previous_round(conn, job):
             ids.update(r[0] for r in conn.execute(
                 "SELECT id FROM findings WHERE job_id=? AND kind='regression'", (previous["id"],)))
             ids.update(r[0] for r in conn.execute(
-                "SELECT finding_id FROM resolutions WHERE job_id=? AND status IN ('not_fixed', 'partly_fixed')",
-                (previous["id"],)))
+                f"SELECT finding_id FROM resolutions WHERE job_id=? AND status IN ({','.join('?' * len(review.OPEN_STATUSES))})",
+                (previous["id"], *review.OPEN_STATUSES)))
         else:
             ids.update(r[0] for r in conn.execute(
                 "SELECT id FROM findings WHERE job_id=? AND kind='finding'", (previous["id"],)))
     findings = [dict(r) for r in conn.execute(
-        f"SELECT f.*, j.agent FROM findings f JOIN jobs j ON j.id=f.job_id WHERE f.id IN ({','.join('?' * len(ids))})"
-        " ORDER BY f.id", sorted(ids))] if ids else []
+        f"SELECT f.*, j.agent, j.head_sha AS raised_at FROM findings f JOIN jobs j ON j.id=f.job_id"
+        f" WHERE f.id IN ({','.join('?' * len(ids))})"
+        # Triaged as declined, a false positive, a duplicate or deferred: not asked about again.
+        " AND (f.disposition IS NULL OR f.disposition='fixed') ORDER BY f.id", sorted(ids))] if ids else []
     return PreviousRound(row["head_sha"], findings)
 
 
@@ -447,16 +455,19 @@ def _run(conn, svc, job, cancel):
             log.info("job %s: previous head %s is gone from the mirror; doing a full review", job["id"],
                      previous.head_sha[:12])
             previous = None
+        diff_bytes, changed_files = ctx.diff_bytes, ctx.changed_files
         if previous:
-            svc.git.write_followup_context(mirror, previous.head_sha, job["head_sha"], base_sha, paths.context,
-                                           exclude=repo_cfg.diff_exclude, previous=previous.for_agent())
+            since_bytes, since_files = svc.git.write_followup_context(
+                mirror, previous.head_sha, job["head_sha"], base_sha, paths.context, exclude=repo_cfg.diff_exclude,
+                previous=previous.for_agent())
+            diff_bytes, changed_files = max(diff_bytes, since_bytes), max(changed_files, since_files)
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))
     with db.transaction(conn):
         db.update_job(conn, job["id"], base_sha=base_sha, workdir=paths.root)
 
-    if ctx.changed_files > repo_cfg.max_changed_files or ctx.diff_bytes > repo_cfg.max_diff_bytes:
-        reason = (f"PR too large for automated review: {ctx.changed_files} files, {ctx.diff_bytes} diff bytes "
+    if changed_files > repo_cfg.max_changed_files or diff_bytes > repo_cfg.max_diff_bytes:
+        reason = (f"PR too large for automated review: {changed_files} files, {diff_bytes} diff bytes "
                   f"(limits {repo_cfg.max_changed_files} files, {repo_cfg.max_diff_bytes} bytes)")
         if job["post"]:
             body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])

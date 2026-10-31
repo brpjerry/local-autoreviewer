@@ -29,7 +29,7 @@ package() {
   find "$pkgdir/usr/lib/local-autoreviewer" -type f -exec chmod 644 {} +
   install -Dm755 bin/local-autoreviewer "$pkgdir/usr/bin/local-autoreviewer"
   install -Dm644 -t "$pkgdir/usr/share/local-autoreviewer/prompts" \
-    prompts/review.md prompts/review.schema.json
+    prompts/review.md prompts/review.schema.json prompts/followup.md
   # The worker restarts itself, once idle, when this changes after an upgrade.
   printf '%s-%s\n' "$pkgver" "$pkgrel" > "$pkgdir/usr/share/local-autoreviewer/VERSION"
   install -Dm644 -t "$pkgdir/usr/lib/systemd/user" systemd/autoreviewer.slice \

@@ -70,7 +70,9 @@ class CodexAgent:
         for name in ("previous-findings.json", "since-review.diff"):  # a follow-up review's context
             extra = Path(paths.context, name)
             if extra.is_file():
-                parts.append(f"\n## {name}\n\n```\n{extra.read_text(errors='replace')[:INLINE_LIMIT // 4]}\n```\n")
+                text = extra.read_text(errors="replace")
+                cut = "\n(truncated: size limit)" if len(text) > INLINE_LIMIT // 4 else ""
+                parts.append(f"\n## {name}\n\n```\n{text[:INLINE_LIMIT // 4]}\n```{cut}\n")
                 size += len(parts[-1])
         for line in Path(paths.context, "files.txt").read_text().splitlines():
             fields = line.split("\t")

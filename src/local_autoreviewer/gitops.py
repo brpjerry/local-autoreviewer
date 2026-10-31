@@ -199,7 +199,9 @@ class Git:
                          start, head_sha, "--", ".", *excludes], text=False).stdout
         (Path(ctx_dir) / "since-review.diff").write_bytes(diff)
         (Path(ctx_dir) / "previous-findings.json").write_text(json.dumps(previous, indent=2))
-        return len(diff)
+        names = self.run(["-C", str(mirror), "diff", "--no-color", "--name-only", "-z", start, head_sha, "--", ".",
+                          *excludes], text=False).stdout
+        return len(diff), names.count(b"\0")  # for the size limits, like the PR's own diff
 
 
 def strip_agent_files(root):
