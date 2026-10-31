@@ -326,6 +326,22 @@ class PipelineTests(EnvTestCase):
         recover_posts(Worker(lambda cfg: svc, None), svc)
         self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
 
+    def test_review_command_survives_a_job_row_that_never_committed(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
+        real_hold = pipeline.hold_foreground_lock
+
+        def hold_then_fail(state, job_id):  # the lock is taken, then the transaction rolls back
+            real_hold(state, job_id)
+            raise sqlite3.OperationalError("database or disk is full")
+
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "hold_foreground_lock", side_effect=hold_then_fail), \
+                self.assertRaises(sqlite3.OperationalError):
+            cli.cmd_review(args)
+
     def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
         svc, (alive,) = self.foreground()
         conn = svc.connect()
@@ -516,6 +532,21 @@ class WorkerTests(EnvTestCase):
         recover_posts(worker, svc)
         recover_posts(worker, svc)
         self.assertEqual([r["body"] for r in self.github.posted], ["Looks good.\n"])
+
+    def test_post_recovery_backs_off_after_any_error(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        lookups = []
+
+        def broken_lookup(*args):
+            lookups.append(args)
+            raise ValueError("unexpected payload")
+
+        self.github.find_marked_review = broken_lookup
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)
+        self.assertEqual(len(lookups), 1)
 
     def test_post_recovery_backs_off_while_github_fails(self):
         svc = self.services(make_config(self.tmp, agents=("claude",)))

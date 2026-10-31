@@ -59,15 +59,15 @@ class Worker:
                 log.info("job %s requeued after restart", job["id"])
         finally:
             conn.close()
-        self.cleanup(svc, self.release_orphaned_foreground)
+        self.run_guarded(svc, self.release_orphaned_foreground)
         # Interrupted posts are finished from the main loop by recover_posts().
 
     @staticmethod
-    def cleanup(svc, *steps):
+    def run_guarded(svc, *steps):
         for step in steps:
             try:
                 step(svc)
-            except Exception:  # cleanup must never take the worker down
+            except Exception:  # housekeeping must never take the worker down
                 log.exception("%s failed", getattr(step, "__name__", step))
 
     def release_orphaned_foreground(self, svc):
@@ -117,7 +117,12 @@ class Worker:
             if job["source"] == db.FOREGROUND:  # requeued if there was nothing to post: no owner to run it
                 pipeline.abandon(svc, [job_id], "foreground review exited before finishing")
         except Exception:
-            log.exception("job %s: post recovery failed", job_id)
+            log.exception("job %s: post recovery failed; retrying in %d min", job_id, POST_RECOVERY_RETRY // 60)
+            try:
+                with db.transaction(conn):
+                    db.update_job(conn, job_id, not_before=svc.now() + POST_RECOVERY_RETRY)
+            except Exception:
+                log.exception("job %s: cannot schedule the retry", job_id)
         finally:
             conn.close()
 
@@ -156,7 +161,7 @@ class Worker:
             svc = self.make_services(self.watcher.get())
             self.reap()
             self.sync_cancels(svc)
-            self.cleanup(svc, self.release_orphaned_foreground, self.recover_posts)
+            self.run_guarded(svc, self.release_orphaned_foreground, self.recover_posts)
             if self.upgrade_pending():
                 if not self.threads:
                     log.info("package version changed to %s; exiting to restart on new code", paths.read_version())

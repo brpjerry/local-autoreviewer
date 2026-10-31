@@ -109,10 +109,9 @@ def ingest(conn, cfg, event, *, now, token_owner):
                 "SELECT status, rerun FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=?"
                 " AND NOT (source=? AND post=0) ORDER BY rerun DESC LIMIT 1",
                 (repo, event.number, event.head_sha, event.base_ref, agent, db.FOREGROUND)).fetchone()
-            if latest is None or latest["status"] in ("cancelled", "superseded"):
-                rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
-            else:
-                rerun = latest["rerun"]  # already reviewed: the insert below is ignored
+            if latest is not None and latest["status"] not in ("cancelled", "superseded"):
+                continue  # already reviewed, or in flight
+            rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
         job_id = db.insert_job(
             conn, repo=repo, number=event.number, head_sha=event.head_sha, base_ref=event.base_ref,
             agent=agent, model=cfg.agents[agent].model, source=event.source, not_before=not_before,

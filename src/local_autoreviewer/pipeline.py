@@ -4,6 +4,7 @@
 import fcntl
 import json
 import logging
+import math
 import shutil
 import sqlite3
 import threading
@@ -229,7 +230,7 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             wait = max(0, job["not_before"] - svc.now())
             if wait > FOREGROUND_MAX_WAIT:
                 return _finish(conn, svc, job_id, "cancelled",
-                               f"not waiting {-(-wait // 60)} min in the foreground (use `enqueue` to let the "
+                               f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
                                f"worker retry); {job['reason']}")
             notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
             sleep(wait)
@@ -244,8 +245,9 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
 
 
 def abandon(svc, job_ids, reason):
-    """Cancel this process's foreground jobs that are still queued or running (after Ctrl-C or an
-    error). A job caught mid-post is left to the worker's marker-checked recovery."""
+    """Cancel foreground jobs that are still queued or running: this process's own after Ctrl-C or
+    an error, or a dead process's (from the worker). It re-reads each job, so one that has just
+    finished is left alone. A job caught mid-post is left to the worker's marker-checked recovery."""
     if not job_ids:
         return
     conn = svc.connect()
