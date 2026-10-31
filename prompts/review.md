@@ -45,7 +45,7 @@ Rate each finding by what it would realistically cost the people using this proj
   - **major** (5–7): a normal workflow will hit it and get a wrong result;
   - **minor** (0–4): narrow edge cases, rare races, problems that heal themselves, and polish.
 
-A problem needing several unlikely events at once is minor, however bad its result sounds, unless someone could bring those events about on purpose: that makes it a security problem. Report minor findings too; just label them honestly.
+A problem needing several unlikely events at once is minor, however bad its result sounds. Report minor findings too; just label them honestly.
 
 Return your review in the required structured format. `line` refers to the new version of the file; use 0 when a finding isn't tied to a line. If the PR looks good, say so in the summary and leave `findings` empty. Don't invent problems.
 $extra_instructions
