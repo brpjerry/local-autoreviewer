@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import sqlite3
 import unittest
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
@@ -33,6 +34,30 @@ class PollTests(EnvTestCase):
             return [dict(r) for r in conn.execute(sql, where[1:])]
         finally:
             conn.close()
+
+    def test_github_is_called_without_holding_the_write_lock(self):
+        probes = []
+
+        def probe(call):
+            def wrapped(*args, **kwargs):
+                # Fails at once with "database is locked" if the poller holds the write lock.
+                other = sqlite3.connect(self.state / "state.sqlite3", timeout=0, isolation_level=None)
+                try:
+                    other.execute("BEGIN IMMEDIATE")
+                    other.execute("ROLLBACK")
+                finally:
+                    other.close()
+                probes.append(call.__name__)
+                return call(*args, **kwargs)
+            return wrapped
+
+        self.github.set_pr(1, "a" * 40)
+        self.poll()
+        self.github.set_pr(1, "a" * 40, state="CLOSED")  # gone from the open list: poll confirms with pr_view
+        self.github.list_open_prs = probe(self.github.list_open_prs)
+        self.github.pr_view = probe(self.github.pr_view)
+        self.assertEqual(self.poll(), [(1, "closed")])
+        self.assertEqual(probes, ["list_open_prs", "pr_view"])
 
     def test_lifecycle(self):
         self.github.set_pr(1, "a" * 40)
