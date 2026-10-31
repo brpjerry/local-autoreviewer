@@ -77,6 +77,10 @@ class _Runner:
                             returncode = proc.wait()
                         break
             except BaseException:  # Ctrl-C: the agent runs in its own session, so stop it here
+                try:
+                    proc.stdin.close()  # interrupted mid-write, it is still open
+                except OSError:
+                    pass
                 self._stop(inv, proc)
                 try:
                     proc.wait(timeout=10)
