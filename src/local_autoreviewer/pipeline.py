@@ -470,6 +470,8 @@ def _run(conn, svc, job, cancel):
     unit = scope_unit(job["id"])
     with db.transaction(conn):
         db.update_job(conn, job["id"], session_id=session_id, scope_unit=unit)
+    # Now, not after the run: a deploy may replace the prompts meanwhile.
+    prompt_version = review.prompt_version(followup=bool(previous))
     fields = dict(
         repo=job["repo"], number=job["number"], title=pr.get("title", ""),
         author=(pr.get("author") or {}).get("login", ""), base_ref=pr["baseRefName"], head_sha=job["head_sha"],
@@ -526,8 +528,7 @@ def _run(conn, svc, job, cancel):
                                  f"{paths.out}/review.md")
     with db.transaction(conn):  # only reviews that passed the scan reach the database
         db.record_review(conn, job["id"], structured, effort=cfg.agents[job["agent"]].effort,
-                         prompt_version=review.prompt_version(followup=bool(previous)),
-                         followup_of=previous.head_sha if previous else None)
+                         prompt_version=prompt_version, followup_of=previous.head_sha if previous else None)
     if not job["post"]:
         raise Outcome("skipped", f"posting disabled; review saved to {paths.out}/review.md")
     return post(conn, svc, job)

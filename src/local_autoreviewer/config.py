@@ -66,7 +66,7 @@ class RepoConfig:
 @dataclass(frozen=True)
 class ServiceConfig:
     paused: bool = False
-    review_timeout: int = 20 * 60
+    review_timeout: int = 40 * 60
     settle: int = 3 * 60
     max_reviews_per_day: int = 30
     bootstrap: str = "baseline"
@@ -174,7 +174,7 @@ def parse(data, path=None):
     _check_keys(service_table, _SERVICE_KEYS, "service")
     service = ServiceConfig(
         paused=_typed(service_table.get("paused", False), bool, "service.paused"),
-        review_timeout=parse_duration(service_table.get("review_timeout", "20m"), "service.review_timeout"),
+        review_timeout=parse_duration(service_table.get("review_timeout", "40m"), "service.review_timeout"),
         settle=parse_duration(service_table.get("settle", "3m"), "service.settle"),
         max_reviews_per_day=_typed(service_table.get("max_reviews_per_day", 30), int, "service.max_reviews_per_day"),
         bootstrap=service_table.get("bootstrap", "baseline"),
