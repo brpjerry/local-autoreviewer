@@ -51,13 +51,13 @@ class _Runner:
         with open(inv.stdout_path, "wb") as out, open(inv.stderr_path, "wb") as err:
             proc = subprocess.Popen(self._command(inv), cwd=inv.cwd, env=inv.env, stdin=subprocess.PIPE,
                                     stdout=out, stderr=err, start_new_session=True)
-            try:
-                proc.stdin.write(inv.stdin)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
             timed_out = cancelled = False
-            try:
+            try:  # from the first byte of input, so an interrupt at any point stops the agent
+                try:
+                    proc.stdin.write(inv.stdin)
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
                 while True:
                     try:
                         returncode = proc.wait(timeout=self.poll_interval)

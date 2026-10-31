@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -36,6 +37,31 @@ class RunnerTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             with self.assertRaises(ProcessLookupError):  # stopped and reaped, not left running
+                os.kill(pid, 0)
+
+
+    def test_interrupt_while_sending_input_stops_the_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp, "pid")
+            inv = Invocation(  # an agent that never reads its input, so writing more than a pipe holds blocks
+                argv=[sys.executable, "-c", "import os, sys, time\n"
+                      "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)", str(pid_file)],
+                cwd=tmp, env={"PATH": os.environ["PATH"]}, stdin=b"x" * (4 << 20), stdout_path=str(Path(tmp, "out")),
+                stderr_path=str(Path(tmp, "err")), unit="test-unit")
+
+            def interrupt(signum, frame):
+                raise KeyboardInterrupt
+
+            previous = signal.signal(signal.SIGALRM, interrupt)
+            signal.setitimer(signal.ITIMER_REAL, 0.5)
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    DirectRunner().run(inv, timeout=30)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):  # stopped and reaped
                 os.kill(pid, 0)
 
 

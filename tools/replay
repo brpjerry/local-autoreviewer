@@ -10,11 +10,14 @@ runs through the real pipeline against a scratch copy laid out like GitHub, in a
 is never posted. Only the PR's title, description, author and base branch are read from GitHub. --prompts
 names a directory with review.md and review.schema.json (default: this checkout's prompts/).
 
-Codex runs with the reviews' own login (the live CODEX_HOME), so don't replay Codex while the worker is
-running a Codex review.
+Codex runs with the reviews' own login (the live CODEX_HOME), and a plain run includes it when the repo's
+config does. So a replay that includes Codex refuses to start while the service is running a Codex review,
+and holds off the service's Codex reviews until it exits (pass --agent claude to leave them alone).
 """
 
 import argparse
+import atexit
+import fcntl
 import json
 import os
 import signal
@@ -48,6 +51,20 @@ class ReplayGitHub:
 
 
 ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/")}
+
+
+def hold_codex(live_state):
+    """Keep the service from starting a Codex review while this replay may use the shared login (a hold;
+    see worker.held_agents). It lasts until the process exits."""
+    holds = live_state / "holds"
+    holds.mkdir(exist_ok=True)
+    path = holds / f"replay-{os.getpid()}.lock"
+    handle = open(path, "w")
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    handle.write("codex\n")
+    handle.flush()
+    atexit.register(lambda: (path.unlink(missing_ok=True), handle.close()))
+    return handle
 
 
 def git(*args):
@@ -110,6 +127,7 @@ def main():
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
     agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
     if "codex" in agents:  # a shared CODEX_HOME races the service's token refreshes (see above)
+        hold = hold_codex(live_state)  # first, so the worker can't start one after the check below  # noqa: F841
         try:
             live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
             try:
