@@ -170,7 +170,7 @@ To run the service from this repository instead of the installed package, so a c
 
 ```sh
 tools/live setup          # a separate worktree at main, with the user units pointed at it
-tools/live deploy <ref>   # move it to another commit; the worker restarts on it once idle
+tools/live deploy [ref]   # move it to another commit (default: main); the worker restarts on it once idle
 local-autoreviewer-live status   # the CLI from the live worktree
 tools/live teardown       # back to the installed package (install one at least as new first)
 ```
