@@ -3,6 +3,7 @@ import fcntl
 import sqlite3
 import threading
 import unittest
+from unittest import mock
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events
@@ -17,6 +18,48 @@ class DbTests(EnvTestCase):
         conn.close()
         with self.assertRaises(db.SchemaTooNew):
             db.connect(self.state / "s.db")
+
+    def test_connect_closes_its_connection_when_the_schema_is_too_new(self):
+        conn = db.connect(self.state / "s.db")
+        conn.execute(f"PRAGMA user_version={db.SCHEMA_VERSION + 1}")
+        conn.close()
+        opened, real_connect = [], sqlite3.connect
+
+        def connect(*args, **kwargs):
+            opened.append(real_connect(*args, **kwargs))
+            return opened[-1]
+
+        with mock.patch.object(db.sqlite3, "connect", side_effect=connect), self.assertRaises(db.SchemaTooNew):
+            db.connect(self.state / "s.db")
+        with self.assertRaises(sqlite3.ProgrammingError):  # "Cannot operate on a closed database"
+            opened[0].execute("SELECT 1")
+
+    def test_an_existing_database_gains_post_attempts(self):
+        path = self.state / "old.db"
+        old = sqlite3.connect(path, isolation_level=None)
+        for statement in db._statements(db.MIGRATIONS[0]):
+            old.execute(statement)
+        old.execute("PRAGMA user_version=1")
+        old.execute("INSERT INTO jobs (repo, number, head_sha, base_ref, agent, source, status, created_at)"
+                    " VALUES ('o/r', 1, 'abc', 'main', 'claude', 'poll', 'posting', 0)")
+        old.close()
+        conn = db.connect(path)
+        try:
+            self.assertEqual(conn.execute("SELECT post_attempts FROM jobs").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_migrate_does_not_need_the_write_lock_when_current(self):
+        db.connect(self.state / "s.db").close()
+        writer = sqlite3.connect(self.state / "s.db", isolation_level=None)
+        reader = sqlite3.connect(self.state / "s.db", isolation_level=None, timeout=0)
+        writer.execute("BEGIN IMMEDIATE")
+        try:
+            db.migrate(reader)  # raises "database is locked" if it takes the write lock
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+            reader.close()
 
 
 class PollTests(EnvTestCase):
@@ -204,6 +247,32 @@ class PollTests(EnvTestCase):
         self.assertEqual(self.jobs(), [])
 
 
+class HousekeepingTests(EnvTestCase):
+    def test_stale_lock_files_are_removed(self):
+        from local_autoreviewer import maintenance, pipeline
+        svc = self.services()
+        conn = svc.connect()
+        ids = []
+        for status in ("posted", "running"):
+            with db.transaction(conn):
+                job_id = db.insert_job(conn, repo=REPO, number=len(ids) + 1, head_sha="a" * 40, base_ref="main",
+                                       agent="claude", model="", source=db.FOREGROUND, not_before=0,
+                                       now=self.clock())
+                db.update_job(conn, job_id, status=status)
+            ids.append(job_id)
+        conn.close()
+        finished, active = ids
+        pipeline.foreground_lock_path(self.state, finished).parent.mkdir(parents=True)
+        pipeline.foreground_lock_path(self.state, finished).touch()  # left by a killed `review`
+        held = pipeline.hold_foreground_lock(self.state, active)
+        self.addCleanup(held.close)
+        pipeline.foreground_lock_path(self.state, 99).touch()  # a `review` creating job 99 right now
+        maintenance.housekeeping(svc)
+        self.assertFalse(pipeline.foreground_lock_path(self.state, finished).exists())
+        self.assertTrue(pipeline.foreground_lock_path(self.state, active).exists())
+        self.assertTrue(pipeline.foreground_lock_path(self.state, 99).exists())
+
+
 class ManualIngestTests(EnvTestCase):
     def ingest(self, **kw):
         svc = self.services()
@@ -220,6 +289,93 @@ class ManualIngestTests(EnvTestCase):
         self.assertEqual(self.ingest(), [])
         self.assertEqual(self.ingest(force=True), [])  # still in flight: no duplicate
         self.assertEqual(len(self.ingest(agents=("claude",))), 0)
+
+    def foreground_job(self, status, post):
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="claude",
+                                   model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=post)
+            db.update_job(conn, job_id, status=status)
+        conn.close()
+
+    def test_a_no_post_foreground_trial_does_not_count_as_reviewed(self):
+        self.foreground_job("skipped", post=False)
+        self.assertEqual(len(self.ingest(agents=("claude",))), 1)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+
+    def test_a_running_trial_does_not_block_a_forced_review(self):
+        self.foreground_job("running", post=False)
+        self.assertEqual(len(self.ingest(agents=("claude",), force=True)), 1)
+
+    def test_a_posted_foreground_review_counts(self):
+        self.foreground_job("posted", post=True)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+
+    def test_a_running_foreground_review_with_post_blocks_a_duplicate(self):
+        self.foreground_job("running", post=True)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+        self.assertEqual(self.ingest(agents=("claude",), force=True), [])
+
+    def test_a_draft_poll_keeps_reviews_requested_for_that_draft(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            enqueued = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="codex",
+                                     model="", source="manual", not_before=0, now=self.clock())
+        self.assertIsNotNone(enqueued)
+
+        def poll_sees(head, action="synchronize", base="main"):
+            event = events.PrEvent(repo=REPO, number=9, action=action, head_sha=head, base_ref=base,
+                                   is_draft=True, author=OWNER, source="poll")
+            with db.transaction(conn):
+                events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+            return {row["agent"]: (row["status"], row["cancel_requested"])
+                    for row in conn.execute("SELECT * FROM jobs WHERE number=9")}
+
+        try:
+            self.assertEqual(poll_sees("a" * 40), {"claude": ("running", 0), "codex": ("queued", 0)})
+            self.assertEqual(poll_sees("a" * 40, "retargeted", base="release"),
+                             {"claude": ("running", 1), "codex": ("cancelled", 0)})
+        finally:
+            conn.close()
+
+    def test_a_new_head_on_a_draft_stops_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="synchronize", head_sha="b" * 40, base_ref="main",
+                               is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 1))
+
+    def test_converting_to_draft_keeps_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="converted_to_draft", head_sha="a" * 40,
+                               base_ref="main", is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 0))
+
+    def test_closing_a_draft_stops_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="closed", head_sha="a" * 40, base_ref="main",
+                               is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 1))
 
     def test_unconfigured_repo_ignored(self):
         svc = self.services()

@@ -5,7 +5,7 @@ import logging
 import shutil
 from pathlib import Path
 
-from . import db
+from . import db, pipeline
 from .pipeline import job_paths
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ def housekeeping(svc):
                 svc.git.remove_worktree(mirror, paths.worktree)
             shutil.rmtree(paths.root, ignore_errors=True)
             removed += 1
+        _remove_stale_locks(conn, svc)
         mirrors = 0
         for repo in {r["repo"] for r in conn.execute("SELECT DISTINCT repo FROM prs")}:
             mirror = svc.git.mirror_path(svc.state, repo)
@@ -55,3 +56,17 @@ def housekeeping(svc):
         log.info("housekeeping: removed %d expired job dir(s), pruned %d mirror(s)", removed, mirrors)
     finally:
         conn.close()
+
+
+def _remove_stale_locks(conn, svc):
+    """Delete lock files left by a `review` killed after its jobs finished. Only finished jobs': an
+    active job's lock is the worker's business, and a lock with no job row may belong to a `review`
+    that is creating that job right now (it takes the lock before the row commits)."""
+    for path in (Path(svc.state) / "locks").glob("job-*.lock"):
+        try:
+            job_id = int(path.stem.removeprefix("job-"))
+        except ValueError:
+            continue
+        job = db.get_job(conn, job_id)
+        if job is not None and job["status"] not in db.ACTIVE:
+            pipeline.remove_lock_if_free(svc.state, job_id)

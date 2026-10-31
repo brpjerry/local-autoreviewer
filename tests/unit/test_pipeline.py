@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import argparse
+import contextlib
+import io
 import json
+import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
-from local_autoreviewer import db, events, pipeline
+from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
+from local_autoreviewer.github import GitHubError
 from local_autoreviewer.worker import Worker
 
 HOSTILE_FILES = {
@@ -19,6 +27,14 @@ HOSTILE_FILES = {
     ".mcp.json": '{"mcpServers": {"evil": {"command": "nc"}}}\n',
     ".Codex/config.toml": "model = 'evil'\n",
 }
+
+
+def recover_posts(worker, svc):
+    """Run the worker's post recovery and wait for its threads."""
+    worker.recover_posts(svc)
+    for thread, _token, _agent in list(worker.threads.values()):
+        thread.join(10)
+    worker.reap()
 
 
 class PipelineTests(EnvTestCase):
@@ -134,6 +150,779 @@ class PipelineTests(EnvTestCase):
         cfg = make_config(self.tmp, claude="badjson")
         svc, (job_id,) = self.queue(cfg)
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+
+    def foreground(self, cfg=None, agents=("claude",), post=False):
+        """Create jobs the way `review` does: source=foreground, running, lock held."""
+        svc = self.services(cfg)
+        conn = svc.connect()
+        ids = []
+        for agent in agents:
+            with db.transaction(conn):
+                job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main",
+                                       agent=agent, model="opus", source=db.FOREGROUND, not_before=0,
+                                       now=self.clock(), post=post)
+                db.update_job(conn, job_id, status="running", started_at=self.clock())
+                lock = pipeline.hold_foreground_lock(self.state, job_id)
+                self.addCleanup(pipeline.release_foreground_lock, self.state, job_id, lock)
+            ids.append(job_id)
+        conn.close()
+        return svc, ids
+
+    def fail_first_pr_view(self):
+        real_view, calls = self.github.pr_view, []
+
+        def flaky_view(repo, number):
+            calls.append(number)
+            if len(calls) == 1:
+                raise GitHubError("TLS handshake timeout")
+            return real_view(repo, number)
+
+        self.github.pr_view = flaky_view
+
+    def test_foreground_waits_out_a_transient_error(self):
+        svc, (job_id,) = self.foreground()
+        self.fail_first_pr_view()
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "skipped")
+        self.assertEqual(sum(waits), 120)  # in steps, checking for a push or close in between
+        self.assertTrue(all(step <= pipeline.FOREGROUND_CANCEL_POLL for step in waits))
+        self.assertEqual(self.job(svc, job_id)["attempts"], 1)
+
+    def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"))
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
+        self.assertIn("usage limit", self.job(svc, job_id)["reason"])
+
+    def test_foreground_review_of_a_draft_runs(self):
+        self.github.set_pr(1, self.head, draft=True)
+        svc, (job_id,) = self.foreground()
+        self.assertEqual(pipeline.run_foreground(svc, job_id), "skipped")
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_job_cancelled_before_its_turn_never_starts_its_agent(self):
+        svc, (job_id,) = self.foreground()
+        conn = svc.connect()
+        with db.transaction(conn):  # a push while another agent's job of the same `review` ran
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+        conn.close()
+        self.assertEqual(pipeline.run_foreground(svc, job_id), "superseded")
+        self.assertEqual(self.agent_log("claude"), [])
+
+    def test_post_that_reached_github_despite_an_error_is_not_posted_twice(self):
+        svc, (job_id,) = self.queue()
+        real_post = self.github.post_review
+
+        def post_then_time_out(*args):
+            real_post(*args)  # GitHub accepted it, but the response never arrived
+            raise GitHubError("timed out")
+
+        self.github.post_review = post_then_time_out
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.assertEqual(self.job(svc, job_id)["not_before"], self.clock() + pipeline.POST_RECOVERY_RETRY)
+        self.github.post_review = real_post
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "posted")
+        self.assertEqual(len(self.github.posted), 1)
+        self.assertEqual(len(self.agent_log("claude")), 1)  # the agent didn't run again
+
+    def failing_post(self, message):
+        def post_review(*args):
+            raise GitHubError(message)
+        self.github.post_review = post_review
+
+    def test_a_refused_post_fails_at_once_and_keeps_the_review(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r failed: Resource not accessible by personal access token (HTTP 403)")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "failed")
+        job = self.job(svc, job_id)
+        self.assertIn("review saved to", job["reason"])
+        self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
+
+    def test_a_rate_limited_post_is_retried(self):
+        svc, (job_id,) = self.queue()
+        for message in ("gh: API rate limit exceeded for user ID 1. (HTTP 403)",
+                        "gh: You have exceeded a secondary rate limit. Please wait a few minutes (HTTP 403)",
+                        "gh: Too Many Requests (HTTP 429)", "gh: Request Timeout (HTTP 408)"):
+            with self.subTest(message=message):
+                conn = svc.connect()
+                with db.transaction(conn):  # run the same job again from the start
+                    db.update_job(conn, job_id, status="running", post_attempts=0)
+                conn.close()
+                self.failing_post(message)
+                self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+
+    def test_definite_refusals_and_other_errors(self):
+        for message, rejected in (("gh: Bad credentials (HTTP 401)", True), ("gh: Not Found (HTTP 404)", True),
+                                  ("gh: Validation Failed (HTTP 422)", True), ("gh api repos/o/r timed out", False),
+                                  ("gh: Server Error (HTTP 500)", False)):
+            with self.subTest(message=message):
+                self.assertEqual(pipeline._rejected(GitHubError(message)), rejected)
+
+    def test_a_cancel_wins_over_a_failing_lookup(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+
+        def failing_lookup(*args):
+            raise GitHubError("gh api repos/o/r timed out")
+
+        self.github.find_marked_review = failing_lookup
+        conn = svc.connect()
+        with db.transaction(conn):
+            events.stop_jobs(conn, REPO, 1, "cancelled", "PR closed")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+
+    def test_ctrl_c_while_waiting_to_retry_a_post_leaves_it_to_the_worker(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+
+        def interrupted(seconds):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.run_foreground(svc, job_id, sleep=interrupted)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+    def test_taking_a_lock_retries_when_the_file_was_replaced(self):
+        with mock.patch.object(pipeline, "_same_file", side_effect=[False, True]) as same:
+            lock = pipeline.hold_foreground_lock(self.state, 8)
+        lock.close()
+        self.assertEqual(same.call_count, 2)
+
+    def test_review_post_counts_an_unexpected_error_in_its_retry(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+
+        def garbled_listing(*args):
+            raise ValueError("unexpected payload")
+
+        self.github.find_marked_review = garbled_listing
+        status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        job = self.job(svc, job_id)
+        self.assertEqual((status, job["post_attempts"]), ("failed", 3))
+
+    def test_review_post_that_runs_out_of_retries_points_at_the_review(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+        status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        job = self.job(svc, job_id)
+        self.assertEqual(status, "failed")
+        self.assertIn(f"review saved to {pipeline.job_paths(self.state, job_id).out}/review.md", job["reason"])
+
+    def test_a_lock_on_a_deleted_file_is_not_the_lock(self):
+        lock = pipeline.hold_foreground_lock(self.state, 7)
+        try:
+            self.assertTrue(pipeline._same_file(lock, pipeline.foreground_lock_path(self.state, 7)))
+            pipeline.foreground_lock_path(self.state, 7).unlink()
+            self.assertFalse(pipeline._same_file(lock, pipeline.foreground_lock_path(self.state, 7)))
+        finally:
+            lock.close()
+
+    def test_post_failures_end_after_max_attempts(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 2}))
+        self.failing_post("gh api repos/o/r failed: HTTP 502: Bad Gateway")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["post_attempts"]), ("failed", 2))
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_post_attempts_are_counted_apart_from_agent_attempts(self):
+        svc, (job_id,) = self.queue()
+        conn = svc.connect()
+        with db.transaction(conn):  # it needed two agent retries before it got this far
+            db.update_job(conn, job_id, attempts=2)
+        conn.close()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.assertEqual((self.job(svc, job_id)["attempts"], self.job(svc, job_id)["post_attempts"]), (2, 1))
+
+    def test_out_of_post_retries_checks_once_more_whether_it_reached_github(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 1}))
+        real_post = self.github.post_review
+
+        def post_then_time_out(*args):
+            real_post(*args)
+            raise GitHubError("gh api repos/o/r timed out")
+
+        self.github.post_review = post_then_time_out
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        self.assertEqual(len(self.github.posted), 1)
+
+    def test_a_garbled_response_to_the_first_post_does_not_rerun_the_agent(self):
+        svc, (job_id,) = self.queue()
+        self.github.post_review = lambda *args: None  # no JSON object came back
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_post_recovery_honours_a_retarget_during_the_backoff(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        del self.github.post_review
+        self.github.set_pr(1, self.head, base="release")
+        conn = svc.connect()
+        with db.transaction(conn):  # what the poll does on seeing the retarget
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc", agent="claude")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_post_recovery_honours_a_cancel_the_pr_state_cannot_show(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        del self.github.post_review
+        conn = svc.connect()
+        with db.transaction(conn):  # the head moved during the backoff and then came back
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc", agent="claude")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_a_retargeted_pr_is_not_posted_to(self):
+        svc, (job_id,) = self.queue()
+        self.github.set_pr(1, self.head, base="release")  # same head, new base: the review is of another diff
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_review_post_retries_a_failed_post_itself(self):
+        svc, (job_id,) = self.foreground(post=True)
+        real_post, calls = self.github.post_review, []
+
+        def flaky_post(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise GitHubError("gh api repos/o/r timed out")
+            return real_post(*args)
+
+        self.github.post_review = flaky_post
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "posted")
+        self.assertEqual(sum(waits), pipeline.POST_RECOVERY_RETRY)
+        self.assertEqual((len(self.github.posted), len(self.agent_log("claude"))), (1, 1))
+
+    def test_review_post_stops_waiting_when_the_pr_closes(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+            if len(waits) == 3:
+                conn = svc.connect()
+                with db.transaction(conn):  # the poll sees the close
+                    events.stop_jobs(conn, REPO, 1, "cancelled", "PR closed")
+                conn.close()
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "cancelled")
+        self.assertLess(sum(waits), pipeline.POST_RECOVERY_RETRY)
+
+    def test_a_cancelled_review_post_hands_the_head_back_to_the_service(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(post=True)
+        event = events.PrEvent(repo=REPO, number=1, action="synchronize", head_sha=self.head, base_ref="main",
+                               is_draft=False, author=OWNER, source="poll", agents=("claude",))
+        conn = svc.connect()
+        with db.transaction(conn):  # the running `review --post` counts as this head's review
+            events.record(conn, event, self.clock())
+            self.assertEqual(events.ingest(conn, svc.config, event, now=self.clock(), token_owner=OWNER), [])
+        conn.close()
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")  # Ctrl-C
+        conn = svc.connect()
+        jobs = [dict(r) for r in conn.execute("SELECT id, source, status FROM jobs ORDER BY id")]
+        conn.close()
+        self.assertEqual([(j["source"], j["status"]) for j in jobs],
+                         [(db.FOREGROUND, "cancelled"), ("poll", "queued")])
+
+    def seen_by_poller(self, head):
+        conn = self.services().connect()
+        with db.transaction(conn):
+            conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                         " head_changed_at, last_seen_at) VALUES (?, 1, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                         (REPO, head, OWNER))
+        conn.close()
+
+    def add_job(self, svc, head, source, status, post=True):
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref="main", agent="claude",
+                                   model="", source=source, not_before=0, now=self.clock(), post=post,
+                                   rerun=db.next_rerun(conn, REPO, 1, head, "main", "claude"))
+            db.update_job(conn, job_id, status=status)
+        conn.close()
+        return job_id
+
+    def poll_saw(self, svc, head):
+        event = events.PrEvent(repo=REPO, number=1, action="synchronize", head_sha=head, base_ref="main",
+                               is_draft=False, author=OWNER, source="poll")
+        conn = svc.connect()
+        with db.transaction(conn):
+            events.record(conn, event, self.clock())
+        conn.close()
+
+    def poll_jobs(self, svc):
+        conn = svc.connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM jobs WHERE source='poll'").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_no_hand_back_for_a_head_that_was_only_baselined(self):
+        self.seen_by_poller(self.head)  # recorded, but bootstrap = "baseline" produced no event
+        svc, (job_id,) = self.foreground(post=True)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)
+
+    def test_no_hand_back_for_an_agent_the_repo_does_not_use(self):
+        self.seen_by_poller(self.head)
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, agent="codex")  # `review --agent codex`
+        conn.close()
+        self.poll_saw(svc, self.head)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)
+
+    def test_a_usage_limit_cancel_hands_the_head_back(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        self.poll_saw(svc, self.head)
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
+        self.assertEqual(self.poll_jobs(svc), 1)
+
+    def test_overlapping_review_posts_hand_back_once_the_last_one_is_cancelled(self):
+        self.seen_by_poller(self.head)
+        svc = self.services()
+        first = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        self.poll_saw(svc, self.head)  # the poll deferred to the first `review --post`
+        self.clock.advance(5)
+        second = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        pipeline.abandon(svc, [first], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)  # the second one still covers the head
+        pipeline.abandon(svc, [second], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 1)
+
+    def test_cancel_and_hand_back_commit_together(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(post=True)
+        self.poll_saw(svc, self.head)
+        with mock.patch.object(events, "requeue_for_service", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                self.assertRaises(sqlite3.OperationalError):
+            pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.job(svc, job_id)["status"], "running")  # still there for the worker to clean up
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual((self.job(svc, job_id)["status"], self.poll_jobs(svc)), ("cancelled", 1))
+
+    def test_hand_back_leaves_other_jobs_alone(self):
+        self.seen_by_poller(self.head)  # the poller hasn't seen the newer push yet
+        svc, (old,) = self.foreground(post=True)
+        self.poll_saw(svc, self.head)
+        newer = self.add_job(svc, "b" * 40, db.FOREGROUND, "running")  # a `review --post` of the new head
+        pipeline.abandon(svc, [old], "foreground review ended before the job finished")
+        self.assertEqual((self.job(svc, newer)["status"], self.job(svc, newer)["cancel_requested"]), ("running", 0))
+        self.assertEqual(self.poll_jobs(svc), 1)  # the old head was handed back, and nothing else changed
+
+    def test_hand_back_does_not_duplicate_a_service_review(self):
+        self.seen_by_poller(self.head)
+        svc = self.services()
+        self.poll_saw(svc, self.head)  # so only the "covered" check stands in the way
+        for status in ("queued", "posted"):
+            with self.subTest(status=status):
+                service = self.add_job(svc, self.head, "poll", status)
+                cancelled = self.add_job(svc, self.head, db.FOREGROUND, "running")
+                pipeline.abandon(svc, [cancelled], "foreground review ended before the job finished")
+                conn = svc.connect()
+                active = conn.execute("SELECT COUNT(*) FROM jobs WHERE source='poll' AND status IN"
+                                      " ('queued', 'posted') AND id!=?", (service,)).fetchone()[0]
+                conn.close()
+                self.assertEqual(active, 0)
+                conn = svc.connect()
+                with db.transaction(conn):
+                    db.update_job(conn, service, status="superseded")  # out of the next subtest's way
+                conn.close()
+
+    def test_review_command_reports_its_jobs(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        out = io.StringIO()
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), contextlib.redirect_stdout(out):
+            code = cli.cmd_review(argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False))
+        self.assertEqual(code, 0)
+        self.assertIn("job 1 [claude]: skipped — posting disabled", out.getvalue())
+        self.assertIn(f"  review: {pipeline.job_paths(self.state, 1).out}/review.md", out.getvalue())
+
+    def test_long_wait_cancel_keeps_a_status_a_poll_just_set(self):
+        svc, (job_id,) = self.foreground()
+
+        def deferred_then_superseded(svc_, job_id_, token):
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id_, status="queued", not_before=self.clock() + 1800, reason="retry: usage limit")
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")  # a poll, right after
+            conn.close()
+            return "queued"
+
+        with mock.patch.object(pipeline, "run_job", side_effect=deferred_then_superseded):
+            self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "superseded")
+        self.assertEqual(self.job(svc, job_id)["reason"], "superseded by abc")
+
+    def test_worker_never_claims_a_waiting_foreground_job(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.fail_first_pr_view()
+        worker = Worker(lambda cfg: svc, None)
+
+        def sleep(seconds):
+            self.clock.advance(seconds)
+            worker.claim(svc)  # the retry is due: a worker polling now must not take it
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "posted")
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(len(self.agent_log("claude")), 1)
+        self.assertEqual(len(self.github.posted), 1)
+
+    def test_foreground_does_not_revive_a_job_superseded_during_the_wait(self):
+        svc, (job_id,) = self.foreground()
+        self.fail_first_pr_view()
+
+        def sleep(seconds):
+            self.clock.advance(seconds)
+            conn = svc.connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "superseded")
+        self.assertEqual(self.agent_log("claude"), [])
+
+    def test_foreground_honours_a_cancel_request(self):
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="sleep"))
+        with mock.patch.object(pipeline, "FOREGROUND_CANCEL_POLL", 0.05):
+            result = {}
+            thread = threading.Thread(target=lambda: result.setdefault("s", pipeline.run_foreground(svc, job_id)))
+            thread.start()
+            deadline = time.monotonic() + 20
+            while not self.agent_log("claude") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            conn = svc.connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+            thread.join(20)
+        self.assertEqual(result["s"], "superseded")
+
+    def test_abandon_never_touches_a_worker_job(self):
+        svc, (job_id,) = self.queue(post=False)  # e.g. a poll job that reused a rolled-back id
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.job(svc, job_id)["status"], "running")
+
+    def test_abandon_cancels_only_unfinished_jobs(self):
+        svc, (done, left) = self.foreground(agents=("claude", "codex"))
+        pipeline.run_job(svc, done, pipeline.CancelToken())
+        pipeline.abandon(svc, [done, left], "foreground review ended before the job finished")
+        self.assertEqual(self.job(svc, done)["status"], "skipped")
+        self.assertEqual(self.job(svc, left)["status"], "cancelled")
+
+    def test_interrupted_review_command_leaves_nothing_for_the_worker(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=None, post=False)
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        conn = svc.connect()
+        jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual([(j["agent"], j["source"], j["status"]) for j in jobs],
+                         [("claude", db.FOREGROUND, "cancelled"), ("codex", db.FOREGROUND, "cancelled")])
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
+
+    def test_cancel_watcher_survives_a_database_error(self):
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="sleep"))
+        real_connect, failed = svc.connect, []
+
+        def connect():
+            if threading.current_thread().name.startswith("cancel-watch") and not failed:
+                failed.append(True)
+                raise sqlite3.OperationalError("database is locked")
+            return real_connect()
+
+        svc.connect = connect
+        with mock.patch.object(pipeline, "FOREGROUND_CANCEL_POLL", 0.05):
+            result = {}
+            thread = threading.Thread(target=lambda: result.setdefault("s", pipeline.run_foreground(svc, job_id)))
+            thread.start()
+            deadline = time.monotonic() + 20
+            while not (self.agent_log("claude") and failed) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            conn = real_connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+            thread.join(20)
+        self.assertEqual(failed, [True])
+        self.assertEqual(result["s"], "superseded")
+
+    def orphan(self, status, agent="codex"):
+        """A foreground job left behind by a killed `review`: no lock is held."""
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent=agent,
+                                   model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=True)
+            db.update_job(conn, job_id, status=status, started_at=self.clock())
+        conn.close()
+        return svc, job_id
+
+    def test_orphaned_foreground_post_is_recovered(self):
+        svc, job_id = self.orphan("posting")
+        self.github.posted.append({"repo": REPO, "number": 1, "id": 7, "html_url": "https://example/r/7",
+                                   "body": f"... {review.marker(job_id=job_id, sha=self.head, agent='codex')}"})
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["review_url"]), ("posted", "https://example/r/7"))
+
+    def test_live_foreground_post_is_left_to_its_owner(self):
+        svc, (job_id,) = self.foreground(post=True)
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, status="posting")
+        conn.close()
+        worker = Worker(lambda cfg: svc, None)
+        worker.recover_posts(svc)
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(self.job(svc, job_id)["status"], "posting")
+
+    def test_unreadable_lock_does_not_count_as_orphaned(self):
+        with mock.patch.object(pipeline, "open", create=True, side_effect=PermissionError("denied")), \
+                pipeline.orphaned_foreground(self.state, 1) as orphaned:
+            self.assertFalse(orphaned)
+
+    def test_orphaned_queued_foreground_job_is_cancelled(self):
+        svc, job_id = self.orphan("queued")  # its `review` died while waiting to retry
+        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+
+    def test_orphaned_foreground_post_backs_off_while_github_fails(self):
+        svc, job_id = self.orphan("posting")
+
+        def failing_lookup(*args):
+            raise GitHubError("HTTP 503")
+
+        self.github.find_marked_review = failing_lookup
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+    def test_resume_drops_a_stale_cancel_request(self):
+        svc, (job_id,) = self.foreground()
+        seen = []
+
+        def fake_run_job(svc_, job_id_, token):
+            conn = svc.connect()
+            with db.transaction(conn):
+                if not seen:  # a requeue that kept the cancel request of a since-reopened PR
+                    db.update_job(conn, job_id_, status="queued", not_before=self.clock() + 60, cancel_requested=1)
+            seen.append(db.get_job(conn, job_id_)["cancel_requested"])
+            conn.close()
+            return "queued" if len(seen) == 1 else "skipped"
+
+        with mock.patch.object(pipeline, "run_job", side_effect=fake_run_job):
+            status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        self.assertEqual((status, seen), ("skipped", [1, 0]))
+
+    def test_orphaned_foreground_post_backs_off_after_any_error(self):
+        svc, job_id = self.orphan("posting")
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Reviewed.\n")
+
+        def broken_post(*args):
+            raise ValueError("unexpected response")
+
+        self.github.post_review = broken_post
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+    def test_orphaned_post_without_output_hands_the_head_back(self):
+        self.seen_by_poller(self.head)
+        svc, job_id = self.orphan("posting")
+        self.poll_saw(svc, self.head)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual((self.job(svc, job_id)["status"], self.poll_jobs(svc)), ("cancelled", 1))
+
+    def test_orphaned_foreground_post_without_output_is_cancelled(self):
+        svc, job_id = self.orphan("posting")
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+
+    def test_review_command_creates_its_jobs_under_the_poll_lock(self):
+        from local_autoreviewer import __main__ as cli
+        from local_autoreviewer.triggers import poll as poll_mod
+        svc = self.services()
+        started, result = threading.Event(), {}
+        view = self.github.pr_view
+
+        def pr_view(repo, number):
+            started.set()
+            return view(repo, number)
+
+        self.github.pr_view = pr_view
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", return_value="skipped"):
+            with poll_mod.poll_lock(self.state):  # a poll is between its fetch and its apply
+                thread = threading.Thread(target=lambda: result.setdefault("r", cli.cmd_review(args)))
+                thread.start()
+                self.assertFalse(started.wait(0.3))
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["r"], 0)
+
+    def test_review_interrupted_mid_post_says_so_and_releases_its_locks(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=True)
+
+        def interrupted_post(svc_, job_id, **kwargs):
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="posting")
+            conn.close()
+            raise KeyboardInterrupt
+
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=interrupted_post), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        conn = svc.connect()
+        (job,) = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual(job["status"], "posting")  # left for the worker's marker-checked recovery
+        self.assertIn(f"job {job['id']}'s post didn't complete", stderr.getvalue())
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
+
+    def test_review_interrupted_mid_post_is_finished_by_the_worker(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=True)
+
+        def interrupted_post(svc_, job_id, **kwargs):
+            out = Path(pipeline.job_paths(self.state, job_id).out)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "review.md").write_text("Reviewed.\n")  # the review was ready; the post call hung
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="posting")
+            conn.close()
+            raise KeyboardInterrupt
+
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=interrupted_post), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        conn = svc.connect()
+        (job,) = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual(job["status"], "posted")
+        self.assertEqual([r["body"] for r in self.github.posted], ["Reviewed.\n"])
+
+    def test_worker_cleans_up_after_a_killed_review_process(self):
+        svc, job_id = self.orphan("running")
+        pipeline.foreground_lock_path(self.state, job_id).parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(  # stands in for a `review` process holding the job's lock
+            [sys.executable, "-c", "import fcntl, sys, time\n"
+             "handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX)\n"
+             "print('locked', flush=True); time.sleep(60)",
+             str(pipeline.foreground_lock_path(self.state, job_id))], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            worker = Worker(lambda cfg: svc, None)
+            worker.release_orphaned_foreground(svc)
+            self.assertEqual(self.job(svc, job_id)["status"], "running")  # its owner is alive
+            holder.kill()
+            holder.wait(10)
+            worker.release_orphaned_foreground(svc)
+            self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+            self.assertFalse(pipeline.foreground_lock_path(self.state, job_id).exists())
+        finally:
+            holder.kill()
+            holder.wait(10)
+            holder.stdout.close()
+
+    def test_review_command_survives_a_job_row_that_never_committed(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
+        svc.connect().close()  # create the schema now, so the first transaction below is the job's
+        real_transaction, calls = db.transaction, []
+
+        @contextlib.contextmanager
+        def commit_fails_once(conn):  # the job's lock is taken, then its COMMIT fails
+            if calls:
+                with real_transaction(conn):
+                    yield conn
+                return
+            calls.append(True)
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("ROLLBACK")
+            raise sqlite3.OperationalError("database or disk is full")
+
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(db, "transaction", commit_fails_once), \
+                self.assertRaises(sqlite3.OperationalError):
+            cli.cmd_review(args)
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
+
+    def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
+        svc, (alive,) = self.foreground()
+        conn = svc.connect()
+        with db.transaction(conn):  # a `review` that was killed: its lock is gone
+            dead = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="codex",
+                                 model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=False)
+            db.update_job(conn, dead, status="running", started_at=self.clock())
+        conn.close()
+        worker = Worker(lambda cfg: svc, None)
+        worker.recover(svc)
+        worker.claim(svc)
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(self.job(svc, alive)["status"], "running")
+        self.assertEqual(self.job(svc, dead)["status"], "cancelled")
 
     def test_timeout_kills_agent(self):
         cfg = make_config(self.tmp, claude="sleep", service={"review_timeout": "1s"})
@@ -275,11 +1064,99 @@ class WorkerTests(EnvTestCase):
         self.github.post_review(REPO, 2, self.head, f"body\n<!-- local-autoreviewer job={job_id} sha={self.head} agent=claude -->")
         worker = Worker(lambda c: svc, ConfigWatcher(self.config_file, None), tick=0.05)
         worker.recover(svc)
+        recover_posts(worker, svc)
         conn = svc.connect()
         job = dict(db.get_job(conn, job_id))
         conn.close()
         self.assertEqual(job["status"], "posted")
         self.assertEqual(len(self.github.posted), 1)
+
+    def test_a_failing_cleanup_step_does_not_stop_the_worker(self):
+        with mock.patch.object(Worker, "release_orphaned_foreground", side_effect=RuntimeError("boom")):
+            worker, thread, svc = self.start(make_config(self.tmp, agents=("claude",)))
+            try:
+                self.enqueue(svc)
+                self.wait_for(svc, lambda js: js and all(j["status"] == "posted" for j in js))
+            finally:
+                worker.stop.set()
+                thread.join(30)
+
+    def test_a_paused_worker_still_finishes_an_interrupted_post(self):
+        cfg = make_config(self.tmp, agents=("claude",), service={"paused": True})
+        svc = self.services(cfg)
+        job_id = self.interrupted_post(svc)
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Reviewed.\n")
+        worker, thread, svc = self.start(cfg)
+        try:
+            self.wait_for(svc, lambda js: [j["status"] for j in js] == ["posted"])
+        finally:
+            worker.stop.set()
+            thread.join(30)
+
+    def interrupted_post(self, svc):
+        (job_id,) = self.enqueue(svc)
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, status="posting")
+        conn.close()
+        return job_id
+
+    def test_interrupted_post_with_saved_output_is_posted_once(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Looks good.\n")
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)
+        self.assertEqual([r["body"] for r in self.github.posted], ["Looks good.\n"])
+
+    def test_post_recovery_backs_off_after_any_error(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        lookups = []
+
+        def broken_lookup(*args):
+            lookups.append(args)
+            raise ValueError("unexpected payload")
+
+        self.github.find_marked_review = broken_lookup
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)
+        self.assertEqual(len(lookups), 1)
+
+    def test_post_recovery_backs_off_while_github_fails(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        lookups = []
+
+        def failing_lookup(*args):
+            lookups.append(args)
+            raise GitHubError("HTTP 503")
+
+        self.github.find_marked_review = failing_lookup
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)  # not due yet: no second lookup
+        conn = svc.connect()
+        job = dict(db.get_job(conn, job_id))
+        conn.close()
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+        # Once the retry is due and GitHub answers again, the post is confirmed.
+        del self.github.find_marked_review
+        body = f"body\n{review.marker(job_id=job_id, sha=self.head, agent='claude')}"
+        self.github.post_review(REPO, 2, self.head, body)
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(worker, svc)
+        conn = svc.connect()
+        self.assertEqual(db.get_job(conn, job_id)["status"], "posted")
+        conn.close()
 
 
 if __name__ == "__main__":

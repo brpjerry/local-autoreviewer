@@ -9,6 +9,8 @@ from pathlib import Path
 ACTIVE = ("queued", "running", "posting")
 FINAL = ("posted", "failed", "superseded", "cancelled", "skipped", "blocked")
 STATUSES = ACTIVE + FINAL
+# Job sources: "poll" and "webhook" (a trigger), "manual" (`enqueue`, run by the worker), and FOREGROUND.
+FOREGROUND = "foreground"  # job source for `review`, which runs its jobs itself, never the worker
 
 MIGRATIONS = [
     # 1: initial schema. Times are integer Unix seconds (UTC).
@@ -39,6 +41,8 @@ MIGRATIONS = [
     CREATE INDEX jobs_pr ON jobs (repo, number, agent);
     CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """,
+    # 2: failed posts are retried without running the agent again; count them apart from `attempts`.
+    "ALTER TABLE jobs ADD COLUMN post_attempts INTEGER NOT NULL DEFAULT 0;",
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -65,11 +69,18 @@ def connect(path):
             if attempt == 49:
                 raise
             time.sleep(0.1)
-    migrate(conn)
+    try:
+        migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
 def migrate(conn):
+    # Fast path without the write lock: every connection checks, and most find nothing to do.
+    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+        return
     while True:
         # Read the version under the write lock, so concurrent openers migrate once.
         with transaction(conn):
@@ -121,6 +132,14 @@ def update_job(conn, job_id, **fields):
         raise ValueError(f"unknown job status {fields['status']!r}")
     columns = ", ".join(f"{name}=?" for name in fields)
     conn.execute(f"UPDATE jobs SET {columns} WHERE id=?", (*fields.values(), job_id))
+
+
+def is_trial(job):
+    """A no-post `review` run in the foreground: it neither counts as a review nor blocks one."""
+    return job["source"] == FOREGROUND and not job["post"]
+
+
+TRIAL_SQL = "(source=? AND post=0)"  # is_trial() as a WHERE condition; bind FOREGROUND
 
 
 def active_jobs(conn, repo, number, agent=None):

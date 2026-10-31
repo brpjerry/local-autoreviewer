@@ -123,36 +123,55 @@ def cmd_review(args):
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
     svc = build_services(cfg)
-    pr = svc.github.pr_view(repo_cfg.name, number)
     agents = args.agent or list(repo_cfg.agents)
-    conn = svc.connect()
-    job_ids = []
-    try:
-        for agent in agents:
-            with db.transaction(conn):
-                rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"], agent)
-                job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
-                                       base_ref=pr["baseRefName"], agent=agent, model=cfg.agents[agent].model,
-                                       source="manual", not_before=svc.now(), now=svc.now(),
-                                       post=args.post, rerun=rerun)
-                db.update_job(conn, job_id, status="running", started_at=svc.now())
-            job_ids.append(job_id)
-    finally:
-        conn.close()
+    locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
+    owned = []  # job ids whose rows committed (a rolled-back id may be reused by another process)
     worst = 0
-    for job_id in job_ids:
-        status = pipeline.run_job(svc, job_id, pipeline.CancelToken())
-        conn = svc.connect()
-        job = db.get_job(conn, job_id)
-        conn.close()
-        out = Path(pipeline.job_paths(svc.state, job_id).out, "review.md")
-        print(f"job {job_id} [{job['agent']}]: {status} — {job['reason']}")
-        if job["review_url"]:
-            print(f"  posted: {job['review_url']}")
-        elif out.is_file():
-            print(f"  review: {out}")
-        if status not in ("posted", "skipped"):
-            worst = 1
+    try:
+        # Like enqueue, read the head and create the jobs under the poll lock, so a poll applying
+        # an older snapshot can't supersede them.
+        with poll_mod.poll_lock(svc.state):
+            pr = svc.github.pr_view(repo_cfg.name, number)
+            conn = svc.connect()
+            try:
+                for agent in agents:
+                    with db.transaction(conn):
+                        rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"],
+                                              agent)
+                        job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
+                                               base_ref=pr["baseRefName"], agent=agent,
+                                               model=cfg.agents[agent].model, source=db.FOREGROUND,
+                                               not_before=svc.now(), now=svc.now(), post=args.post, rerun=rerun)
+                        db.update_job(conn, job_id, status="running", started_at=svc.now())
+                        locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
+                    owned.append(job_id)
+            finally:
+                conn.close()
+        for job_id in owned:
+            status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
+            conn = svc.connect()
+            job = db.get_job(conn, job_id)
+            conn.close()
+            out = Path(pipeline.job_paths(svc.state, job_id).out, "review.md")
+            print(f"job {job_id} [{job['agent']}]: {status} — {job['reason']}")
+            if job["review_url"]:
+                print(f"  posted: {job['review_url']}")
+            elif out.is_file():
+                print(f"  review: {out}")
+            if status not in ("posted", "skipped"):
+                worst = 1
+    finally:
+        # Never leave this command's jobs for the worker, even after Ctrl-C or an error.
+        pipeline.abandon(svc, owned, "foreground review ended before the job finished")
+        if owned:
+            conn = svc.connect()
+            mid_post = [job_id for job_id in owned if db.get_job(conn, job_id)["status"] == "posting"]
+            conn.close()
+            for job_id in mid_post:
+                print(f"job {job_id}'s post didn't complete; the worker, when it runs, will check whether it "
+                      "reached GitHub and finish posting it if not", file=sys.stderr)
+        for job_id, handle in locks.items():
+            pipeline.release_foreground_lock(svc.state, job_id, handle)
     return worst
 
 

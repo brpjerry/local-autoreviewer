@@ -8,10 +8,8 @@ import signal
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from . import db, paths, pipeline
-from .github import GitHubError
 
 log = logging.getLogger(__name__)
 TICK = 2.0
@@ -47,39 +45,80 @@ class Worker:
     def recover(self, svc):
         conn = svc.connect()
         try:
-            for job in conn.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
+            # Foreground jobs belong to their `review` process; see release_orphaned_foreground().
+            for job in conn.execute("SELECT * FROM jobs WHERE status='running' AND source!=?",
+                                    (db.FOREGROUND,)).fetchall():
                 if job["scope_unit"]:
                     svc.runner.cleanup(job["scope_unit"])
                 with db.transaction(conn):
                     db.update_job(conn, job["id"], status="queued", reason="requeued after worker restart",
                                   cancel_requested=0, not_before=svc.now())
                 log.info("job %s requeued after restart", job["id"])
-            for job in conn.execute("SELECT * FROM jobs WHERE status='posting'").fetchall():
-                self.recover_posting(svc, conn, job)
+        finally:
+            conn.close()
+        self.run_guarded(svc, self.release_orphaned_foreground)
+        # Interrupted posts are finished from the main loop by recover_posts().
+
+    @staticmethod
+    def run_guarded(svc, *steps):
+        for step in steps:
+            try:
+                step(svc)
+            except Exception:  # housekeeping must never take the worker down
+                log.exception("%s failed", getattr(step, "__name__", step))
+
+    def release_orphaned_foreground(self, svc):
+        """Clean up after `review` commands that died without finishing their jobs: a queued or
+        running job whose lock nobody holds is cancelled and its scope stopped. One caught
+        mid-post is finished by recover_posts()."""
+        conn = svc.connect()
+        try:
+            ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM jobs WHERE source=? AND status IN ('queued','running')", (db.FOREGROUND,))]
+            for job_id in ids:
+                with pipeline.orphaned_foreground(svc.state, job_id) as orphaned:
+                    if not orphaned:
+                        continue
+                    # abandon() re-reads the job under the lock: the owner may have just finished it.
+                    pipeline.abandon(svc, [job_id], "foreground review exited before finishing")
         finally:
             conn.close()
 
-    def recover_posting(self, svc, conn, job):
-        """A crash between posting and recording: look for our marker before posting again."""
+    def recover_posts(self, svc):
+        """Finish posts that failed and are due for a retry, or were interrupted by a crash (the
+        worker's own, or a dead `review`'s). Each runs in a thread like a job, so a slow GitHub can't
+        stall the loop, and occupies its agent's slot."""
+        conn = svc.connect()
         try:
-            existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
-            if existing:
-                with db.transaction(conn):
-                    db.update_job(conn, job["id"], status="posted", reason="review found after restart",
-                                  review_id=existing.get("id"), review_url=existing.get("html_url"),
-                                  posted_at=svc.now(), finished_at=svc.now())
-                return
-            if Path(pipeline.job_paths(svc.state, job["id"]).out, "review.md").is_file():
-                try:
-                    pipeline.post(conn, svc, job)
-                except pipeline.Outcome as outcome:
-                    pipeline._finish(conn, svc, job["id"], outcome.status, outcome.reason)
-                return
-        except GitHubError as exc:
-            log.warning("job %s: cannot verify posting yet (%s); will retry", job["id"], exc)
-            return
-        with db.transaction(conn):
-            db.update_job(conn, job["id"], status="queued", reason="requeued: review output missing")
+            rows = conn.execute("SELECT id, source, agent FROM jobs WHERE status='posting' AND not_before<=?",
+                                (svc.now(),)).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            if row["id"] in self.threads:
+                continue  # one of our job threads is posting it right now
+            if row["source"] == db.FOREGROUND:
+                with pipeline.orphaned_foreground(svc.state, row["id"]) as orphaned:
+                    if not orphaned:
+                        continue  # its `review` is still posting it
+            thread = threading.Thread(target=self._recover_post, args=(svc, row["id"]), name=f"recover-{row['id']}")
+            self.threads[row["id"]] = (thread, pipeline.CancelToken(), row["agent"])
+            thread.start()
+
+    def _recover_post(self, svc, job_id):
+        conn = svc.connect()
+        try:
+            job = db.get_job(conn, job_id)
+            if job["status"] == "posting":
+                pipeline.recover_post(conn, svc, job)
+        except Exception as exc:
+            log.exception("job %s: post recovery failed", job_id)
+            try:  # counts as a failed attempt, so a persistent error ends the job eventually
+                pipeline.fail_post_attempt(conn, svc, job_id, exc)
+            except Exception:
+                log.exception("job %s: cannot schedule the retry", job_id)
+        finally:
+            conn.close()
 
     # Main loop ------------------------------------------------------------------
 
@@ -91,6 +130,7 @@ class Worker:
             svc = self.make_services(self.watcher.get())
             self.reap()
             self.sync_cancels(svc)
+            self.run_guarded(svc, self.release_orphaned_foreground, self.recover_posts)
             if self.upgrade_pending():
                 if not self.threads:
                     log.info("package version changed to %s; exiting to restart on new code", paths.read_version())
@@ -146,8 +186,8 @@ class Worker:
                             self.cap_logged.add((agent, day))
                         continue
                     job = conn.execute(
-                        "SELECT * FROM jobs WHERE status='queued' AND agent=? AND not_before<=? "
-                        "ORDER BY not_before, id LIMIT 1", (agent, now)).fetchone()
+                        "SELECT * FROM jobs WHERE status='queued' AND agent=? AND not_before<=? AND source!=? "
+                        "ORDER BY not_before, id LIMIT 1", (agent, now, db.FOREGROUND)).fetchone()
                     if job is None:
                         continue
                     db.update_job(conn, job["id"], status="running", started_at=now, cancel_requested=0)
@@ -171,8 +211,12 @@ class Worker:
         log.info("stopping %d running job(s); they will be requeued", len(self.threads))
         for _thread, token, _agent in self.threads.values():
             token.cancel("shutdown")
+        # One deadline for all threads, inside TimeoutStopSec. Best effort: a post recovery can make
+        # several gh calls of up to 120 s each, but being killed mid-post is safe, because the next
+        # recovery checks for the review's marker.
+        deadline = time.monotonic() + 130
         for job_id, (thread, _token, _agent) in list(self.threads.items()):
-            thread.join(timeout=90)
+            thread.join(timeout=max(0, deadline - time.monotonic()))
             if thread.is_alive():
                 log.warning("job %s did not stop in time", job_id)
 

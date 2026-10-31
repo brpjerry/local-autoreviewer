@@ -57,6 +57,44 @@ def stop_jobs(conn, repo, number, status, reason, *, agent=None, keep=None):
     return stopped
 
 
+def requeue_for_service(conn, cfg, job, *, now, token_owner):
+    """Queue the review the poller would have queued for a cancelled `review --post` job's head:
+    while that job was active it counted as the head's review, so a poll that saw the head skipped
+    it. Only when a poll has recorded a review event for the head (a baselined PR has none), only
+    under the poller's rules, and only if no other job already covers the head: another active
+    `review --post` takes over the obligation, and is handed back in turn if it is cancelled too.
+    Nothing else is superseded. Returns the new job id or None."""
+    repo_cfg = cfg.repo(job["repo"])
+    row = conn.execute("SELECT * FROM prs WHERE repo=? AND number=? AND state='open'",
+                       (job["repo"], job["number"])).fetchone()
+    if (repo_cfg is None or job["agent"] not in repo_cfg.agents or row is None or row["is_draft"]
+            or (row["head_sha"], row["base_ref"]) != (job["head_sha"], job["base_ref"])
+            or not author_allowed(repo_cfg, row["author"], token_owner)):
+        return None
+    covered = conn.execute(
+        "SELECT 1 FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=? AND id!=?"
+        f" AND NOT {db.TRIAL_SQL} AND status NOT IN ('cancelled', 'superseded')",
+        (job["repo"], job["number"], job["head_sha"], job["base_ref"], job["agent"], job["id"],
+         db.FOREGROUND)).fetchone()
+    if covered:
+        return None
+    skipped_by_poll = conn.execute(
+        f"SELECT 1 FROM events WHERE source='poll' AND repo=? AND number=? AND head_sha=?"
+        f" AND action IN ({','.join('?' * len(REVIEW_ACTIONS))})",
+        (job["repo"], job["number"], job["head_sha"], *REVIEW_ACTIONS)).fetchone()
+    if not skipped_by_poll:
+        return None  # the poll that sees this head next will review it, or it was only baselined
+    job_id = db.insert_job(
+        conn, repo=job["repo"], number=job["number"], head_sha=job["head_sha"], base_ref=job["base_ref"],
+        agent=job["agent"], model=cfg.agents[job["agent"]].model, source="poll",
+        not_before=max(now, row["head_changed_at"] + cfg.service.settle), now=now, post=repo_cfg.post,
+        rerun=db.next_rerun(conn, job["repo"], job["number"], job["head_sha"], job["base_ref"], job["agent"]))
+    if job_id:
+        log.info("queued job %s: %s#%s @%s %s (in place of cancelled job %s)", job_id, job["repo"], job["number"],
+                 job["head_sha"][:12], job["agent"], job["id"])
+    return job_id
+
+
 def ingest(conn, cfg, event, *, now, token_owner):
     """Apply policy to one event inside the caller's transaction. Returns new job ids."""
     repo_cfg = cfg.repo(event.repo)
@@ -67,7 +105,13 @@ def ingest(conn, cfg, event, *, now, token_owner):
 
     if event.action in STOP_ACTIONS or (event.is_draft and event.source != "manual"):
         reason = "PR closed" if event.action == "closed" else "PR is a draft"
-        stopped = stop_jobs(conn, repo, event.number, "cancelled", reason)
+
+        def requested_for_this_target(job):
+            # `enqueue` and `review` may review a draft on purpose; a close, a new head or a new base stops them.
+            return (event.action != "closed" and job["source"] in ("manual", db.FOREGROUND)
+                    and job["head_sha"] == event.head_sha and job["base_ref"] == event.base_ref)
+
+        stopped = stop_jobs(conn, repo, event.number, "cancelled", reason, keep=requested_for_this_target)
         if stopped:
             log.info("%s#%s %s: cancelled jobs %s", repo, event.number, event.action, stopped)
         return []
@@ -91,17 +135,21 @@ def ingest(conn, cfg, event, *, now, token_owner):
             log.info("%s#%s %s: superseded jobs %s", repo, event.number, agent, superseded)
         rerun = 0
         if event.force:
-            if any(same_target(job) for job in db.active_jobs(conn, repo, event.number, agent)):
+            if any(same_target(job) and not db.is_trial(job)
+                   for job in db.active_jobs(conn, repo, event.number, agent)):
                 continue  # already in flight for this exact head
             rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
         else:
             # Dedupe on the head, but a head whose review was cancelled or superseded
             # (closed then reopened, or force-pushed back) gets reviewed again.
+            # A no-post `review` trial doesn't count; a foreground `review --post` does.
             latest = conn.execute(
                 "SELECT status, rerun FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=?"
-                " ORDER BY rerun DESC LIMIT 1", (repo, event.number, event.head_sha, event.base_ref, agent)).fetchone()
-            if latest is not None and latest["status"] in ("cancelled", "superseded"):
-                rerun = latest["rerun"] + 1
+                f" AND NOT {db.TRIAL_SQL} ORDER BY rerun DESC LIMIT 1",
+                (repo, event.number, event.head_sha, event.base_ref, agent, db.FOREGROUND)).fetchone()
+            if latest is not None and latest["status"] not in ("cancelled", "superseded"):
+                continue  # already reviewed, or in flight
+            rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
         job_id = db.insert_job(
             conn, repo=repo, number=event.number, head_sha=event.head_sha, base_ref=event.base_ref,
             agent=agent, model=cfg.agents[agent].model, source=event.source, not_before=not_before,

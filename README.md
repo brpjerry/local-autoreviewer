@@ -80,13 +80,14 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | --- | --- |
 | `local-autoreviewer status` | Recent jobs, their state and review links (`--json` for scripts) |
 | `local-autoreviewer enqueue owner/repo#N [--agent codex] [--force]` | Queue a review; with `--force`, review the same commit again |
-| `local-autoreviewer review owner/repo#N [--post]` | Review now, in the foreground |
+| `local-autoreviewer review owner/repo#N [--post]` | Review now, in the foreground (see below) |
 | `local-autoreviewer resume <job>` | Continue the review's agent session interactively, in its checkout |
 | `local-autoreviewer ask <job> "why is X a problem?"` | Send one follow-up question to the review session |
 | `local-autoreviewer poll --dry-run` | Show which events the next poll would produce |
 | `journalctl --user -u local-autoreviewer-worker -f` | Watch the worker |
 
-- **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish.
+- **Foreground reviews.** `review` waits out retries of up to 5 minutes and cancels a job that would wait longer, such as one hitting a usage limit. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit. With `--post`, a post interrupted by Ctrl-C is finished by the worker, and a run cancelled before its review is ready lets the service review that commit as it otherwise would have.
+- **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish, including posts that were interrupted or failed.
 - **Daily cap.** `max_reviews_per_day` limits reviews per agent, which protects your interactive budget. Usage-limit errors defer the job for 30 minutes without using up a retry.
 - **Resuming.** `resume` opens a normal interactive session with your full config. Run it in any terminal or multiplexer pane. Changes made there land in the review checkout, not your own clone.
 - **Retention.** Job checkouts are kept for `retain_jobs` (14 days by default). After that, `resume` recreates the checkout as long as the commit can still be fetched.
@@ -134,6 +135,8 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.local/state/local-autoreviewer/mirrors/` | One bare mirror per repo |
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |
+
+Run one worker per state directory. A second worker sharing it could, for example, finish the same interrupted post twice.
 
 ## Development
 
