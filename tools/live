@@ -52,7 +52,7 @@ hold() {
 }
 
 wait_idle() {
-    # Without the app's code, so it never migrates the database under an older worker; it writes nothing.
+    # Without the app's code, so it never migrates the database under an older worker; it changes no rows.
     [ -f "$state/state.sqlite3" ] || return 0
     local busy announced=
     for _ in $(seq 1 180); do

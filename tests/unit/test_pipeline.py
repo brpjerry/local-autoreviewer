@@ -1098,18 +1098,29 @@ class WorkerTests(EnvTestCase):
         self.enqueue(svc)
         worker = Worker(lambda c: svc, None)
         holds, connect = [], svc.connect
+        test = self
 
-        def connect_then_hold():  # tools/live takes its hold just after the worker starts claiming
-            conn = connect()
-            holds.append(self.hold("tools-live", "all"))
-            return conn
-        svc.connect = connect_then_hold
+        class HoldOnBegin:  # tools/live takes its hold just as the claim's transaction begins
+            def __init__(self, conn):
+                self.conn = conn
+
+            def execute(self, sql, *args):
+                result = self.conn.execute(sql, *args)
+                if sql == "BEGIN IMMEDIATE" and not holds:
+                    holds.append(test.hold("tools-live", "all"))
+                return result
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+        svc.connect = lambda: HoldOnBegin(connect())
         worker.claim(svc)
         svc.connect = connect
         self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
         holds[0].close()
         self.assertEqual(worker.threads, {})
-        self.assertEqual([j["status"] for j in self.wait_for(svc, lambda js: True)], ["queued"])
+        conn = connect()
+        self.addCleanup(conn.close)
+        self.assertEqual([r["status"] for r in conn.execute("SELECT status FROM jobs")], ["queued"])
 
     def test_worker_reviews_with_both_agents(self):
         worker, thread, svc = self.start(self.cfg)

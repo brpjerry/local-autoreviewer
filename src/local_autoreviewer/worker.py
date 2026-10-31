@@ -24,9 +24,11 @@ def held_agents(state):
     Codex); its content names the agents, or is "all" (also if empty). A file whose owner has exited is
     no longer locked and doesn't count. Owners remove their own files.
 
-    The worker checks holds inside the write transaction that claims a job, and an owner waiting for
-    the worker to go idle counts running jobs inside a write transaction of its own, after taking the
-    hold. So a claim either sees the hold or is counted."""
+    The worker checks holds inside the write transaction that claims a queued review, and an owner
+    waiting for the worker to go idle counts running jobs inside a write transaction of its own, after
+    taking the hold. So a claim either sees the hold or is counted. Holds don't stop a post retry (no
+    agent runs, and a retry is safe to repeat) or a foreground `review`, which runs in its own process;
+    the idle count includes them only while they run."""
     held = set()
     for path in (Path(state) / "holds").glob("*.lock"):
         try:
