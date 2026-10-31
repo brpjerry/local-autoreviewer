@@ -89,11 +89,18 @@ def record_saved_reviews(conn, svc):
         if not path.is_file():
             continue
         try:
-            structured = review.validate(json.loads(path.read_text()))
+            data = json.loads(path.read_text())
+            structured = review.validate(data)
         except (OSError, ValueError) as exc:  # ReviewFormatError and JSONDecodeError are ValueErrors
             log.warning("job %s: cannot record saved review %s: %s", row["id"], path, exc)
             continue
+        followup_of = data.get("followup_of") if isinstance(data.get("followup_of"), str) else None
+        if followup_of:  # a saved follow-up: keep its statuses for findings that still exist
+            known = {r[0] for r in conn.execute("SELECT id FROM findings")}
+            structured["resolutions"] = [
+                r for r in data.get("resolutions") or [] if isinstance(r, dict)
+                and r.get("status") in (*review.FOLLOWUP_STATUSES, "unchecked") and r.get("finding") in known]
         with db.transaction(conn):
-            db.record_review(conn, row["id"], structured)
+            db.record_review(conn, row["id"], structured, followup_of=followup_of)
         recorded += 1
     return recorded

@@ -63,6 +63,16 @@ MIGRATIONS = [
         UNIQUE (job_id, kind, position));
     CREATE INDEX findings_job ON findings (job_id);
     """,
+    # 4: follow-up reviews, which check the previous round's findings and look for regressions.
+    """
+    ALTER TABLE jobs ADD COLUMN review_kind TEXT NOT NULL DEFAULT 'full';
+    ALTER TABLE jobs ADD COLUMN followup_of TEXT;
+    CREATE TABLE resolutions (
+        id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs (id),
+        finding_id INTEGER NOT NULL REFERENCES findings (id), status TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '', UNIQUE (job_id, finding_id));
+    CREATE INDEX resolutions_finding ON resolutions (finding_id);
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -154,14 +164,17 @@ def update_job(conn, job_id, **fields):
     conn.execute(f"UPDATE jobs SET {columns} WHERE id=?", (*fields.values(), job_id))
 
 
-FINDING_KINDS = ("finding", "test_gap", "question", "nit")
+FINDING_KINDS = ("finding", "regression", "test_gap", "question", "nit")  # regressions: from follow-ups
 DISPOSITIONS = ("fixed", "declined", "false-positive", "duplicate", "deferred")
 
 
-def record_review(conn, job_id, review, *, effort=None, prompt_version=None):
-    """Keep a validated review's contents for analysis, replacing any earlier record for the job."""
+def record_review(conn, job_id, review, *, effort=None, prompt_version=None, followup_of=None):
+    """Keep a validated review's contents for analysis, replacing any earlier record for the job. A
+    follow-up (followup_of: the previous head) records its regressions and each previous finding's status."""
+    conn.execute("DELETE FROM resolutions WHERE job_id=?", (job_id,))
     conn.execute("DELETE FROM findings WHERE job_id=?", (job_id,))
-    rows = [(job_id, "finding", i, f["severity"], f.get("impact"), f.get("likelihood") or None,
+    kind = "regression" if followup_of else "finding"
+    rows = [(job_id, kind, i, f["severity"], f.get("impact"), f.get("likelihood") or None,
              f.get("trigger") or None, f["category"], f["file"], f["line"], f["title"], f["detail"], f["suggestion"],
              f.get("reviewer_severity"), f.get("readability"), f.get("loc_delta"), _edits_json(f))
             for i, f in enumerate(review["findings"])]
@@ -175,7 +188,11 @@ def record_review(conn, job_id, review, *, effort=None, prompt_version=None):
         "INSERT INTO findings (job_id, kind, position, severity, impact, likelihood, occurs_when, category, file,"
         " line, title, detail, suggestion, reviewer_severity, readability, loc_delta, edits)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.executemany("INSERT INTO resolutions (job_id, finding_id, status, detail) VALUES (?, ?, ?, ?)",
+                     [(job_id, r["finding"], r["status"], r["detail"]) for r in review.get("resolutions") or []])
     known = {"effort": effort, "prompt_version": prompt_version}
+    if followup_of:
+        known.update(review_kind="followup", followup_of=followup_of)
     update_job(conn, job_id, summary=review["summary"], review_recorded=1,
                **{key: value for key, value in known.items() if value is not None})
 

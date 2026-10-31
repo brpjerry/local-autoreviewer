@@ -56,13 +56,13 @@ wait_idle() {
     [ -f "$state/state.sqlite3" ] || return 0
     local busy announced=
     for _ in $(seq 1 180); do
-        # Only the worker's own work counts: foreground `review` jobs, and posts waiting out a retry,
-        # aren't affected by a restart.
+        # Running reviews count, foreground `review` ones too: the code switched to may migrate the shared
+        # database under them. Posts waiting out a retry don't run until they are due.
         busy=$(python3 -I -c 'import sqlite3, sys, time
 from pathlib import Path
 conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
-print(conn.execute("SELECT COUNT(*) FROM jobs WHERE source != ? AND (status = ? OR status = ? AND not_before <= ?)",
-                   ("foreground", "running", "posting", int(time.time()))).fetchone()[0])' \
+print(conn.execute("SELECT COUNT(*) FROM jobs WHERE status = ? OR status = ? AND not_before <= ?",
+                   ("running", "posting", int(time.time()))).fetchone()[0])' \
             "$state/state.sqlite3")
         [ "$busy" = 0 ] && return 0
         [ "${announced:-}" ] || echo "waiting for $busy running review(s) to finish..."

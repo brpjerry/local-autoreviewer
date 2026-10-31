@@ -23,11 +23,11 @@ OWNER = "alice"
 REPO = "alice/demo"
 
 
-def git(*args, cwd=None):
+def git(*args, cwd=None, check=True):
     env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ["PATH"],
            "HOME": os.environ.get("HOME", "/"), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-    return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True,
+    return subprocess.run(["git", *args], cwd=cwd, env=env, check=check, capture_output=True,
                           text=True).stdout.strip()
 
 

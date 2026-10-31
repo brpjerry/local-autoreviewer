@@ -37,19 +37,63 @@ def schema_text(path=None):
 PROMPT_FILES = ("review.md", "review.schema.json")
 
 
-def snapshot():
+def snapshot(followup=False):
     """The prompt files, read once for a review: it is hashed, built and handed to the agent from these
     same texts, so a deploy during the review can't mix two versions."""
-    return {name: (paths.prompts_dir() / name).read_text() for name in PROMPT_FILES}
+    names = PROMPT_FILES + (("followup.md",) if followup else ())
+    return {name: (paths.prompts_dir() / name).read_text() for name in names}
 
 
-def prompt_version(prompts=None):
-    """Short hash of the prompt template and schema, recorded with each review."""
-    prompts = prompts or snapshot()
+def prompt_version(prompts=None, followup=False):
+    """Short hash of the prompt template(s) and schema, recorded with each review."""
+    prompts = prompts or snapshot(followup)
     digest = hashlib.sha256()
     for name in sorted(prompts):
         digest.update(prompts[name].encode())
+    if "followup.md" in prompts:  # its schema is built in code, from the review schema
+        digest.update(json.dumps(followup_schema(prompts), sort_keys=True).encode())
     return digest.hexdigest()[:12]
+
+
+FOLLOWUP_STATUSES = ("fixed", "partly_fixed", "not_fixed", "obsolete")
+OPEN_STATUSES = ("not_fixed", "partly_fixed", "unchecked")  # unchecked: the follow-up gave no status
+STATUS_LABELS = {"fixed": "✅ Fixed", "partly_fixed": "🟡 Partly fixed", "not_fixed": "❌ Not fixed",
+                 "obsolete": "➖ No longer applies", "unchecked": "❔ Not checked", None: "❔ Not checked"}
+
+
+def followup_schema(prompts=None):
+    """The follow-up schema, built from the review schema (from a snapshot if given) so a finding has one
+    definition."""
+    text = (prompts or {}).get("review.schema.json") or schema_path().read_text()
+    finding = json.loads(text)["properties"]["findings"]["items"]
+    return {
+        "type": "object", "additionalProperties": False, "required": ["summary", "resolutions", "regressions"],
+        "properties": {
+            "summary": {"type": "string",
+                        "description": "2-4 sentences: how the previous findings stand, and any regressions."},
+            "resolutions": {
+                "type": "array", "description": "Exactly one entry per previous finding, by its id.",
+                "items": {
+                    "type": "object", "additionalProperties": False, "required": ["finding", "status", "detail"],
+                    "properties": {
+                        "finding": {"type": "integer", "description": "The previous finding's id."},
+                        "status": {"type": "string", "enum": list(FOLLOWUP_STATUSES)},
+                        "detail": {"type": "string",
+                                   "description": "Why: what the code at the new head does about it, with file and line."},
+                    },
+                },
+            },
+            "regressions": {"type": "array", "description": "New problems the changes since the previous review "
+                                                            "introduce. Empty if none.", "items": finding},
+        },
+    }
+
+
+def _section(text, heading):
+    """One '## heading' section of a prompt, up to the next '## ' heading or the closing 'Return your ...' line."""
+    start = text.index(f"## {heading}\n")
+    ends = [i for i in (text.find("\n## ", start + 1), text.find("\nReturn your ", start + 1)) if i != -1]
+    return text[start:min(ends, default=len(text))].strip() + "\n"
 
 
 def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, context, agent_note="",
@@ -66,6 +110,35 @@ def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, c
         repo=repo, number=number, title=title.replace("\n", " "), author=author, base_ref=base_ref,
         head_sha=head_sha, worktree=worktree, context=context, agent_note=agent_note,
         project_docs_note=docs_note, extra_instructions=extra)
+
+
+def build_followup_prompt(*, previous_sha, previous_count, prompts=None, **fields):
+    """The follow-up prompt. It shares the review prompt's sections on proposed changes and severity, so
+    the two can't drift apart."""
+    prompts = prompts or snapshot(followup=True)
+    full = prompts["review.md"]
+    # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
+    text = Template(prompts["followup.md"]).safe_substitute(
+        proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
+        previous_sha=previous_sha, previous_count=previous_count)
+    return build_prompt(**fields, template=Template(text))
+
+
+def validate_followup(raw, previous_ids):
+    """Coerce a follow-up's structured output; regressions are checked like a review's findings."""
+    if not isinstance(raw, dict):
+        raise ReviewFormatError("follow-up is not an object")
+    base = validate({"summary": raw.get("summary"), "findings": raw.get("regressions") or []})
+    resolutions = {}
+    for item in raw.get("resolutions") or []:
+        if not isinstance(item, dict) or item.get("status") not in FOLLOWUP_STATUSES:
+            continue
+        finding = _int(item.get("finding"))
+        if finding in previous_ids and finding not in resolutions:  # unknown ids and repeats are dropped
+            resolutions[finding] = {"finding": finding, "status": item["status"], "detail": str(item.get("detail") or "")}
+    for finding in sorted(set(previous_ids) - resolutions.keys()):  # unanswered: still open next round
+        resolutions[finding] = {"finding": finding, "status": "unchecked", "detail": ""}
+    return {**base, "resolutions": list(resolutions.values())}
 
 
 def validate(review):
@@ -277,6 +350,43 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
     body = "\n".join(head + findings + extras + nit_lines + footer)
     if len(body) > MAX_BODY:
         body = "\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer)
+    if len(body) > MAX_BODY:
+        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
+        body = body[:MAX_BODY - len(tail) - 100] + tail
+    return body
+
+
+def render_followup(review, previous, *, repo, number, sha, previous_sha, agent, model, job_id):
+    """A follow-up: each previous finding's status, then any regressions as numbered findings."""
+    agent_name = AGENT_NAMES.get(agent, agent)
+    model_note = f" ({clean(model, 80)})" if model else ""
+    commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
+    before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
+    lines = [f"### Follow-up review · {agent_name}{model_note}", "",
+             f"Checked commit {commit} for the {len(previous)} issue(s) open after {before}, and for regressions in "
+             "the changes since. Automated read-only review.", "", clean(review["summary"]), ""]
+    status = {r["finding"]: r for r in review["resolutions"]}
+    if previous:
+        lines.append("#### Previous findings")
+        for item in previous:
+            resolution = status.get(item["id"])
+            who = AGENT_NAMES.get(item["agent"], item["agent"])
+            where = _location(repo, item.get("raised_at") or previous_sha, item["file"], item["line"])
+            line = (f"- {STATUS_LABELS[resolution['status'] if resolution else None]}: {clean(item['title'], 500)} "
+                    f"_({who}, {item['severity']}{', ' + where if where else ''})_")
+            if resolution and resolution["detail"]:
+                line += " — " + clean(resolution["detail"], 2000).replace("\n", " ")
+            lines.append(line)
+        lines.append("")
+    if review["findings"]:
+        lines.append("#### Regressions")
+        for n, item in enumerate(review["findings"], 1):
+            lines += _finding(n, item, repo, sha)
+        lines.append("")
+    else:
+        lines += ["No regressions found.", ""]
+    footer = ["---", f"<sub>local-autoreviewer · job {job_id} · {agent_name} · follow-up</sub>", marker(job_id, sha, agent)]
+    body = "\n".join(lines + footer)
     if len(body) > MAX_BODY:
         tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
         body = body[:MAX_BODY - len(tail) - 100] + tail
