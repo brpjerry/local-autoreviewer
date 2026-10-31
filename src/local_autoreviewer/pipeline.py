@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 RATE_LIMIT_BACKOFF = 30 * 60
 SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
+FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
 
 
 @dataclass
@@ -132,6 +133,44 @@ def run_job(svc, job_id, cancel):
         except Exception as exc:  # unexpected: record and retry rather than wedge the queue
             log.exception("job %s crashed", job_id)
             return _retry(conn, svc, job, f"internal error: {type(exc).__name__}: {exc}")
+    finally:
+        conn.close()
+
+
+def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None):
+    """Run a claimed job to a final state without the worker: wait out short retries in place,
+    and cancel the job rather than leave a long deferral (a usage limit) queued for the worker."""
+    while True:
+        status = run_job(svc, job_id, CancelToken())
+        if status != "queued":
+            return status
+        conn = svc.connect()
+        try:
+            job = db.get_job(conn, job_id)
+            wait = max(0, job["not_before"] - svc.now())
+            if wait > FOREGROUND_MAX_WAIT:
+                return _finish(conn, svc, job_id, "cancelled",
+                               f"not waiting {wait // 60} min in the foreground; {job['reason']}")
+            notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
+            sleep(wait)
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="running", started_at=svc.now())
+        finally:
+            conn.close()
+
+
+def abandon(svc, job_ids, reason):
+    """Cancel jobs a foreground run is leaving unfinished (for example after Ctrl-C), so a worker
+    never picks them up. A job caught mid-post is left to the worker's marker-checked recovery."""
+    conn = svc.connect()
+    try:
+        for job_id in job_ids:
+            job = db.get_job(conn, job_id)
+            if job["status"] not in ("queued", "running"):
+                continue
+            if job["scope_unit"]:
+                svc.runner.cleanup(job["scope_unit"])
+            _finish(conn, svc, job_id, "cancelled", reason)
     finally:
         conn.close()
 

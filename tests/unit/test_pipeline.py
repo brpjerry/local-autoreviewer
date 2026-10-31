@@ -8,6 +8,7 @@ from pathlib import Path
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events, pipeline
 from local_autoreviewer.config import ConfigWatcher
+from local_autoreviewer.github import GitHubError
 from local_autoreviewer.worker import Worker
 
 HOSTILE_FILES = {
@@ -134,6 +135,40 @@ class PipelineTests(EnvTestCase):
         cfg = make_config(self.tmp, claude="badjson")
         svc, (job_id,) = self.queue(cfg)
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+
+    def test_foreground_waits_out_a_transient_error(self):
+        svc, (job_id,) = self.queue(post=False)
+        real_view, calls = self.github.pr_view, []
+
+        def flaky_view(repo, number):
+            calls.append(number)
+            if len(calls) == 1:
+                raise GitHubError("TLS handshake timeout")
+            return real_view(repo, number)
+
+        self.github.pr_view = flaky_view
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "skipped")
+        self.assertEqual(waits, [120])
+        self.assertEqual(self.job(svc, job_id)["attempts"], 1)
+
+    def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
+        cfg = make_config(self.tmp, claude="ratelimit")
+        svc, (job_id,) = self.queue(cfg, post=False)
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
+        self.assertIn("usage limit", self.job(svc, job_id)["reason"])
+
+    def test_abandon_cancels_only_unfinished_jobs(self):
+        svc, (done, left) = self.queue(agents=("claude", "codex"), post=False)
+        pipeline.run_job(svc, done, pipeline.CancelToken())
+        pipeline.abandon(svc, [done, left], "foreground review interrupted")
+        self.assertEqual(self.job(svc, done)["status"], "skipped")
+        self.assertEqual(self.job(svc, left)["status"], "cancelled")
 
     def test_timeout_kills_agent(self):
         cfg = make_config(self.tmp, claude="sleep", service={"review_timeout": "1s"})

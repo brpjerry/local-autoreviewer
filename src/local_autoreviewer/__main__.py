@@ -140,19 +140,23 @@ def cmd_review(args):
     finally:
         conn.close()
     worst = 0
-    for job_id in job_ids:
-        status = pipeline.run_job(svc, job_id, pipeline.CancelToken())
-        conn = svc.connect()
-        job = db.get_job(conn, job_id)
-        conn.close()
-        out = Path(pipeline.job_paths(svc.state, job_id).out, "review.md")
-        print(f"job {job_id} [{job['agent']}]: {status} — {job['reason']}")
-        if job["review_url"]:
-            print(f"  posted: {job['review_url']}")
-        elif out.is_file():
-            print(f"  review: {out}")
-        if status not in ("posted", "skipped"):
-            worst = 1
+    try:
+        for job_id in job_ids:
+            status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
+            conn = svc.connect()
+            job = db.get_job(conn, job_id)
+            conn.close()
+            out = Path(pipeline.job_paths(svc.state, job_id).out, "review.md")
+            print(f"job {job_id} [{job['agent']}]: {status} — {job['reason']}")
+            if job["review_url"]:
+                print(f"  posted: {job['review_url']}")
+            elif out.is_file():
+                print(f"  review: {out}")
+            if status not in ("posted", "skipped"):
+                worst = 1
+    finally:
+        # Jobs this command created are never left for the worker, even after Ctrl-C.
+        pipeline.abandon(svc, job_ids, "foreground review interrupted")
     return worst
 
 
