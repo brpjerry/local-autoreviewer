@@ -57,24 +57,35 @@ class _Runner:
             except BrokenPipeError:
                 pass
             timed_out = cancelled = False
-            while True:
-                try:
-                    returncode = proc.wait(timeout=self.poll_interval)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                if time.monotonic() - start > timeout:
-                    timed_out = True
-                elif should_cancel():
-                    cancelled = True
-                if timed_out or cancelled:
-                    self._stop(inv, proc)
+            try:
+                while True:
                     try:
-                        returncode = proc.wait(timeout=30)
+                        returncode = proc.wait(timeout=self.poll_interval)
+                        break
                     except subprocess.TimeoutExpired:
+                        pass
+                    if time.monotonic() - start > timeout:
+                        timed_out = True
+                    elif should_cancel():
+                        cancelled = True
+                    if timed_out or cancelled:
+                        self._stop(inv, proc)
+                        try:
+                            returncode = proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                            returncode = proc.wait()
+                        break
+            except BaseException:  # Ctrl-C: the agent runs in its own session, so stop it here
+                self._stop(inv, proc)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
                         os.killpg(proc.pid, signal.SIGKILL)
-                        returncode = proc.wait()
-                    break
+                    except ProcessLookupError:
+                        pass
+                raise
         return RunResult(returncode, timed_out, cancelled, time.monotonic() - start)
 
 

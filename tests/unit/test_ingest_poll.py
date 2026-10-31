@@ -3,6 +3,7 @@ import fcntl
 import sqlite3
 import threading
 import unittest
+from unittest import mock
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events
@@ -17,6 +18,21 @@ class DbTests(EnvTestCase):
         conn.close()
         with self.assertRaises(db.SchemaTooNew):
             db.connect(self.state / "s.db")
+
+    def test_connect_closes_its_connection_when_the_schema_is_too_new(self):
+        conn = db.connect(self.state / "s.db")
+        conn.execute(f"PRAGMA user_version={db.SCHEMA_VERSION + 1}")
+        conn.close()
+        opened, real_connect = [], sqlite3.connect
+
+        def connect(*args, **kwargs):
+            opened.append(real_connect(*args, **kwargs))
+            return opened[-1]
+
+        with mock.patch.object(db.sqlite3, "connect", side_effect=connect), self.assertRaises(db.SchemaTooNew):
+            db.connect(self.state / "s.db")
+        with self.assertRaises(sqlite3.ProgrammingError):  # "Cannot operate on a closed database"
+            opened[0].execute("SELECT 1")
 
     def test_migrate_does_not_need_the_write_lock_when_current(self):
         db.connect(self.state / "s.db").close()
@@ -295,6 +311,18 @@ class ManualIngestTests(EnvTestCase):
         row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
         conn.close()
         self.assertEqual(tuple(row), ("running", 1))
+
+    def test_converting_to_draft_keeps_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="converted_to_draft", head_sha="a" * 40,
+                               base_ref="main", is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 0))
 
     def test_closing_a_draft_stops_requested_reviews(self):
         self.foreground_job("running", post=False)

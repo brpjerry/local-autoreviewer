@@ -168,8 +168,8 @@ def cmd_review(args):
             mid_post = [job_id for job_id in owned if db.get_job(conn, job_id)["status"] == "posting"]
             conn.close()
             for job_id in mid_post:
-                print(f"job {job_id} was interrupted mid-post; the worker will check whether it reached GitHub "
-                      "and finish posting it if not", file=sys.stderr)
+                print(f"job {job_id}'s post didn't complete; the worker, when it runs, will check whether it "
+                      "reached GitHub and finish posting it if not", file=sys.stderr)
         for job_id, handle in locks.items():
             pipeline.release_foreground_lock(svc.state, job_id, handle)
     return worst

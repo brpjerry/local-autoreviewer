@@ -16,7 +16,6 @@ from .github import GitHubError
 log = logging.getLogger(__name__)
 TICK = 2.0
 STATUS_EVERY = 10.0
-POST_RECOVERY_RETRY = 300  # seconds before retrying an interrupted post whose GitHub lookup failed
 
 
 def start_of_local_day(now):
@@ -119,10 +118,11 @@ class Worker:
             if job["source"] == db.FOREGROUND:
                 pipeline.abandon(svc, [job_id], "foreground review exited before finishing")
         except Exception:
-            log.exception("job %s: post recovery failed; retrying in %d min", job_id, POST_RECOVERY_RETRY // 60)
+            log.exception("job %s: post recovery failed; retrying in %d min",
+                          job_id, pipeline.POST_RECOVERY_RETRY // 60)
             try:
                 with db.transaction(conn):
-                    db.update_job(conn, job_id, not_before=svc.now() + POST_RECOVERY_RETRY)
+                    db.update_job(conn, job_id, not_before=svc.now() + pipeline.POST_RECOVERY_RETRY)
             except Exception:
                 log.exception("job %s: cannot schedule the retry", job_id)
         finally:
@@ -146,9 +146,9 @@ class Worker:
                 return
         except GitHubError as exc:
             log.warning("job %s: cannot verify posting yet (%s); retrying in %d min",
-                        job["id"], exc, POST_RECOVERY_RETRY // 60)
+                        job["id"], exc, pipeline.POST_RECOVERY_RETRY // 60)
             with db.transaction(conn):
-                db.update_job(conn, job["id"], not_before=svc.now() + POST_RECOVERY_RETRY)
+                db.update_job(conn, job["id"], not_before=svc.now() + pipeline.POST_RECOVERY_RETRY)
             return
         with db.transaction(conn):
             db.update_job(conn, job["id"], status="queued", reason="requeued: review output missing")

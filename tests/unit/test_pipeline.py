@@ -16,7 +16,7 @@ from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
 from local_autoreviewer.github import GitHubError
-from local_autoreviewer.worker import POST_RECOVERY_RETRY, Worker
+from local_autoreviewer.worker import Worker
 
 HOSTILE_FILES = {
     "src/calc.py": "def divide(a, b):\n    return a / b\n\ndef mean(xs):\n    return sum(xs) / len(xs)\n",
@@ -189,13 +189,47 @@ class PipelineTests(EnvTestCase):
             self.clock.advance(seconds)
 
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "skipped")
-        self.assertEqual(waits, [120])
+        self.assertEqual(sum(waits), 120)  # in steps, checking for a push or close in between
+        self.assertTrue(all(step <= pipeline.FOREGROUND_CANCEL_POLL for step in waits))
         self.assertEqual(self.job(svc, job_id)["attempts"], 1)
 
     def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
         svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"))
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertIn("usage limit", self.job(svc, job_id)["reason"])
+
+    def test_foreground_review_of_a_draft_runs(self):
+        self.github.set_pr(1, self.head, draft=True)
+        svc, (job_id,) = self.foreground()
+        self.assertEqual(pipeline.run_foreground(svc, job_id), "skipped")
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_job_cancelled_before_its_turn_never_starts_its_agent(self):
+        svc, (job_id,) = self.foreground()
+        conn = svc.connect()
+        with db.transaction(conn):  # a push while another agent's job of the same `review` ran
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+        conn.close()
+        self.assertEqual(pipeline.run_foreground(svc, job_id), "superseded")
+        self.assertEqual(self.agent_log("claude"), [])
+
+    def test_post_that_reached_github_despite_an_error_is_not_posted_twice(self):
+        svc, (job_id,) = self.queue()
+        real_post = self.github.post_review
+
+        def post_then_time_out(*args):
+            real_post(*args)  # GitHub accepted it, but the response never arrived
+            raise GitHubError("timed out")
+
+        self.github.post_review = post_then_time_out
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.assertEqual(self.job(svc, job_id)["not_before"], self.clock() + pipeline.POST_RECOVERY_RETRY)
+        self.github.post_review = real_post
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "posted")
+        self.assertEqual(len(self.github.posted), 1)
+        self.assertEqual(len(self.agent_log("claude")), 1)  # the agent didn't run again
 
     def test_worker_never_claims_a_waiting_foreground_job(self):
         svc, (job_id,) = self.foreground(post=True)
@@ -344,7 +378,7 @@ class PipelineTests(EnvTestCase):
         self.github.find_marked_review = failing_lookup
         recover_posts(Worker(lambda cfg: svc, None), svc)
         job = self.job(svc, job_id)
-        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + POST_RECOVERY_RETRY))
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
 
     def test_resume_drops_a_stale_cancel_request(self):
         svc, (job_id,) = self.foreground()
@@ -362,6 +396,20 @@ class PipelineTests(EnvTestCase):
         with mock.patch.object(pipeline, "run_job", side_effect=fake_run_job):
             status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
         self.assertEqual((status, seen), ("skipped", [1, 0]))
+
+    def test_orphaned_foreground_post_backs_off_after_any_error(self):
+        svc, job_id = self.orphan("posting")
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Reviewed.\n")
+
+        def broken_post(*args):
+            raise ValueError("unexpected response")
+
+        self.github.post_review = broken_post
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
 
     def test_orphaned_foreground_post_without_output_is_cancelled(self):
         svc, job_id = self.orphan("posting")
@@ -414,7 +462,7 @@ class PipelineTests(EnvTestCase):
         (job,) = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
         conn.close()
         self.assertEqual(job["status"], "posting")  # left for the worker's marker-checked recovery
-        self.assertIn(f"job {job['id']} was interrupted mid-post", stderr.getvalue())
+        self.assertIn(f"job {job['id']}'s post didn't complete", stderr.getvalue())
         self.assertEqual(list((self.state / "locks").iterdir()), [])
 
     def test_review_interrupted_mid_post_is_finished_by_the_worker(self):
@@ -716,12 +764,13 @@ class WorkerTests(EnvTestCase):
         job = dict(db.get_job(conn, job_id))
         conn.close()
         self.assertEqual(len(lookups), 1)
-        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + POST_RECOVERY_RETRY))
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
 
         # Once the retry is due and GitHub answers again, the post is confirmed.
         del self.github.find_marked_review
-        self.github.post_review(REPO, 2, self.head, f"body\n{review.marker(job_id=job_id, sha=self.head, agent='claude')}")
-        self.clock.advance(POST_RECOVERY_RETRY)
+        body = f"body\n{review.marker(job_id=job_id, sha=self.head, agent='claude')}"
+        self.github.post_review(REPO, 2, self.head, body)
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
         recover_posts(worker, svc)
         conn = svc.connect()
         self.assertEqual(db.get_job(conn, job_id)["status"], "posted")

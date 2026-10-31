@@ -25,7 +25,8 @@ RATE_LIMIT_BACKOFF = 30 * 60
 SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
 FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
-FOREGROUND_CANCEL_POLL = 2.0
+FOREGROUND_CANCEL_POLL = 2.0  # seconds between a foreground job's checks for cancel requests
+POST_RECOVERY_RETRY = 300  # seconds before retrying a post that failed or was interrupted
 
 
 @dataclass
@@ -188,25 +189,46 @@ def orphaned_foreground(state, job_id):
         except BlockingIOError:
             yield False
             return
-        yield True
-        path.unlink(missing_ok=True)
+        try:
+            yield True
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def _check_cancel(svc, job_id, token):
+    """Cancel token if the job has a cancel request (a newer push, the PR closing). True if so."""
+    try:
+        conn = svc.connect()
+        try:
+            row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:  # e.g. busy: the next check tries again
+        log.debug("job %s: cancel check failed: %s", job_id, exc)
+        return False
+    if row is not None and row["cancel_requested"]:
+        token.cancel(row["reason"] or "cancelled")
+        return True
+    return False
 
 
 def _watch_cancel(svc, job_id, token, done):
-    """Give a foreground run the worker's cancel semantics (a newer push, the PR closing)."""
+    """Give a foreground run the worker's cancel semantics."""
     while not done.wait(FOREGROUND_CANCEL_POLL):
-        try:
-            conn = svc.connect()
-            try:
-                row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:  # e.g. busy: try again on the next tick rather than stop watching
-            log.debug("job %s: cancel check failed: %s", job_id, exc)
-            continue
-        if row is not None and row["cancel_requested"]:
-            token.cancel(row["reason"] or "cancelled")
+        if _check_cancel(svc, job_id, token):
             return
+
+
+def _wait_while_queued(svc, conn, job_id, wait, sleep):
+    """Sleep up to `wait` seconds in short steps; return early with the job's status if a push or
+    close ends it meanwhile. Returns 'queued' if it is still waiting at the end."""
+    deadline = svc.now() + wait
+    while (remaining := deadline - svc.now()) > 0:
+        sleep(min(FOREGROUND_CANCEL_POLL, remaining))
+        status = db.get_job(conn, job_id)["status"]
+        if status != "queued":
+            return status
+    return "queued"
 
 
 def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None):
@@ -214,6 +236,7 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
     in place, and cancel the job rather than wait out a long deferral such as a usage limit."""
     while True:
         token, done = CancelToken(), threading.Event()
+        _check_cancel(svc, job_id, token)  # a cancel requested while it waited its turn
         watcher = threading.Thread(target=_watch_cancel, args=(svc, job_id, token, done), daemon=True,
                                    name=f"cancel-watch-{job_id}")
         watcher.start()
@@ -232,8 +255,11 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
                 return _finish(conn, svc, job_id, "cancelled",
                                f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
                                f"worker retry); {job['reason']}")
-            notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
-            sleep(wait)
+            if wait:
+                notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
+            status = _wait_while_queued(svc, conn, job_id, wait, sleep)
+            if status != "queued":
+                return status  # a push or close ended it during the wait
             with db.transaction(conn):
                 # A push or close during the wait may have ended the job; never revive it.
                 # Like a worker claim, drop a stale cancel request (one left by a requeue that kept it).
@@ -360,7 +386,17 @@ def post(conn, svc, job):
     body = Path(paths.out, "review.md").read_text()
     with db.transaction(conn):
         db.update_job(conn, job["id"], status="posting")
-    _check_pr(svc, job)
-    response = svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
+    try:
+        _check_pr(svc, job)
+        response = svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
+    except GitHubError as exc:
+        # The review is ready, and may even have reached GitHub (a timeout on the response). Leave the
+        # job `posting`: post recovery looks for the review before posting it again, and the agent
+        # doesn't run again.
+        log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)
+        with db.transaction(conn):
+            db.update_job(conn, job["id"], reason=f"post failed: {exc}"[:1000],
+                          not_before=svc.now() + POST_RECOVERY_RETRY)
+        return "posting"
     return _finish(conn, svc, job["id"], "posted", "review posted", posted_at=svc.now(),
                    review_id=response.get("id"), review_url=response.get("html_url"))
