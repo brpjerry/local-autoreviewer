@@ -231,6 +231,100 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(len(self.github.posted), 1)
         self.assertEqual(len(self.agent_log("claude")), 1)  # the agent didn't run again
 
+    def failing_post(self, message):
+        def post_review(*args):
+            raise GitHubError(message)
+        self.github.post_review = post_review
+
+    def test_a_refused_post_fails_at_once_and_keeps_the_review(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r failed: Resource not accessible by personal access token (HTTP 403)")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "failed")
+        job = self.job(svc, job_id)
+        self.assertIn("review saved to", job["reason"])
+        self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
+
+    def test_post_failures_end_after_max_attempts(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 2}))
+        self.failing_post("gh api repos/o/r failed: HTTP 502: Bad Gateway")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["attempts"]), ("failed", 2))
+        self.assertEqual(len(self.agent_log("claude")), 1)
+
+    def test_post_recovery_honours_a_retarget_during_the_backoff(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        del self.github.post_review
+        self.github.set_pr(1, self.head, base="release")
+        conn = svc.connect()
+        with db.transaction(conn):  # what the poll does on seeing the retarget
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc", agent="claude")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_post_recovery_honours_a_cancel_the_pr_state_cannot_show(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+        del self.github.post_review
+        conn = svc.connect()
+        with db.transaction(conn):  # the head moved during the backoff and then came back
+            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc", agent="claude")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_a_retargeted_pr_is_not_posted_to(self):
+        svc, (job_id,) = self.queue()
+        self.github.set_pr(1, self.head, base="release")  # same head, new base: the review is of another diff
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
+        self.assertEqual(self.github.posted, [])
+
+    def test_review_post_retries_a_failed_post_itself(self):
+        svc, (job_id,) = self.foreground(post=True)
+        real_post, calls = self.github.post_review, []
+
+        def flaky_post(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise GitHubError("gh api repos/o/r timed out")
+            return real_post(*args)
+
+        self.github.post_review = flaky_post
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            self.clock.advance(seconds)
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "posted")
+        self.assertEqual(sum(waits), pipeline.POST_RECOVERY_RETRY)
+        self.assertEqual((len(self.github.posted), len(self.agent_log("claude"))), (1, 1))
+
+    def test_long_wait_cancel_keeps_a_status_a_poll_just_set(self):
+        svc, (job_id,) = self.foreground()
+
+        def deferred_then_superseded(svc_, job_id_, token):
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id_, status="queued", not_before=self.clock() + 1800, reason="retry: usage limit")
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")  # a poll, right after
+            conn.close()
+            return "queued"
+
+        with mock.patch.object(pipeline, "run_job", side_effect=deferred_then_superseded):
+            self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "superseded")
+        self.assertEqual(self.job(svc, job_id)["reason"], "superseded by abc")
+
     def test_worker_never_claims_a_waiting_foreground_job(self):
         svc, (job_id,) = self.foreground(post=True)
         self.fail_first_pr_view()

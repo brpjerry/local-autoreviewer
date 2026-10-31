@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import math
+import re
 import shutil
 import sqlite3
 import threading
@@ -26,7 +27,7 @@ SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
 FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
 FOREGROUND_CANCEL_POLL = 2.0  # seconds between a foreground job's checks for cancel requests
-POST_RECOVERY_RETRY = 300  # seconds before retrying a post that failed or was interrupted
+POST_RECOVERY_RETRY = 5 * 60  # seconds before retrying a post that failed or was interrupted
 
 
 @dataclass
@@ -114,6 +115,8 @@ def _check_pr(svc, job):
         raise Outcome("cancelled", f"PR is {pr['state'].lower()}")
     if pr["headRefOid"] != job["head_sha"]:
         raise Outcome("superseded", f"head moved to {pr['headRefOid'][:12]}")
+    if pr["baseRefName"] != job["base_ref"]:
+        raise Outcome("superseded", f"retargeted to {pr['baseRefName']}")
     if pr["isDraft"] and job["source"] not in ("manual", db.FOREGROUND):
         raise Outcome("cancelled", "PR is a draft")
     return pr
@@ -203,7 +206,7 @@ def _check_cancel(svc, job_id, token):
             row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error as exc:  # e.g. busy: the next check tries again
+    except (sqlite3.Error, db.SchemaTooNew) as exc:  # e.g. busy: the next check tries again
         log.debug("job %s: cancel check failed: %s", job_id, exc)
         return False
     if row is not None and row["cancel_requested"]:
@@ -219,16 +222,35 @@ def _watch_cancel(svc, job_id, token, done):
             return
 
 
-def _wait_while_queued(svc, conn, job_id, wait, sleep):
-    """Sleep up to `wait` seconds in short steps; return early with the job's status if a push or
-    close ends it meanwhile. Returns 'queued' if it is still waiting at the end."""
+def _wait_while(svc, conn, job_id, status, wait, sleep):
+    """Sleep up to `wait` seconds in short steps while the job keeps `status`; return early with its
+    new status if a push or close ends it meanwhile."""
     deadline = svc.now() + wait
     while (remaining := deadline - svc.now()) > 0:
         sleep(min(FOREGROUND_CANCEL_POLL, remaining))
-        status = db.get_job(conn, job_id)["status"]
-        if status != "queued":
-            return status
-    return "queued"
+        current = db.get_job(conn, job_id)["status"]
+        if current != status:
+            return current
+    return status
+
+
+def _finish_post(svc, job_id, sleep, notify):
+    """A post that failed under `review --post`: retry it in place while the retry fits in the wait,
+    as the worker would. Returns the job's status; 'posting' leaves it to the worker."""
+    conn = svc.connect()
+    try:
+        while True:
+            job = db.get_job(conn, job_id)
+            wait = max(0, job["not_before"] - svc.now())
+            if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT:
+                return job["status"]
+            if wait:
+                notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
+            if _wait_while(svc, conn, job_id, "posting", wait, sleep) != "posting":
+                return db.get_job(conn, job_id)["status"]
+            recover_post(conn, svc, db.get_job(conn, job_id))
+    finally:
+        conn.close()
 
 
 def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None):
@@ -245,6 +267,8 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
         finally:
             done.set()
             watcher.join()
+        if status == "posting":
+            return _finish_post(svc, job_id, sleep, notify)
         if status != "queued":
             return status
         conn = svc.connect()
@@ -252,12 +276,18 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
             if wait > FOREGROUND_MAX_WAIT:
-                return _finish(conn, svc, job_id, "cancelled",
-                               f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
-                               f"worker retry); {job['reason']}")
+                reason = (f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
+                          f"worker retry); {job['reason']}")
+                with db.transaction(conn):  # only if a poll hasn't superseded it meanwhile
+                    cancelled = conn.execute(
+                        "UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status='queued'",
+                        (reason[:1000], svc.now(), job_id)).rowcount
+                if cancelled:
+                    log.info("job %s -> cancelled: %s", job_id, reason)
+                return db.get_job(conn, job_id)["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
-            status = _wait_while_queued(svc, conn, job_id, wait, sleep)
+            status = _wait_while(svc, conn, job_id, "queued", wait, sleep)
             if status != "queued":
                 return status  # a push or close ended it during the wait
             with db.transaction(conn):
@@ -380,6 +410,53 @@ def _run(conn, svc, job, cancel):
     return post(conn, svc, job)
 
 
+def _rejected(exc):
+    """True for a definite refusal (HTTP 4xx other than a timeout or rate limit): retrying won't help."""
+    match = re.search(r"\bHTTP (4\d\d)\b", str(exc))
+    return bool(match) and match.group(1) not in ("408", "429")
+
+
+def post_failed(conn, svc, job, exc):
+    """A post that failed or whose result is unknown (a timeout after GitHub accepted it, say). It stays
+    `posting` for marker-checked recovery, without running the agent again, until max_attempts; a
+    definite refusal fails it at once. The review stays in out/review.md either way."""
+    attempts = db.get_job(conn, job["id"])["attempts"] + 1
+    saved = f"review saved to {job_paths(svc.state, job['id']).out}/review.md"
+    if _rejected(exc) or attempts >= svc.config.service.max_attempts:
+        return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000], attempts=attempts,
+                       error=str(exc)[:2000])
+    log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)
+    with db.transaction(conn):
+        db.update_job(conn, job["id"], attempts=attempts, reason=f"post failed: {exc}"[:1000],
+                      not_before=svc.now() + POST_RECOVERY_RETRY)
+    return "posting"
+
+
+def recover_post(conn, svc, job):
+    """Finish a job left `posting` by a failed or interrupted post: confirm it if the review reached
+    GitHub, otherwise post the saved review, unless a push, retarget or close has ended the job since.
+    Returns the job's status afterwards."""
+    try:
+        existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
+    except GitHubError as exc:
+        return post_failed(conn, svc, job, exc)
+    if existing:
+        return _finish(conn, svc, job["id"], "posted", "review found after an interrupted post",
+                       posted_at=svc.now(), review_id=existing.get("id"), review_url=existing.get("html_url"))
+    job = db.get_job(conn, job["id"])
+    if job["cancel_requested"]:
+        reason = job["reason"] or "cancelled"
+        return _finish(conn, svc, job["id"], "superseded" if reason.startswith("superseded") else "cancelled", reason)
+    if not Path(job_paths(svc.state, job["id"]).out, "review.md").is_file():
+        if job["source"] == db.FOREGROUND:  # no owner left to run it again
+            return _finish(conn, svc, job["id"], "cancelled", "interrupted post had no saved review")
+        return _finish(conn, svc, job["id"], "queued", "requeued: review output missing")
+    try:
+        return post(conn, svc, job)
+    except Outcome as outcome:
+        return _finish(conn, svc, job["id"], outcome.status, outcome.reason, **outcome.fields)
+
+
 def post(conn, svc, job):
     """Post out/review.md for a job, after confirming the PR still points at the reviewed head."""
     paths = job_paths(svc.state, job["id"])
@@ -390,13 +467,6 @@ def post(conn, svc, job):
         _check_pr(svc, job)
         response = svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
     except GitHubError as exc:
-        # The review is ready, and may even have reached GitHub (a timeout on the response). Leave the
-        # job `posting`: post recovery looks for the review before posting it again, and the agent
-        # doesn't run again.
-        log.warning("job %s: post failed (%s); retrying in %d min", job["id"], exc, POST_RECOVERY_RETRY // 60)
-        with db.transaction(conn):
-            db.update_job(conn, job["id"], reason=f"post failed: {exc}"[:1000],
-                          not_before=svc.now() + POST_RECOVERY_RETRY)
-        return "posting"
+        return post_failed(conn, svc, job, exc)
     return _finish(conn, svc, job["id"], "posted", "review posted", posted_at=svc.now(),
                    review_id=response.get("id"), review_url=response.get("html_url"))

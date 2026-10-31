@@ -8,10 +8,8 @@ import signal
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from . import db, paths, pipeline
-from .github import GitHubError
 
 log = logging.getLogger(__name__)
 TICK = 2.0
@@ -110,48 +108,16 @@ class Worker:
         conn = svc.connect()
         try:
             job = db.get_job(conn, job_id)
-            if job["status"] != "posting":
-                return
-            self.recover_posting(svc, conn, job)
-            # recover_posting requeues a job with no saved output; a foreground job has no owner left
-            # to run it, so cancel it instead.
-            if job["source"] == db.FOREGROUND:
-                pipeline.abandon(svc, [job_id], "foreground review exited before finishing")
-        except Exception:
-            log.exception("job %s: post recovery failed; retrying in %d min",
-                          job_id, pipeline.POST_RECOVERY_RETRY // 60)
-            try:
-                with db.transaction(conn):
-                    db.update_job(conn, job_id, not_before=svc.now() + pipeline.POST_RECOVERY_RETRY)
+            if job["status"] == "posting":
+                pipeline.recover_post(conn, svc, job)
+        except Exception as exc:
+            log.exception("job %s: post recovery failed", job_id)
+            try:  # counts as a failed attempt, so a persistent error ends the job eventually
+                pipeline.post_failed(conn, svc, db.get_job(conn, job_id), exc)
             except Exception:
                 log.exception("job %s: cannot schedule the retry", job_id)
         finally:
             conn.close()
-
-    def recover_posting(self, svc, conn, job):
-        """A crash between posting and recording: look for our marker before posting again."""
-        try:
-            existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
-            if existing:
-                with db.transaction(conn):
-                    db.update_job(conn, job["id"], status="posted", reason="review found after restart",
-                                  review_id=existing.get("id"), review_url=existing.get("html_url"),
-                                  posted_at=svc.now(), finished_at=svc.now())
-                return
-            if Path(pipeline.job_paths(svc.state, job["id"]).out, "review.md").is_file():
-                try:
-                    pipeline.post(conn, svc, job)
-                except pipeline.Outcome as outcome:
-                    pipeline._finish(conn, svc, job["id"], outcome.status, outcome.reason)
-                return
-        except GitHubError as exc:
-            log.warning("job %s: cannot verify posting yet (%s); retrying in %d min",
-                        job["id"], exc, pipeline.POST_RECOVERY_RETRY // 60)
-            with db.transaction(conn):
-                db.update_job(conn, job["id"], not_before=svc.now() + pipeline.POST_RECOVERY_RETRY)
-            return
-        with db.transaction(conn):
-            db.update_job(conn, job["id"], status="queued", reason="requeued: review output missing")
 
     # Main loop ------------------------------------------------------------------
 

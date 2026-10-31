@@ -83,7 +83,8 @@ class _Runner:
                 except subprocess.TimeoutExpired:
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                        proc.wait(timeout=5)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
                         pass
                 raise
         return RunResult(returncode, timed_out, cancelled, time.monotonic() - start)

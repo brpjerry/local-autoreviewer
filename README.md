@@ -86,7 +86,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | `local-autoreviewer poll --dry-run` | Show which events the next poll would produce |
 | `journalctl --user -u local-autoreviewer-worker -f` | Watch the worker |
 
-- **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish.
+- **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish, including posts that were interrupted or failed.
 - **Daily cap.** `max_reviews_per_day` limits reviews per agent, which protects your interactive budget. Usage-limit errors defer the job for 30 minutes without using up a retry.
 - **Resuming.** `resume` opens a normal interactive session with your full config. Run it in any terminal or multiplexer pane. Changes made there land in the review checkout, not your own clone.
 - **Retention.** Job checkouts are kept for `retain_jobs` (14 days by default). After that, `resume` recreates the checkout as long as the commit can still be fetched.
