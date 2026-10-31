@@ -32,8 +32,8 @@ def _action(row, pr):
 
 @contextmanager
 def poll_lock(state):
-    """Run one poll at a time (the timer and a manual `poll`). GitHub is fetched outside the
-    database write lock, so without this an older snapshot could be applied over a newer one.
+    """Run polls and manual enqueues one at a time. GitHub is fetched outside the database
+    write lock, so without this an older snapshot could be applied over a newer one.
     Unlike the write lock, it doesn't block the worker."""
     path = Path(state) / "poll.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +41,7 @@ def poll_lock(state):
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            log.info("another poll is running; waiting for it to finish")
+            log.info("a poll or enqueue is running; waiting for it to finish")
             fcntl.flock(handle, fcntl.LOCK_EX)
         yield
 

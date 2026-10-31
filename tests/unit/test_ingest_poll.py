@@ -79,6 +79,31 @@ class PollTests(EnvTestCase):
         self.assertTrue(started.is_set())
         self.assertEqual(result["r"][1], 0)
 
+    def test_enqueue_waits_for_a_running_poll(self):
+        import argparse
+        from unittest import mock
+        from local_autoreviewer import __main__ as cli
+        self.github.set_pr(1, "a" * 40)
+        started, result = threading.Event(), {}
+        view = self.github.pr_view
+
+        def pr_view(repo, number):
+            started.set()
+            return view(repo, number)
+
+        self.github.pr_view = pr_view
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=None, force=False)
+        with mock.patch.object(cli, "load_config", return_value=self.svc.config), \
+                mock.patch.object(cli, "build_services", return_value=self.svc):
+            with poll_mod.poll_lock(self.state):  # a poll is between its fetch and its apply
+                thread = threading.Thread(target=lambda: result.setdefault("r", cli.cmd_enqueue(args)))
+                thread.start()
+                self.assertFalse(started.wait(0.3))
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["r"], 0)
+        self.assertEqual(len(self.jobs("status='queued'")), 2)
+
     def test_a_failed_fetch_changes_nothing_and_releases_the_lock(self):
         from local_autoreviewer.github import GitHubError
         self.github.set_pr(1, "a" * 40)
