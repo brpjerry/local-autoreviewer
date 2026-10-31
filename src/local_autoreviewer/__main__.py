@@ -125,23 +125,23 @@ def cmd_review(args):
     svc = build_services(cfg)
     pr = svc.github.pr_view(repo_cfg.name, number)
     agents = args.agent or list(repo_cfg.agents)
-    conn = svc.connect()
-    job_ids = []
-    try:
-        for agent in agents:
-            with db.transaction(conn):
-                rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"], agent)
-                job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
-                                       base_ref=pr["baseRefName"], agent=agent, model=cfg.agents[agent].model,
-                                       source="manual", not_before=svc.now(), now=svc.now(),
-                                       post=args.post, rerun=rerun)
-                db.update_job(conn, job_id, status="running", started_at=svc.now())
-            job_ids.append(job_id)
-    finally:
-        conn.close()
+    locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
     worst = 0
     try:
-        for job_id in job_ids:
+        conn = svc.connect()
+        try:
+            for agent in agents:
+                with db.transaction(conn):
+                    rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"], agent)
+                    job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
+                                           base_ref=pr["baseRefName"], agent=agent, model=cfg.agents[agent].model,
+                                           source=pipeline.FOREGROUND, not_before=svc.now(), now=svc.now(),
+                                           post=args.post, rerun=rerun)
+                    db.update_job(conn, job_id, status="running", started_at=svc.now())
+                    locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
+        finally:
+            conn.close()
+        for job_id in locks:
             status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
             conn = svc.connect()
             job = db.get_job(conn, job_id)
@@ -155,8 +155,10 @@ def cmd_review(args):
             if status not in ("posted", "skipped"):
                 worst = 1
     finally:
-        # Jobs this command created are never left for the worker, even after Ctrl-C.
-        pipeline.abandon(svc, job_ids, "foreground review interrupted")
+        # Never leave this command's jobs for the worker, even after Ctrl-C or an error.
+        pipeline.abandon(svc, list(locks), "foreground review ended before the job finished")
+        for job_id, handle in locks.items():
+            pipeline.release_foreground_lock(svc.state, job_id, handle)
     return worst
 
 

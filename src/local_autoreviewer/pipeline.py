@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +22,9 @@ log = logging.getLogger(__name__)
 RATE_LIMIT_BACKOFF = 30 * 60
 SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
+FOREGROUND = db.FOREGROUND  # see "Foreground jobs" below
 FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
+FOREGROUND_CANCEL_POLL = 2.0
 
 
 @dataclass
@@ -109,7 +112,7 @@ def _check_pr(svc, job):
         raise Outcome("cancelled", f"PR is {pr['state'].lower()}")
     if pr["headRefOid"] != job["head_sha"]:
         raise Outcome("superseded", f"head moved to {pr['headRefOid'][:12]}")
-    if pr["isDraft"] and job["source"] != "manual":
+    if pr["isDraft"] and job["source"] not in ("manual", FOREGROUND):
         raise Outcome("cancelled", "PR is a draft")
     return pr
 
@@ -137,11 +140,78 @@ def run_job(svc, job_id, cancel):
         conn.close()
 
 
+# Foreground jobs ---------------------------------------------------------------
+# `review` runs its jobs itself. They carry source=FOREGROUND, which the worker never claims or
+# recovers, and the command holds an flock per job for as long as it owns it. The worker cancels
+# (or, mid-post, recovers) a foreground job only once that lock is free, i.e. its owner is gone.
+
+def foreground_lock_path(state, job_id):
+    return Path(state) / "locks" / f"job-{job_id}.lock"
+
+
+def hold_foreground_lock(state, job_id):
+    """Lock job_id for this process. Take it before the job's row commits, so no reader can see
+    an unlocked foreground job. The lock lasts until the returned file is closed."""
+    path = foreground_lock_path(state, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def release_foreground_lock(state, job_id, handle):
+    foreground_lock_path(state, job_id).unlink(missing_ok=True)
+    handle.close()
+
+
+@contextmanager
+def orphaned_foreground(state, job_id):
+    """Yield True, holding the job's lock, if no live process owns the foreground job."""
+    path = foreground_lock_path(state, job_id)
+    try:
+        handle = open(path, "a")
+    except OSError:
+        yield True
+        return
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+        path.unlink(missing_ok=True)
+
+
+def _watch_cancel(svc, job_id, token, done):
+    """Give a foreground run the worker's cancel semantics (a newer push, the PR closing)."""
+    while not done.wait(FOREGROUND_CANCEL_POLL):
+        conn = svc.connect()
+        try:
+            row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is not None and row["cancel_requested"]:
+            token.cancel(row["reason"] or "cancelled")
+            return
+
+
 def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None):
-    """Run a claimed job to a final state without the worker: wait out short retries in place,
-    and cancel the job rather than leave a long deferral (a usage limit) queued for the worker."""
+    """Run a foreground job (status 'running', lock held) to a final state: wait out short retries
+    in place, and cancel the job rather than wait out a long deferral such as a usage limit."""
     while True:
-        status = run_job(svc, job_id, CancelToken())
+        token, done = CancelToken(), threading.Event()
+        watcher = threading.Thread(target=_watch_cancel, args=(svc, job_id, token, done), daemon=True)
+        watcher.start()
+        try:
+            status = run_job(svc, job_id, token)
+        finally:
+            done.set()
+            watcher.join()
         if status != "queued":
             return status
         conn = svc.connect()
@@ -150,23 +220,27 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             wait = max(0, job["not_before"] - svc.now())
             if wait > FOREGROUND_MAX_WAIT:
                 return _finish(conn, svc, job_id, "cancelled",
-                               f"not waiting {wait // 60} min in the foreground; {job['reason']}")
+                               f"not waiting {-(-wait // 60)} min in the foreground; {job['reason']}")
             notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
             sleep(wait)
             with db.transaction(conn):
-                db.update_job(conn, job_id, status="running", started_at=svc.now())
+                # A push or close during the wait may have ended the job; never revive it.
+                resumed = conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=? AND status='queued'",
+                                       (svc.now(), job_id)).rowcount
+            if not resumed:
+                return db.get_job(conn, job_id)["status"]
         finally:
             conn.close()
 
 
 def abandon(svc, job_ids, reason):
-    """Cancel jobs a foreground run is leaving unfinished (for example after Ctrl-C), so a worker
-    never picks them up. A job caught mid-post is left to the worker's marker-checked recovery."""
+    """Cancel this process's foreground jobs that are still queued or running (after Ctrl-C or an
+    error). A job caught mid-post is left to the worker's marker-checked recovery."""
     conn = svc.connect()
     try:
         for job_id in job_ids:
             job = db.get_job(conn, job_id)
-            if job["status"] not in ("queued", "running"):
+            if job is None or job["status"] not in ("queued", "running"):
                 continue
             if job["scope_unit"]:
                 svc.runner.cleanup(job["scope_unit"])

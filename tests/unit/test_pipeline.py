@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import argparse
 import json
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events, pipeline
@@ -136,8 +138,24 @@ class PipelineTests(EnvTestCase):
         svc, (job_id,) = self.queue(cfg)
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
 
-    def test_foreground_waits_out_a_transient_error(self):
-        svc, (job_id,) = self.queue(post=False)
+    def foreground(self, cfg=None, agents=("claude",), post=False):
+        """Create jobs the way `review` does: source=foreground, running, lock held."""
+        svc = self.services(cfg)
+        conn = svc.connect()
+        ids = []
+        for agent in agents:
+            with db.transaction(conn):
+                job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main",
+                                       agent=agent, model="opus", source=pipeline.FOREGROUND, not_before=0,
+                                       now=self.clock(), post=post)
+                db.update_job(conn, job_id, status="running", started_at=self.clock())
+                lock = pipeline.hold_foreground_lock(self.state, job_id)
+                self.addCleanup(pipeline.release_foreground_lock, self.state, job_id, lock)
+            ids.append(job_id)
+        conn.close()
+        return svc, ids
+
+    def fail_first_pr_view(self):
         real_view, calls = self.github.pr_view, []
 
         def flaky_view(repo, number):
@@ -147,6 +165,10 @@ class PipelineTests(EnvTestCase):
             return real_view(repo, number)
 
         self.github.pr_view = flaky_view
+
+    def test_foreground_waits_out_a_transient_error(self):
+        svc, (job_id,) = self.foreground()
+        self.fail_first_pr_view()
         waits = []
 
         def sleep(seconds):
@@ -158,17 +180,91 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(self.job(svc, job_id)["attempts"], 1)
 
     def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
-        cfg = make_config(self.tmp, claude="ratelimit")
-        svc, (job_id,) = self.queue(cfg, post=False)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"))
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertIn("usage limit", self.job(svc, job_id)["reason"])
 
+    def test_worker_never_claims_a_waiting_foreground_job(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.fail_first_pr_view()
+        worker = Worker(lambda cfg: svc, None)
+
+        def sleep(seconds):
+            self.clock.advance(seconds)
+            worker.claim(svc)  # the retry is due: a worker polling now must not take it
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "posted")
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(len(self.agent_log("claude")), 1)
+        self.assertEqual(len(self.github.posted), 1)
+
+    def test_foreground_does_not_revive_a_job_superseded_during_the_wait(self):
+        svc, (job_id,) = self.foreground()
+        self.fail_first_pr_view()
+
+        def sleep(seconds):
+            self.clock.advance(seconds)
+            conn = svc.connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=sleep), "superseded")
+        self.assertEqual(self.agent_log("claude"), [])
+
+    def test_foreground_honours_a_cancel_request(self):
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="sleep"))
+        with mock.patch.object(pipeline, "FOREGROUND_CANCEL_POLL", 0.05):
+            result = {}
+            thread = threading.Thread(target=lambda: result.setdefault("s", pipeline.run_foreground(svc, job_id)))
+            thread.start()
+            deadline = time.monotonic() + 20
+            while not self.agent_log("claude") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            conn = svc.connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+            thread.join(20)
+        self.assertEqual(result["s"], "superseded")
+
     def test_abandon_cancels_only_unfinished_jobs(self):
-        svc, (done, left) = self.queue(agents=("claude", "codex"), post=False)
+        svc, (done, left) = self.foreground(agents=("claude", "codex"))
         pipeline.run_job(svc, done, pipeline.CancelToken())
-        pipeline.abandon(svc, [done, left], "foreground review interrupted")
+        pipeline.abandon(svc, [done, left], "foreground review ended before the job finished")
         self.assertEqual(self.job(svc, done)["status"], "skipped")
         self.assertEqual(self.job(svc, left)["status"], "cancelled")
+
+    def test_interrupted_review_command_leaves_nothing_for_the_worker(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=None, post=False)
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        conn = svc.connect()
+        jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual([(j["agent"], j["source"], j["status"]) for j in jobs],
+                         [("claude", pipeline.FOREGROUND, "cancelled"), ("codex", pipeline.FOREGROUND, "cancelled")])
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
+
+    def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
+        svc, (alive,) = self.foreground()
+        conn = svc.connect()
+        with db.transaction(conn):  # a `review` that was killed: its lock is gone
+            dead = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="codex",
+                                 model="", source=pipeline.FOREGROUND, not_before=0, now=self.clock(), post=False)
+            db.update_job(conn, dead, status="running", started_at=self.clock())
+        conn.close()
+        worker = Worker(lambda cfg: svc, None)
+        worker.recover(svc)
+        worker.claim(svc)
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(self.job(svc, alive)["status"], "running")
+        self.assertEqual(self.job(svc, dead)["status"], "cancelled")
 
     def test_timeout_kills_agent(self):
         cfg = make_config(self.tmp, claude="sleep", service={"review_timeout": "1s"})

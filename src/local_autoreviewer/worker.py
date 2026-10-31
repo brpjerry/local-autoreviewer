@@ -47,15 +47,41 @@ class Worker:
     def recover(self, svc):
         conn = svc.connect()
         try:
-            for job in conn.execute("SELECT * FROM jobs WHERE status='running'").fetchall():
+            # Foreground jobs belong to their `review` process; see release_orphaned_foreground().
+            for job in conn.execute("SELECT * FROM jobs WHERE status='running' AND source!=?",
+                                    (pipeline.FOREGROUND,)).fetchall():
                 if job["scope_unit"]:
                     svc.runner.cleanup(job["scope_unit"])
                 with db.transaction(conn):
                     db.update_job(conn, job["id"], status="queued", reason="requeued after worker restart",
                                   cancel_requested=0, not_before=svc.now())
                 log.info("job %s requeued after restart", job["id"])
-            for job in conn.execute("SELECT * FROM jobs WHERE status='posting'").fetchall():
+            for job in conn.execute("SELECT * FROM jobs WHERE status='posting' AND source!=?",
+                                    (pipeline.FOREGROUND,)).fetchall():
                 self.recover_posting(svc, conn, job)
+        finally:
+            conn.close()
+        self.release_orphaned_foreground(svc)
+
+    def release_orphaned_foreground(self, svc):
+        """Clean up after `review` commands that died without finishing their jobs: a job whose
+        lock nobody holds is cancelled (its scope stopped), or recovered if it was mid-post."""
+        conn = svc.connect()
+        try:
+            ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM jobs WHERE source=? AND status IN ('queued','running','posting')",
+                (pipeline.FOREGROUND,))]
+            for job_id in ids:
+                with pipeline.orphaned_foreground(svc.state, job_id) as orphaned:
+                    if not orphaned:
+                        continue
+                    job = db.get_job(conn, job_id)  # re-read under the lock: the owner may have just finished
+                    if job["status"] == "posting":
+                        self.recover_posting(svc, conn, job)
+                    elif job["status"] in ("queued", "running"):
+                        if job["scope_unit"]:
+                            svc.runner.cleanup(job["scope_unit"])
+                        pipeline._finish(conn, svc, job_id, "cancelled", "foreground review exited before finishing")
         finally:
             conn.close()
 
@@ -91,6 +117,7 @@ class Worker:
             svc = self.make_services(self.watcher.get())
             self.reap()
             self.sync_cancels(svc)
+            self.release_orphaned_foreground(svc)
             if self.upgrade_pending():
                 if not self.threads:
                     log.info("package version changed to %s; exiting to restart on new code", paths.read_version())
@@ -146,8 +173,8 @@ class Worker:
                             self.cap_logged.add((agent, day))
                         continue
                     job = conn.execute(
-                        "SELECT * FROM jobs WHERE status='queued' AND agent=? AND not_before<=? "
-                        "ORDER BY not_before, id LIMIT 1", (agent, now)).fetchone()
+                        "SELECT * FROM jobs WHERE status='queued' AND agent=? AND not_before<=? AND source!=? "
+                        "ORDER BY not_before, id LIMIT 1", (agent, now, pipeline.FOREGROUND)).fetchone()
                     if job is None:
                         continue
                     db.update_job(conn, job["id"], status="running", started_at=now, cancel_requested=0)

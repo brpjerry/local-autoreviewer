@@ -119,6 +119,17 @@ class ManualIngestTests(EnvTestCase):
         self.assertEqual(self.ingest(force=True), [])  # still in flight: no duplicate
         self.assertEqual(len(self.ingest(agents=("claude",))), 0)
 
+    def test_a_foreground_review_does_not_count_as_reviewed(self):
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):  # a no-post `review` trial of the same head
+            trial = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="claude",
+                                  model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=False)
+            db.update_job(conn, trial, status="skipped")
+        conn.close()
+        self.assertEqual(len(self.ingest(agents=("claude",))), 1)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+
     def test_unconfigured_repo_ignored(self):
         svc = self.services()
         event = events.PrEvent(repo="x/y", number=1, action="opened", head_sha="a" * 40, base_ref="main",

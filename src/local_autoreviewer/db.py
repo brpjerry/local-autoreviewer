@@ -9,6 +9,7 @@ from pathlib import Path
 ACTIVE = ("queued", "running", "posting")
 FINAL = ("posted", "failed", "superseded", "cancelled", "skipped", "blocked")
 STATUSES = ACTIVE + FINAL
+FOREGROUND = "foreground"  # job source for `review`, which runs its jobs itself, never the worker
 
 MIGRATIONS = [
     # 1: initial schema. Times are integer Unix seconds (UTC).
