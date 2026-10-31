@@ -14,7 +14,7 @@ This is a follow-up, not a new review. You have two jobs, and only these:
 ## Where things are
 
 - `$worktree`: the repository checked out at $head_sha (read-only). Agent instruction files (CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, .mcp.json) were removed from this checkout on purpose.
-- `$context/since-review.diff`: what changed between $previous_sha and $head_sha.
+- `$context/since-review.diff`: what the PR itself changed since $previous_sha. Base-branch commits merged or rebased in since then are left out, so it can differ from a plain `git diff $previous_sha $head_sha`; don't review those base changes.
 - `$context/previous-findings.json`: the previous findings, with the edits proposed for them.
 - `$context/pr.diff`: the whole PR against its base, for line numbers and context.
 - `$context/pr.json`, `$context/commits.txt`, `$context/files.txt`: the PR's description, commits and changed files.

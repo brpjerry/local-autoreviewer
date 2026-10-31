@@ -2,6 +2,7 @@
 """Follow-up reviews: a later head is checked against the previous round's findings and for regressions."""
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +87,39 @@ class FollowupTests(EnvTestCase):
         diff = self.context(second, "since-review.diff").read_text()
         self.assertIn("raise ValueError", diff)
         self.assertNotIn("BASE_ONLY", diff)
+
+    def test_a_conflicting_base_merge_means_a_full_review(self):
+        self.review_at(self.head_a)
+        work = self.remote.work
+        git("checkout", "-q", "main", cwd=work)
+        self.remote.write("src/calc.py", "def divide(a, b):\n    return a / b  # checked upstream\n")
+        self.remote.commit("main changes the same line")
+        git("push", "-q", str(self.remote.bare), "main", cwd=work)
+        git("checkout", "-q", "pr1", cwd=work)
+        subprocess.run(["git", "merge", "--no-edit", "main"], cwd=work, capture_output=True)  # conflicts
+        self.remote.write("src/calc.py", FIXED)  # the author resolves it
+        head = self.remote.commit("merge main")
+        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
+        second, status = self.review_at(head)
+        self.assertEqual(status, "posted")
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
+
+    def test_a_followup_too_large_for_the_limits_means_a_full_review(self):
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), repo_extra={"max_diff_bytes": 10_000}))
+        first, status = self.review_at(self.remote.push_pr(1, {"data.txt": "x\n" * 2_500}))  # a 7.5 KB diff
+        self.assertEqual(status, "posted")
+        work = self.remote.work
+        git("checkout", "-q", "pr1", cwd=work)
+        git("rm", "-q", "data.txt", cwd=work)  # the PR drops it again
+        self.remote.write("other.txt", "y\n" * 1_000)
+        head = self.remote.commit("swap the data")
+        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
+        git("checkout", "-q", "main", cwd=work)
+        # The PR's diff (3 KB) is within the limit; the change since the review (10.5 KB) isn't.
+        second, status = self.review_at(head)
+        self.assertEqual(status, "posted")
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
+        self.assertFalse(self.context(second, "since-review.diff").exists())
 
     def test_a_chain_of_followups_carries_the_open_issues(self):
         self.review_at(self.head_a)

@@ -456,19 +456,28 @@ def _run(conn, svc, job, cancel):
             log.info("job %s: previous head %s is gone from the mirror; doing a full review", job["id"],
                      previous.head_sha[:12])
             previous = None
-        diff_bytes, changed_files = ctx.diff_bytes, ctx.changed_files
+        start = svc.git.since_review_start(mirror, previous.head_sha, job["head_sha"], base_sha) if previous else None
+        if previous and start is None:
+            log.info("job %s: a conflicting merge or rebase mixes the PR's changes since %s with its base's; doing a "
+                     "full review", job["id"], previous.head_sha[:12])
+            previous = None
         if previous:
             since_bytes, since_files = svc.git.write_followup_context(
-                mirror, previous.head_sha, job["head_sha"], base_sha, paths.context, exclude=repo_cfg.diff_exclude,
+                mirror, start, job["head_sha"], paths.context, exclude=repo_cfg.diff_exclude,
                 previous=previous.for_agent())
-            diff_bytes, changed_files = max(diff_bytes, since_bytes), max(changed_files, since_files)
+            if since_bytes > repo_cfg.max_diff_bytes or since_files > repo_cfg.max_changed_files:
+                log.info("job %s: the changes since %s are too large for a follow-up; doing a full review", job["id"],
+                         previous.head_sha[:12])
+                for name in ("since-review.diff", "previous-findings.json"):
+                    Path(paths.context, name).unlink(missing_ok=True)
+                previous = None
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))
     with db.transaction(conn):
         db.update_job(conn, job["id"], base_sha=base_sha, workdir=paths.root)
 
-    if changed_files > repo_cfg.max_changed_files or diff_bytes > repo_cfg.max_diff_bytes:
-        reason = (f"PR too large for automated review: {changed_files} files, {diff_bytes} diff bytes "
+    if ctx.changed_files > repo_cfg.max_changed_files or ctx.diff_bytes > repo_cfg.max_diff_bytes:
+        reason = (f"PR too large for automated review: {ctx.changed_files} files, {ctx.diff_bytes} diff bytes "
                   f"(limits {repo_cfg.max_changed_files} files, {repo_cfg.max_diff_bytes} bytes)")
         if job["post"]:
             body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])
