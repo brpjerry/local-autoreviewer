@@ -257,6 +257,52 @@ class PipelineTests(EnvTestCase):
                 self.failing_post(message)
                 self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
 
+    def test_definite_refusals_and_other_errors(self):
+        for message, rejected in (("gh: Bad credentials (HTTP 401)", True), ("gh: Not Found (HTTP 404)", True),
+                                  ("gh: Validation Failed (HTTP 422)", True), ("gh api repos/o/r timed out", False),
+                                  ("gh: Server Error (HTTP 500)", False)):
+            with self.subTest(message=message):
+                self.assertEqual(pipeline._rejected(GitHubError(message)), rejected)
+
+    def test_a_cancel_wins_over_a_failing_lookup(self):
+        svc, (job_id,) = self.queue()
+        self.failing_post("gh api repos/o/r timed out")
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posting")
+
+        def failing_lookup(*args):
+            raise GitHubError("gh api repos/o/r timed out")
+
+        self.github.find_marked_review = failing_lookup
+        conn = svc.connect()
+        with db.transaction(conn):
+            events.stop_jobs(conn, REPO, 1, "cancelled", "PR closed")
+        conn.close()
+        self.clock.advance(pipeline.POST_RECOVERY_RETRY)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+
+    def test_ctrl_c_while_waiting_to_retry_a_post_leaves_it_to_the_worker(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+
+        def interrupted(seconds):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            pipeline.run_foreground(svc, job_id, sleep=interrupted)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+    def test_a_lock_on_a_deleted_file_is_not_the_lock(self):
+        lock = pipeline.hold_foreground_lock(self.state, 7)
+        try:
+            self.assertTrue(pipeline._same_file(lock, pipeline.foreground_lock_path(self.state, 7)))
+            pipeline.foreground_lock_path(self.state, 7).unlink()
+            self.assertFalse(pipeline._same_file(lock, pipeline.foreground_lock_path(self.state, 7)))
+        finally:
+            lock.close()
+
     def test_post_failures_end_after_max_attempts(self):
         svc, (job_id,) = self.queue(make_config(self.tmp, service={"max_attempts": 2}))
         self.failing_post("gh api repos/o/r failed: HTTP 502: Bad Gateway")
@@ -375,6 +421,7 @@ class PipelineTests(EnvTestCase):
                                is_draft=False, author=OWNER, source="poll", agents=("claude",))
         conn = svc.connect()
         with db.transaction(conn):  # the running `review --post` counts as this head's review
+            events.record(conn, event, self.clock())
             self.assertEqual(events.ingest(conn, svc.config, event, now=self.clock(), token_owner=OWNER), [])
         conn.close()
         pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")  # Ctrl-C
@@ -401,6 +448,46 @@ class PipelineTests(EnvTestCase):
             db.update_job(conn, job_id, status=status)
         conn.close()
         return job_id
+
+    def poll_saw(self, svc, head):
+        event = events.PrEvent(repo=REPO, number=1, action="synchronize", head_sha=head, base_ref="main",
+                               is_draft=False, author=OWNER, source="poll")
+        conn = svc.connect()
+        with db.transaction(conn):
+            events.record(conn, event, self.clock())
+        conn.close()
+
+    def poll_jobs(self, svc):
+        conn = svc.connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM jobs WHERE source='poll'").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_no_hand_back_for_a_head_that_was_only_baselined(self):
+        self.seen_by_poller(self.head)  # recorded, but bootstrap = "baseline" produced no event
+        svc, (job_id,) = self.foreground(post=True)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)
+
+    def test_no_hand_back_for_an_agent_the_repo_does_not_use(self):
+        self.seen_by_poller(self.head)
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, agent="codex")  # `review --agent codex`
+        conn.close()
+        self.poll_saw(svc, self.head)
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)
+
+    def test_a_usage_limit_cancel_hands_the_head_back(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        self.poll_saw(svc, self.head)
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
+        self.assertEqual(self.poll_jobs(svc), 1)
 
     def test_hand_back_leaves_other_jobs_alone(self):
         self.seen_by_poller(self.head)  # the poller hasn't seen the newer push yet

@@ -60,9 +60,9 @@ def stop_jobs(conn, repo, number, status, reason, *, agent=None, keep=None):
 def requeue_for_service(conn, cfg, job, *, now, token_owner):
     """Queue the review the poller would have queued for a cancelled `review --post` job's head:
     while that job was active it counted as the head's review, so a poll that saw the head skipped
-    it. Only that one job is added, under the poller's rules, and only if no other job already covers
-    the head; nothing else is superseded. Does nothing if the poller hasn't seen the head, since its
-    next poll will. Returns the new job id or None."""
+    it. Only when a poll really did that (it recorded a review event for the head after the job was
+    created; a baselined PR has none), only under the poller's rules, and only if no other job
+    already covers the head. Nothing else is superseded. Returns the new job id or None."""
     repo_cfg = cfg.repo(job["repo"])
     row = conn.execute("SELECT * FROM prs WHERE repo=? AND number=? AND state='open'",
                        (job["repo"], job["number"])).fetchone()
@@ -77,6 +77,12 @@ def requeue_for_service(conn, cfg, job, *, now, token_owner):
          db.FOREGROUND)).fetchone()
     if covered:
         return None
+    skipped_by_poll = conn.execute(
+        f"SELECT 1 FROM events WHERE source='poll' AND repo=? AND number=? AND head_sha=? AND received_at>=?"
+        f" AND action IN ({','.join('?' * len(REVIEW_ACTIONS))})",
+        (job["repo"], job["number"], job["head_sha"], job["created_at"], *REVIEW_ACTIONS)).fetchone()
+    if not skipped_by_poll:
+        return None  # the poll that sees this head next will review it, or it was only baselined
     job_id = db.insert_job(
         conn, repo=job["repo"], number=job["number"], head_sha=job["head_sha"], base_ref=job["base_ref"],
         agent=job["agent"], model=cfg.agents[job["agent"]].model, source="poll",

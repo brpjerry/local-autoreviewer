@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -159,13 +160,27 @@ def hold_foreground_lock(state, job_id):
     an unlocked foreground job. The lock lasts until the returned file is closed."""
     path = foreground_lock_path(state, job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BaseException:
+    while True:
+        handle = open(path, "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Lock files are unlinked while locked; if that happened between open and flock, this
+            # lock is on a deleted file that nobody else can see, so try again on the current one.
+            if _same_file(handle, path):
+                return handle
+        except BaseException:
+            handle.close()
+            raise
         handle.close()
-        raise
-    return handle
+
+
+def _same_file(handle, path):
+    try:
+        current = os.stat(path)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(handle.fileno())
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
 
 
 def release_foreground_lock(state, job_id, handle):
@@ -467,7 +482,9 @@ def recover_post(conn, svc, job):
     try:
         existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
     except GitHubError as exc:
-        return post_failed(conn, svc, job, exc)
+        if not db.get_job(conn, job["id"])["cancel_requested"]:
+            return post_failed(conn, svc, job, exc)
+        existing = None  # a push or close ended the job: don't wait on GitHub any longer
     if existing:
         return _finish(conn, svc, job["id"], "posted", "review found after an interrupted post",
                        posted_at=svc.now(), review_id=existing.get("id"), review_url=existing.get("html_url"))

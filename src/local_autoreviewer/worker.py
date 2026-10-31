@@ -212,7 +212,9 @@ class Worker:
         for _thread, token, _agent in self.threads.values():
             token.cancel("shutdown")
         for job_id, (thread, _token, _agent) in list(self.threads.items()):
-            thread.join(timeout=130)  # a post recovery's gh call can take up to 120 s
+            # Best effort: one post recovery can make several gh calls of up to 120 s each. Being
+            # killed mid-post is safe, because the next recovery checks for the review's marker.
+            thread.join(timeout=130)
             if thread.is_alive():
                 log.warning("job %s did not stop in time", job_id)
 
