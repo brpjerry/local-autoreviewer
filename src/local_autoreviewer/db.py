@@ -7,7 +7,8 @@ import sqlite3
 import time
 from pathlib import Path
 
-ACTIVE = ("queued", "running", "posting")
+# waiting: the review is ready and waits for the other reviews of its commit, to be posted with them.
+ACTIVE = ("queued", "running", "waiting", "posting")
 FINAL = ("posted", "failed", "superseded", "cancelled", "skipped", "blocked")
 STATUSES = ACTIVE + FINAL
 # Job sources: "poll" and "webhook" (a trigger), "manual" (`enqueue`, run by the worker), and FOREGROUND.
@@ -72,6 +73,13 @@ MIGRATIONS = [
         finding_id INTEGER NOT NULL REFERENCES findings (id), status TEXT NOT NULL,
         detail TEXT NOT NULL DEFAULT '', UNIQUE (job_id, finding_id));
     CREATE INDEX resolutions_finding ON resolutions (finding_id);
+    """,
+    # 5: the reviews of a commit are posted as one, with the items several reviewers reported merged;
+    # posted_with is the job whose post carries this job's review. And a reviewer may call a PR trivial.
+    """
+    ALTER TABLE jobs ADD COLUMN posted_with INTEGER;
+    ALTER TABLE jobs ADD COLUMN trivial INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE findings ADD COLUMN duplicate_of INTEGER REFERENCES findings (id);
     """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -171,6 +179,8 @@ DISPOSITIONS = ("fixed", "declined", "false-positive", "duplicate", "deferred")
 def record_review(conn, job_id, review, *, effort=None, prompt_version=None, followup_of=None):
     """Keep a validated review's contents for analysis, replacing any earlier record for the job. A
     follow-up (followup_of: the previous head) records its regressions and each previous finding's status."""
+    conn.execute("UPDATE findings SET duplicate_of=NULL WHERE duplicate_of IN (SELECT id FROM findings WHERE job_id=?)",
+                 (job_id,))
     conn.execute("DELETE FROM resolutions WHERE job_id=?", (job_id,))
     conn.execute("DELETE FROM findings WHERE job_id=?", (job_id,))
     kind = "regression" if followup_of else "finding"
@@ -190,7 +200,7 @@ def record_review(conn, job_id, review, *, effort=None, prompt_version=None, fol
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     conn.executemany("INSERT INTO resolutions (job_id, finding_id, status, detail) VALUES (?, ?, ?, ?)",
                      [(job_id, r["finding"], r["status"], r["detail"]) for r in review.get("resolutions") or []])
-    known = {"effort": effort, "prompt_version": prompt_version}
+    known = {"effort": effort, "prompt_version": prompt_version, "trivial": int(bool(review.get("trivial")))}
     if followup_of:
         known.update(review_kind="followup", followup_of=followup_of)
     update_job(conn, job_id, summary=review["summary"], review_recorded=1,

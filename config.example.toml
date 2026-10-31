@@ -10,6 +10,8 @@ settle = "3m"              # wait after the last push, so a burst of pushes yiel
 max_reviews_per_day = 30   # per agent; protects your interactive subscription budget
 bootstrap = "baseline"     # "baseline": a newly added repo's existing PRs are not reviewed; "review": they are
 retain_jobs = "14d"        # job checkouts are kept this long for `resume` / `ask`
+combine_wait = "30m"       # a finished review waits this long for the other agent's review of the same commit,
+                           # so both are posted as one; "0s" posts each review on its own
 # max_attempts = 3
 
 [defaults]                 # every [[repo]] inherits these and may override any of them

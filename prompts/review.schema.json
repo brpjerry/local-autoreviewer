@@ -1,11 +1,15 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "findings", "test_gaps", "questions", "nits"],
+  "required": ["summary", "trivial", "findings", "test_gaps", "questions", "nits"],
   "properties": {
     "summary": {
       "type": "string",
       "description": "2-6 sentences: what the PR does, overall assessment, and the most important risks."
+    },
+    "trivial": {
+      "type": "boolean",
+      "description": "true if the PR is trivial and you ended the review early, false after a full review."
     },
     "findings": {
       "type": "array",

@@ -99,10 +99,12 @@ class PipelineTests(EnvTestCase):
 
     def test_both_agents(self):
         svc, ids = self.queue(agents=("claude", "codex"))
-        for job_id in ids:
-            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        self.assertEqual(pipeline.run_job(svc, ids[0], pipeline.CancelToken()), "waiting")  # for Codex's review
+        self.assertEqual(pipeline.run_job(svc, ids[1], pipeline.CancelToken()), "posted")
         self.assertEqual(self.job(svc, ids[1])["session_id"], "thread-123")
-        self.assertIn("Automated review · Codex", self.github.posted[1]["body"])
+        (posted,) = self.github.posted  # one post for both
+        self.assertIn("Automated review · Claude Code (opus) and Codex (opus)", posted["body"])
+        self.assertEqual({self.job(svc, job_id)["review_id"] for job_id in ids}, {posted["id"]})
 
     def test_head_moved_before_post_is_not_posted(self):
         svc, (job_id,) = self.queue()
@@ -841,9 +843,17 @@ class PipelineTests(EnvTestCase):
 
         self.github.pr_view = pr_view
         args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
+
+        def skipped(svc_, job_id, **kwargs):
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="skipped")
+            conn.close()
+            return "skipped"
+
         with mock.patch.object(cli, "load_config", return_value=self.cfg), \
                 mock.patch.object(cli, "build_services", return_value=svc), \
-                mock.patch.object(pipeline, "run_foreground", return_value="skipped"):
+                mock.patch.object(pipeline, "run_foreground", side_effect=skipped):
             with poll_mod.poll_lock(self.state):  # a poll is between its fetch and its apply
                 thread = threading.Thread(target=lambda: result.setdefault("r", cli.cmd_review(args)))
                 thread.start()
@@ -1131,7 +1141,7 @@ class WorkerTests(EnvTestCase):
             worker.stop.set()
             thread.join(30)
         self.assertEqual({j["agent"] for j in jobs}, {"claude", "codex"})
-        self.assertEqual(len(self.github.posted), 2)
+        self.assertEqual(len(self.github.posted), 1)  # together
         status = json.loads((self.state / "status.json").read_text())
         self.assertEqual(status["counts"], {"posted": 2})
 

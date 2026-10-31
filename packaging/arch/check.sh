@@ -16,6 +16,8 @@ expected=(
     /usr/share/local-autoreviewer/prompts/review.md
     /usr/share/local-autoreviewer/prompts/review.schema.json
     /usr/share/local-autoreviewer/prompts/followup.md
+    /usr/share/local-autoreviewer/prompts/duplicates.md
+    /usr/share/local-autoreviewer/prompts/duplicates.schema.json
     /usr/share/local-autoreviewer/VERSION
     /usr/lib/systemd/user/autoreviewer.slice
     /usr/lib/systemd/user/local-autoreviewer-worker.service

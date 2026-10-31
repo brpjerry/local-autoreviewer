@@ -6,11 +6,14 @@ It needs no inbound connectivity: a systemd timer polls GitHub every 2 minutes, 
 
 ```text
 poll.timer → poll → events → ingest (your PRs, no drafts, dedupe, settle, supersede) → job queue
-worker → fetch PR head → checkout (agent files removed) → claude -p / codex exec (limited scope) → render → token scan → post
+worker → fetch PR head → checkout (agent files removed) → claude -p / codex exec (limited scope) → render → token scan
+       → wait for the other agent's review → duplicate check → one post
 ```
 
-For each update to one of your open PRs on a configured repo, every enabled agent posts one review: Claude Code and Codex by default.
+For each update to one of your open PRs on a configured repo, every enabled agent reviews it (Claude Code and Codex by default), and the reviews are posted together as one.
 - **Format:** a `COMMENT` review pinned to the reviewed commit.
+- **One post:** a finished review waits for the other agent's review of the same commit, for up to `combine_wait` (30 minutes). The agent that finishes last then checks both reviews for duplicates: an issue both reported appears once, credited to both, and every item says which reviewer found it. A review is posted on its own when the other one failed or comes later than that, and with `combine_wait = "0s"`. If the duplicate check fails, both reviews are posted in full, with a note.
+- **Trivial PRs:** a reviewer may judge a PR trivial (it only changes strings, comments or docs, bumps a version or renames something) and end the review early, after checking the change itself. The review says so.
 - **Coverage:** correctness, security, design, performance, missing tests and readability. Findings are ranked Blocker / Major / Minor, and nits are collapsed.
 - **Fixes:** each finding comes with the exact proposed change. Changes within the PR's diff are posted as GitHub suggested changes, which you apply with **Commit suggestion**; the review body shows every change as a diff too. Each change carries the text it replaces, so one whose line numbers are a little off is moved to where that text is, and one whose text isn't in the file is left out rather than applied to the wrong lines.
 - **Severity:** reviewers rate each finding's impact from 0 to 10, its likelihood and its trigger, and severity follows from impact. Then two adjustments apply to anything below Blocker: a fix that removes lines outside the tests (`test_paths`) moves the finding up a level, and a fix the reviewer rates less readable moves it down two, as far as Nit.
@@ -70,7 +73,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
    ```sh
    local-autoreviewer review you/repo#12
    ```
-   The review is written to `~/.local/state/local-autoreviewer/jobs/<id>/out/review.md`. Add `--post` to post it.
+   Each agent's review is written to `~/.local/state/local-autoreviewer/jobs/<id>/out/review.md`, and the two merged as they would be posted to the last job's `out/round.md`. Add `--post` to post them.
 6. **Enable:**
    ```sh
    systemctl --user enable --now local-autoreviewer-worker.service local-autoreviewer-poll.timer
@@ -100,8 +103,8 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 ## Review data
 
 Every review that passes the credential scan is also recorded in the state database, so you can see over time what the reviewers find and what is worth acting on:
-- **Per review:** the agent, model, effort, a hash of the prompt and schema, and the summary.
-- **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen). Also recorded: the proposed edits (whether each was a one-click suggestion, and whether it matched its stated lines, was moved or was left out), the readability rating, the net change in non-test lines, and the severity before and after the adjustments. Follow-ups record each previous finding's status (`resolutions`) and their regressions (kind `regression`), so you can see which fixes worked without triaging by hand.
+- **Per review:** the agent, model, effort, a hash of the prompt and schema, the summary, whether the reviewer judged the PR trivial, and which job's post carried it (`posted_with`).
+- **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen). Also recorded: the proposed edits (whether each was a one-click suggestion, and whether it matched its stated lines, was moved or was left out), the readability rating, the net change in non-test lines, and the severity before and after the adjustments. Follow-ups record each previous finding's status (`resolutions`) and their regressions (kind `regression`), so you can see which fixes worked without triaging by hand. Each review is kept as its reviewer wrote it; an item the duplicate check merged into another reviewer's has `duplicate_of` set, and isn't asked about again in a follow-up.
 - **Afterwards:** `triage` records your own impact rating, what was done (`fixed`, `declined`, `false-positive`, `duplicate`, `deferred`), the fixing commit and a note.
 
 `findings --json` exports everything, including the job's commit, so the rounds of review on a PR can be reconstructed. Housekeeping also records reviews saved before this existed, and an expired job loses its checkout but keeps its `out/` directory.
@@ -133,8 +136,9 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 - A timeout or a newer push stops the scope, which kills the whole process tree.
 
 **Before posting:**
+- The duplicate check runs the agent with the same locked-down flags as its review, in the same checkout.
 - The review is rebuilt from structured output. HTML comments are escaped, @mentions neutralized, embedded images dropped, and the body capped at 65,536 characters.
-- It is scanned for credential patterns, and for exact, base64, hex and reversed copies of the GitHub token and the local Claude and Codex credentials. A match marks the job `blocked`, and nothing is posted.
+- It is scanned for credential patterns (each review, and again the merged post), and for exact, base64, hex and reversed copies of the GitHub token and the local Claude and Codex credentials. A match marks the job `blocked`, and nothing is posted.
 - The PR head is re-checked immediately before posting, so a review of a superseded commit is never posted.
 
 ## Files
@@ -145,7 +149,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.config/local-autoreviewer/github-token` | Fine-grained token (0600) |
 | `~/.local/state/local-autoreviewer/state.sqlite3` | PR snapshots, events, jobs |
 | `~/.local/state/local-autoreviewer/status.json` | Snapshot written by the worker |
-| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md), kept |
+| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md, and for the job that posted several reviews round.md and the duplicate check's output), kept |
 | `~/.local/state/local-autoreviewer/mirrors/` | One bare mirror per repo |
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |

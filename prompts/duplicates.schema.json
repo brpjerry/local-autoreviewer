@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["duplicates"],
+  "properties": {
+    "duplicates": {
+      "type": "array",
+      "description": "Each set of items from different reviewers that report the same problem. Empty if none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ids", "reason"],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "description": "The ids of the items in the set, at least two.",
+            "items": {"type": "string"}
+          },
+          "reason": {"type": "string", "description": "Why they report the same problem, in one sentence."}
+        }
+      }
+    }
+  }
+}
