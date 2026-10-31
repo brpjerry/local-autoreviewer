@@ -67,7 +67,13 @@ def ingest(conn, cfg, event, *, now, token_owner):
 
     if event.action in STOP_ACTIONS or (event.is_draft and event.source != "manual"):
         reason = "PR closed" if event.action == "closed" else "PR is a draft"
-        stopped = stop_jobs(conn, repo, event.number, "cancelled", reason)
+
+        def requested_for_this_head(job):
+            # `enqueue` and `review` may review a draft on purpose; only a close or a new head stops them.
+            return (event.action != "closed" and job["source"] in ("manual", db.FOREGROUND)
+                    and job["head_sha"] == event.head_sha)
+
+        stopped = stop_jobs(conn, repo, event.number, "cancelled", reason, keep=requested_for_this_head)
         if stopped:
             log.info("%s#%s %s: cancelled jobs %s", repo, event.number, event.action, stopped)
         return []

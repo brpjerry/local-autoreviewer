@@ -159,6 +159,41 @@ class ManualIngestTests(EnvTestCase):
         self.assertEqual(self.ingest(agents=("claude",)), [])
         self.assertEqual(self.ingest(agents=("claude",), force=True), [])
 
+    def test_a_draft_poll_keeps_reviews_requested_for_that_draft(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            enqueued = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="codex",
+                                     model="", source="manual", not_before=0, now=self.clock())
+
+        def poll_sees(head, action="synchronize"):
+            event = events.PrEvent(repo=REPO, number=9, action=action, head_sha=head, base_ref="main",
+                                   is_draft=True, author=OWNER, source="poll")
+            with db.transaction(conn):
+                events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+            return {row["agent"]: (row["status"], row["cancel_requested"])
+                    for row in conn.execute("SELECT * FROM jobs WHERE number=9")}
+
+        try:
+            self.assertEqual(poll_sees("a" * 40), {"claude": ("running", 0), "codex": ("queued", 0)})
+            self.assertEqual(poll_sees("b" * 40), {"claude": ("running", 1), "codex": ("cancelled", 0)})
+        finally:
+            conn.close()
+        self.assertIsNotNone(enqueued)
+
+    def test_closing_a_draft_stops_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="closed", head_sha="a" * 40, base_ref="main",
+                               is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 1))
+
     def test_unconfigured_repo_ignored(self):
         svc = self.services()
         event = events.PrEvent(repo="x/y", number=1, action="opened", head_sha="a" * 40, base_ref="main",
