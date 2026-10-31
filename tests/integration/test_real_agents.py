@@ -84,8 +84,11 @@ class RealAgentTests(EnvTestCase):
         in_checkout = [f for f in findings if f["file"] and (checkout / f["file"]).is_file()]
         if in_checkout:
             self.assertTrue(any(json.loads(f["edits"]) for f in in_checkout), "no finding came with a proposed change")
+        anchors = [e["anchor"] for f in findings for e in json.loads(f["edits"])]
+        self.assertNotIn("unverified", anchors)  # every edit came with the text it replaces
         print(f"findings with edits: {sum(bool(json.loads(f['edits'])) for f in findings)}/{len(findings)}, "
-              f"inline suggestions: {len(self.github.posted[-1]['comments'])}")
+              f"inline suggestions: {len(self.github.posted[-1]['comments'])}, "
+              f"anchors: {dict((a, anchors.count(a)) for a in sorted(set(anchors)))}")
         return job
 
     @unittest.skipUnless("claude" in ENABLED, "claude not requested")

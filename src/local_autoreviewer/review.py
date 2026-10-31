@@ -199,9 +199,14 @@ def _edits(raw):
         if not 1 <= start <= end:
             continue
         edit = {"file": item["file"], "start_line": start, "end_line": end, "replacement": item["replacement"]}
+        if isinstance(item.get("current"), str):
+            edit["current"] = item["current"]
         if isinstance(item.get("original"), list):  # from a saved review
             edit["original"] = [str(line) for line in item["original"]]
             edit["inline"] = bool(item.get("inline"))
+            edit["anchor"] = str(item.get("anchor") or "unverified")
+            if isinstance(item.get("stated"), list) and len(item["stated"]) == 2:
+                edit["stated"] = [_int(n) for n in item["stated"]]
         edits.append(edit)
     return edits[:suggestions.MAX_EDITS]
 
@@ -253,7 +258,11 @@ def _proposed_changes(edits):
     """Each proposed change as a collapsed diff, so the review stands on its own without its inline
     suggestions. The diff is code; only marker-like HTML comments are broken up."""
     lines = []
-    for edit in edits:
+    dropped = len(edits) - len(suggestions.applied(edits))
+    if dropped:
+        lines.append(f"_{dropped} proposed change{'s' if dropped > 1 else ''} didn't match the file and "
+                     f"{'were' if dropped > 1 else 'was'} left out._")
+    for edit in suggestions.applied(edits):
         span = f"{edit['start_line']}" if edit["start_line"] == edit["end_line"] else \
             f"{edit['start_line']}–{edit['end_line']}"
         where = clean(f"{edit['file']}:{span}", 300)

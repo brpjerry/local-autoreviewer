@@ -79,6 +79,21 @@ class RenderTests(unittest.TestCase):
         self.assertIn("2. **Clever**", nits)
         self.assertIn("lowered from major: less readable", nits)
 
+    def test_render_leaves_out_dropped_edits(self):
+        def change(line, anchor, **extra):
+            return {"file": "a.py", "start_line": line, "end_line": line, "replacement": f"new{line}",
+                    "current": f"old{line}", "original": [] if anchor == "dropped" else [f"old{line}"],
+                    "inline": False, "anchor": anchor, **extra}
+        finding = dict(SAMPLE["findings"][0],
+                       edits=[change(3, "moved", stated=[4, 4]), change(9, "dropped", stated=[9, 9])])
+        data = review.validate(dict(SAMPLE, findings=[finding]))
+        self.assertEqual([(e["anchor"], e.get("stated"), e["current"]) for e in data["findings"][0]["edits"]],
+                         [("moved", [4, 4], "old3"), ("dropped", [9, 9], "old9")])  # a saved review loads back
+        body = self.render(dict(SAMPLE, findings=[finding]))
+        self.assertIn("Proposed change to <code>a.py:3</code>", body)
+        self.assertIn("1 proposed change didn't match the file and was left out.", body)
+        self.assertNotIn("new9", body)
+
     def test_prompt_version(self):
         self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")
         self.assertEqual(review.prompt_version(), review.prompt_version())

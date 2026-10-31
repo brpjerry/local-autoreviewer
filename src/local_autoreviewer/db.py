@@ -198,8 +198,10 @@ def record_review(conn, job_id, review, *, effort=None, prompt_version=None, fol
 
 
 def _edits_json(item):
-    """A finding's or nit's proposed edits, as recorded: where, what, and whether it was a one-click suggestion."""
-    return json.dumps([{key: edit.get(key) for key in ("file", "start_line", "end_line", "replacement", "inline")}
+    """A finding's or nit's proposed edits, as recorded: where, what, whether it was a one-click suggestion,
+    and how it was placed (see suggestions.check_edit)."""
+    return json.dumps([{key: edit.get(key) for key in ("file", "start_line", "end_line", "replacement", "inline",
+                                                        "current", "anchor", "stated")}
                        for edit in item.get("edits") or []])
 
 

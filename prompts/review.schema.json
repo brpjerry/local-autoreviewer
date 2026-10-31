@@ -42,6 +42,7 @@
                 "file",
                 "start_line",
                 "end_line",
+                "current",
                 "replacement"
               ],
               "properties": {
@@ -56,6 +57,10 @@
                 "end_line": {
                   "type": "integer",
                   "description": "Last line replaced (inclusive)."
+                },
+                "current": {
+                  "type": "string",
+                  "description": "The exact text of those lines as they are now, copied from the file: every line, with its indentation."
                 },
                 "replacement": {
                   "type": "string",
@@ -102,6 +107,7 @@
                 "file",
                 "start_line",
                 "end_line",
+                "current",
                 "replacement"
               ],
               "properties": {
@@ -116,6 +122,10 @@
                 "end_line": {
                   "type": "integer",
                   "description": "Last line replaced (inclusive)."
+                },
+                "current": {
+                  "type": "string",
+                  "description": "The exact text of those lines as they are now, copied from the file: every line, with its indentation."
                 },
                 "replacement": {
                   "type": "string",
