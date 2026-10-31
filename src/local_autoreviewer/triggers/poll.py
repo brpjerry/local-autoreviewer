@@ -38,7 +38,11 @@ def poll_lock(state):
     path = Path(state) / "poll.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log.info("another poll is running; waiting for it to finish")
+            fcntl.flock(handle, fcntl.LOCK_EX)
         yield
 
 
@@ -88,7 +92,7 @@ def poll_repo(conn, svc, repo_cfg, now, prs, gone):
             continue
         pr = gone.get(number)
         if pr is None or pr["state"] == "OPEN":
-            continue  # still open, or not yet confirmed: the next poll looks again
+            continue  # still open; or, defensively, became known as open after fetch_repo ran
         conn.execute("UPDATE prs SET state='closed', last_seen_at=? WHERE repo=? AND number=?", (now, repo, number))
         produced.append(PrEvent(repo=repo, number=number, action="closed", head_sha=pr["headRefOid"],
                                 base_ref=pr["baseRefName"], is_draft=pr["isDraft"], author=pr_author(pr),

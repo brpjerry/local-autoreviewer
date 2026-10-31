@@ -75,10 +75,24 @@ class PollTests(EnvTestCase):
             thread.start()
             self.assertFalse(started.wait(0.3))
         thread.join(10)
+        self.assertFalse(thread.is_alive())
         self.assertTrue(started.is_set())
         self.assertEqual(result["r"][1], 0)
 
-    def test_pr_opened_between_fetch_and_apply_is_left_for_the_next_poll(self):
+    def test_a_failed_fetch_changes_nothing_and_releases_the_lock(self):
+        from local_autoreviewer.github import GitHubError
+        self.github.set_pr(1, "a" * 40)
+        self.poll()
+        self.github.set_pr(1, "a" * 40, state="CLOSED")
+        real_view = self.github.pr_view
+        self.github.pr_view = lambda repo, number: (_ for _ in ()).throw(GitHubError("HTTP 502"))
+        results, failures = poll_mod.poll(self.svc)
+        self.assertEqual((results, failures), ({}, 1))
+        self.assertEqual(len(self.jobs("status='queued'")), 2)  # the open PR's jobs are untouched
+        self.github.pr_view = real_view
+        self.assertEqual(self.poll(), [(1, "closed")])  # lock released: the next poll runs
+
+    def test_an_unconfirmed_open_pr_is_left_for_the_next_poll(self):
         conn = self.svc.connect()
         with db.transaction(conn):
             conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
