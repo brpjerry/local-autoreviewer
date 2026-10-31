@@ -98,7 +98,7 @@ def ingest(conn, cfg, event, *, now, token_owner):
         else:
             # Dedupe on the head, but a head whose review was cancelled or superseded
             # (closed then reopened, or force-pushed back) gets reviewed again.
-            # A no-post `review` trial doesn't count; a foreground `review --post` does.
+            # A no-post `review` trial doesn't count; a foreground `review --post` does (db.is_trial).
             latest = conn.execute(
                 "SELECT status, rerun FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=?"
                 " AND NOT (source=? AND post=0) ORDER BY rerun DESC LIMIT 1",

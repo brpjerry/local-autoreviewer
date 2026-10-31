@@ -23,7 +23,6 @@ log = logging.getLogger(__name__)
 RATE_LIMIT_BACKOFF = 30 * 60
 SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
-FOREGROUND = db.FOREGROUND  # see "Foreground jobs" below
 FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
 FOREGROUND_CANCEL_POLL = 2.0
 
@@ -113,7 +112,7 @@ def _check_pr(svc, job):
         raise Outcome("cancelled", f"PR is {pr['state'].lower()}")
     if pr["headRefOid"] != job["head_sha"]:
         raise Outcome("superseded", f"head moved to {pr['headRefOid'][:12]}")
-    if pr["isDraft"] and job["source"] not in ("manual", FOREGROUND):
+    if pr["isDraft"] and job["source"] not in ("manual", db.FOREGROUND):
         raise Outcome("cancelled", "PR is a draft")
     return pr
 
@@ -142,7 +141,7 @@ def run_job(svc, job_id, cancel):
 
 
 # Foreground jobs ---------------------------------------------------------------
-# `review` runs its jobs itself. They carry source=FOREGROUND, which the worker never claims or
+# `review` runs its jobs itself. They carry source=db.FOREGROUND, which the worker never claims or
 # recovers, and the command holds an flock per job for as long as it owns it. The worker cancels
 # (or, mid-post, recovers) a foreground job only once that lock is free, i.e. its owner is gone.
 
@@ -230,7 +229,8 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             wait = max(0, job["not_before"] - svc.now())
             if wait > FOREGROUND_MAX_WAIT:
                 return _finish(conn, svc, job_id, "cancelled",
-                               f"not waiting {-(-wait // 60)} min in the foreground; {job['reason']}")
+                               f"not waiting {-(-wait // 60)} min in the foreground (use `enqueue` to let the "
+                               f"worker retry); {job['reason']}")
             notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
             sleep(wait)
             with db.transaction(conn):
@@ -246,6 +246,8 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
 def abandon(svc, job_ids, reason):
     """Cancel this process's foreground jobs that are still queued or running (after Ctrl-C or an
     error). A job caught mid-post is left to the worker's marker-checked recovery."""
+    if not job_ids:
+        return
     conn = svc.connect()
     try:
         for job_id in job_ids:

@@ -12,7 +12,7 @@ from tests.helpers import OWNER, REPO, EnvTestCase, make_config
 from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
 from local_autoreviewer.github import GitHubError
-from local_autoreviewer.worker import Worker
+from local_autoreviewer.worker import POST_RECOVERY_RETRY, Worker
 
 HOSTILE_FILES = {
     "src/calc.py": "def divide(a, b):\n    return a / b\n\ndef mean(xs):\n    return sum(xs) / len(xs)\n",
@@ -23,6 +23,14 @@ HOSTILE_FILES = {
     ".mcp.json": '{"mcpServers": {"evil": {"command": "nc"}}}\n',
     ".Codex/config.toml": "model = 'evil'\n",
 }
+
+
+def recover_posts(worker, svc):
+    """Run the worker's post recovery and wait for its threads."""
+    worker.recover_posts(svc)
+    for thread, _token, _agent in list(worker.threads.values()):
+        thread.join(10)
+    worker.reap()
 
 
 class PipelineTests(EnvTestCase):
@@ -147,7 +155,7 @@ class PipelineTests(EnvTestCase):
         for agent in agents:
             with db.transaction(conn):
                 job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main",
-                                       agent=agent, model="opus", source=pipeline.FOREGROUND, not_before=0,
+                                       agent=agent, model="opus", source=db.FOREGROUND, not_before=0,
                                        now=self.clock(), post=post)
                 db.update_job(conn, job_id, status="running", started_at=self.clock())
                 lock = pipeline.hold_foreground_lock(self.state, job_id)
@@ -249,7 +257,7 @@ class PipelineTests(EnvTestCase):
         jobs = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
         conn.close()
         self.assertEqual([(j["agent"], j["source"], j["status"]) for j in jobs],
-                         [("claude", pipeline.FOREGROUND, "cancelled"), ("codex", pipeline.FOREGROUND, "cancelled")])
+                         [("claude", db.FOREGROUND, "cancelled"), ("codex", db.FOREGROUND, "cancelled")])
         self.assertEqual(list((self.state / "locks").iterdir()), [])
 
     def test_cancel_watcher_survives_a_database_error(self):
@@ -284,7 +292,7 @@ class PipelineTests(EnvTestCase):
         conn = svc.connect()
         with db.transaction(conn):
             job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent=agent,
-                                   model="", source=pipeline.FOREGROUND, not_before=0, now=self.clock(), post=True)
+                                   model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=True)
             db.update_job(conn, job_id, status=status, started_at=self.clock())
         conn.close()
         return svc, job_id
@@ -293,13 +301,29 @@ class PipelineTests(EnvTestCase):
         svc, job_id = self.orphan("posting")
         self.github.posted.append({"repo": REPO, "number": 1, "id": 7, "html_url": "https://example/r/7",
                                    "body": f"... {review.marker(job_id=job_id, sha=self.head, agent='codex')}"})
-        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
         job = self.job(svc, job_id)
         self.assertEqual((job["status"], job["review_url"]), ("posted", "https://example/r/7"))
 
+    def test_live_foreground_post_is_left_to_its_owner(self):
+        svc, (job_id,) = self.foreground(post=True)
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, status="posting")
+        conn.close()
+        worker = Worker(lambda cfg: svc, None)
+        worker.recover_posts(svc)
+        self.assertEqual(worker.threads, {})
+        self.assertEqual(self.job(svc, job_id)["status"], "posting")
+
+    def test_unreadable_lock_does_not_count_as_orphaned(self):
+        with mock.patch.object(pipeline, "open", create=True, side_effect=PermissionError("denied")), \
+                pipeline.orphaned_foreground(self.state, 1) as orphaned:
+            self.assertFalse(orphaned)
+
     def test_orphaned_foreground_post_without_output_is_cancelled(self):
         svc, job_id = self.orphan("posting")
-        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
         self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
 
     def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
@@ -307,7 +331,7 @@ class PipelineTests(EnvTestCase):
         conn = svc.connect()
         with db.transaction(conn):  # a `review` that was killed: its lock is gone
             dead = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="codex",
-                                 model="", source=pipeline.FOREGROUND, not_before=0, now=self.clock(), post=False)
+                                 model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=False)
             db.update_job(conn, dead, status="running", started_at=self.clock())
         conn.close()
         worker = Worker(lambda cfg: svc, None)
@@ -457,11 +481,60 @@ class WorkerTests(EnvTestCase):
         self.github.post_review(REPO, 2, self.head, f"body\n<!-- local-autoreviewer job={job_id} sha={self.head} agent=claude -->")
         worker = Worker(lambda c: svc, ConfigWatcher(self.config_file, None), tick=0.05)
         worker.recover(svc)
+        recover_posts(worker, svc)
         conn = svc.connect()
         job = dict(db.get_job(conn, job_id))
         conn.close()
         self.assertEqual(job["status"], "posted")
         self.assertEqual(len(self.github.posted), 1)
+
+    def test_a_failing_cleanup_step_does_not_stop_the_worker(self):
+        with mock.patch.object(Worker, "release_orphaned_foreground", side_effect=RuntimeError("boom")):
+            worker, thread, svc = self.start(make_config(self.tmp, agents=("claude",)))
+            try:
+                self.enqueue(svc)
+                self.wait_for(svc, lambda js: js and all(j["status"] == "posted" for j in js))
+            finally:
+                worker.stop.set()
+                thread.join(30)
+
+    def interrupted_post(self, svc):
+        (job_id,) = self.enqueue(svc)
+        conn = svc.connect()
+        with db.transaction(conn):
+            db.update_job(conn, job_id, status="posting")
+        conn.close()
+        return job_id
+
+    def test_interrupted_post_with_saved_output_is_posted_once(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        out = Path(pipeline.job_paths(self.state, job_id).out)
+        out.mkdir(parents=True)
+        (out / "review.md").write_text("Looks good.\n")
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)
+        self.assertEqual([r["body"] for r in self.github.posted], ["Looks good.\n"])
+
+    def test_post_recovery_backs_off_while_github_fails(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        job_id = self.interrupted_post(svc)
+        lookups = []
+
+        def failing_lookup(*args):
+            lookups.append(args)
+            raise GitHubError("HTTP 503")
+
+        self.github.find_marked_review = failing_lookup
+        worker = Worker(lambda c: svc, None)
+        recover_posts(worker, svc)
+        recover_posts(worker, svc)  # not due yet: no second lookup
+        conn = svc.connect()
+        job = dict(db.get_job(conn, job_id))
+        conn.close()
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + POST_RECOVERY_RETRY))
 
 
 if __name__ == "__main__":

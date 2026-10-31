@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import sqlite3
 import unittest
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
@@ -14,6 +15,18 @@ class DbTests(EnvTestCase):
         conn.close()
         with self.assertRaises(db.SchemaTooNew):
             db.connect(self.state / "s.db")
+
+    def test_migrate_does_not_need_the_write_lock_when_current(self):
+        db.connect(self.state / "s.db").close()
+        writer = sqlite3.connect(self.state / "s.db", isolation_level=None)
+        reader = sqlite3.connect(self.state / "s.db", isolation_level=None, timeout=0)
+        writer.execute("BEGIN IMMEDIATE")
+        try:
+            db.migrate(reader)  # raises "database is locked" if it takes the write lock
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+            reader.close()
 
 
 class PollTests(EnvTestCase):
@@ -144,6 +157,7 @@ class ManualIngestTests(EnvTestCase):
     def test_a_running_foreground_review_with_post_blocks_a_duplicate(self):
         self.foreground_job("running", post=True)
         self.assertEqual(self.ingest(agents=("claude",)), [])
+        self.assertEqual(self.ingest(agents=("claude",), force=True), [])
 
     def test_unconfigured_repo_ignored(self):
         svc = self.services()

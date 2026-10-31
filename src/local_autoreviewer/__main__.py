@@ -135,7 +135,7 @@ def cmd_review(args):
                     rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"], agent)
                     job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
                                            base_ref=pr["baseRefName"], agent=agent, model=cfg.agents[agent].model,
-                                           source=pipeline.FOREGROUND, not_before=svc.now(), now=svc.now(),
+                                           source=db.FOREGROUND, not_before=svc.now(), now=svc.now(),
                                            post=args.post, rerun=rerun)
                     db.update_job(conn, job_id, status="running", started_at=svc.now())
                     locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
@@ -157,6 +157,13 @@ def cmd_review(args):
     finally:
         # Never leave this command's jobs for the worker, even after Ctrl-C or an error.
         pipeline.abandon(svc, list(locks), "foreground review ended before the job finished")
+        if locks:
+            conn = svc.connect()
+            mid_post = [job_id for job_id in locks if db.get_job(conn, job_id)["status"] == "posting"]
+            conn.close()
+            for job_id in mid_post:
+                print(f"job {job_id} was interrupted mid-post; the worker will check whether it reached GitHub "
+                      "and finish posting it if not", file=sys.stderr)
         for job_id, handle in locks.items():
             pipeline.release_foreground_lock(svc.state, job_id, handle)
     return worst

@@ -80,7 +80,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | --- | --- |
 | `local-autoreviewer status` | Recent jobs, their state and review links (`--json` for scripts) |
 | `local-autoreviewer enqueue owner/repo#N [--agent codex] [--force]` | Queue a review; with `--force`, review the same commit again |
-| `local-autoreviewer review owner/repo#N [--post]` | Review now, in the foreground. Without `--post` it is a trial: the service still reviews that commit |
+| `local-autoreviewer review owner/repo#N [--post]` | Review now, in the foreground. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit |
 | `local-autoreviewer resume <job>` | Continue the review's agent session interactively, in its checkout |
 | `local-autoreviewer ask <job> "why is X a problem?"` | Send one follow-up question to the review session |
 | `local-autoreviewer poll --dry-run` | Show which events the next poll would produce |
