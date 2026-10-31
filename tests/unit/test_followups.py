@@ -2,7 +2,6 @@
 """Follow-up reviews: a later head is checked against the previous round's findings and for regressions."""
 
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,7 +95,8 @@ class FollowupTests(EnvTestCase):
         self.remote.commit("main changes the same line")
         git("push", "-q", str(self.remote.bare), "main", cwd=work)
         git("checkout", "-q", "pr1", cwd=work)
-        subprocess.run(["git", "merge", "--no-edit", "main"], cwd=work, capture_output=True)  # conflicts
+        git("merge", "--no-edit", "main", cwd=work, check=False)  # conflicts
+        self.assertTrue((work / ".git" / "MERGE_HEAD").exists())  # a real merge is in progress
         self.remote.write("src/calc.py", FIXED)  # the author resolves it
         head = self.remote.commit("merge main")
         git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
