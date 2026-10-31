@@ -327,6 +327,30 @@ class PipelineTests(EnvTestCase):
         recover_posts(Worker(lambda cfg: svc, None), svc)
         self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
 
+    def test_review_command_creates_its_jobs_under_the_poll_lock(self):
+        from local_autoreviewer import __main__ as cli
+        from local_autoreviewer.triggers import poll as poll_mod
+        svc = self.services()
+        started, result = threading.Event(), {}
+        view = self.github.pr_view
+
+        def pr_view(repo, number):
+            started.set()
+            return view(repo, number)
+
+        self.github.pr_view = pr_view
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", return_value="skipped"):
+            with poll_mod.poll_lock(self.state):  # a poll is between its fetch and its apply
+                thread = threading.Thread(target=lambda: result.setdefault("r", cli.cmd_review(args)))
+                thread.start()
+                self.assertFalse(started.wait(0.3))
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["r"], 0)
+
     def test_review_command_survives_a_job_row_that_never_committed(self):
         from local_autoreviewer import __main__ as cli
         svc = self.services()

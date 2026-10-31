@@ -123,24 +123,28 @@ def cmd_review(args):
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
     svc = build_services(cfg)
-    pr = svc.github.pr_view(repo_cfg.name, number)
     agents = args.agent or list(repo_cfg.agents)
     locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
     worst = 0
     try:
-        conn = svc.connect()
-        try:
-            for agent in agents:
-                with db.transaction(conn):
-                    rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"], agent)
-                    job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
-                                           base_ref=pr["baseRefName"], agent=agent, model=cfg.agents[agent].model,
-                                           source=db.FOREGROUND, not_before=svc.now(), now=svc.now(),
-                                           post=args.post, rerun=rerun)
-                    db.update_job(conn, job_id, status="running", started_at=svc.now())
-                    locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
-        finally:
-            conn.close()
+        # Like enqueue, read the head and create the jobs under the poll lock, so a poll applying
+        # an older snapshot can't supersede them.
+        with poll_mod.poll_lock(svc.state):
+            pr = svc.github.pr_view(repo_cfg.name, number)
+            conn = svc.connect()
+            try:
+                for agent in agents:
+                    with db.transaction(conn):
+                        rerun = db.next_rerun(conn, repo_cfg.name, number, pr["headRefOid"], pr["baseRefName"],
+                                              agent)
+                        job_id = db.insert_job(conn, repo=repo_cfg.name, number=number, head_sha=pr["headRefOid"],
+                                               base_ref=pr["baseRefName"], agent=agent,
+                                               model=cfg.agents[agent].model, source=db.FOREGROUND,
+                                               not_before=svc.now(), now=svc.now(), post=args.post, rerun=rerun)
+                        db.update_job(conn, job_id, status="running", started_at=svc.now())
+                        locks[job_id] = pipeline.hold_foreground_lock(svc.state, job_id)
+            finally:
+                conn.close()
         for job_id in locks:
             status = pipeline.run_foreground(svc, job_id, notify=lambda message: print(message, file=sys.stderr))
             conn = svc.connect()

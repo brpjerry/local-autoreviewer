@@ -268,8 +268,8 @@ class ManualIngestTests(EnvTestCase):
             enqueued = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="codex",
                                      model="", source="manual", not_before=0, now=self.clock())
 
-        def poll_sees(head, action="synchronize"):
-            event = events.PrEvent(repo=REPO, number=9, action=action, head_sha=head, base_ref="main",
+        def poll_sees(head, action="synchronize", base="main"):
+            event = events.PrEvent(repo=REPO, number=9, action=action, head_sha=head, base_ref=base,
                                    is_draft=True, author=OWNER, source="poll")
             with db.transaction(conn):
                 events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
@@ -278,10 +278,23 @@ class ManualIngestTests(EnvTestCase):
 
         try:
             self.assertEqual(poll_sees("a" * 40), {"claude": ("running", 0), "codex": ("queued", 0)})
-            self.assertEqual(poll_sees("b" * 40), {"claude": ("running", 1), "codex": ("cancelled", 0)})
+            self.assertEqual(poll_sees("a" * 40, "retargeted", base="release"),
+                             {"claude": ("running", 1), "codex": ("cancelled", 0)})
         finally:
             conn.close()
         self.assertIsNotNone(enqueued)
+
+    def test_a_new_head_on_a_draft_stops_requested_reviews(self):
+        self.foreground_job("running", post=False)
+        svc = self.services()
+        conn = svc.connect()
+        event = events.PrEvent(repo=REPO, number=9, action="synchronize", head_sha="b" * 40, base_ref="main",
+                               is_draft=True, author=OWNER, source="poll")
+        with db.transaction(conn):
+            events.ingest(conn, self.cfg, event, now=self.clock(), token_owner=OWNER)
+        row = conn.execute("SELECT status, cancel_requested FROM jobs WHERE number=9").fetchone()
+        conn.close()
+        self.assertEqual(tuple(row), ("running", 1))
 
     def test_closing_a_draft_stops_requested_reviews(self):
         self.foreground_job("running", post=False)
