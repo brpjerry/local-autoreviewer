@@ -22,7 +22,11 @@ def held_agents(state):
     """Agents the worker must not start new reviews for: the union of live holds. A hold is a file in
     state/holds that its owner keeps locked (tools/live while it deploys, tools/replay while it runs
     Codex); its content names the agents, or is "all" (also if empty). A file whose owner has exited is
-    no longer locked and doesn't count. Owners remove their own files."""
+    no longer locked and doesn't count. Owners remove their own files.
+
+    The worker checks holds inside the write transaction that claims a job, and an owner waiting for
+    the worker to go idle counts running jobs inside a write transaction of its own, after taking the
+    hold. So a claim either sees the hold or is counted."""
     held = set()
     for path in (Path(state) / "holds").glob("*.lock"):
         try:
@@ -189,8 +193,7 @@ class Worker:
 
     def claim(self, svc):
         busy = {agent for (_t, _c, agent) in self.threads.values()}
-        held = held_agents(svc.state)
-        free = [agent for agent in svc.config.agents if agent not in busy and agent not in held and "all" not in held]
+        free = [agent for agent in svc.config.agents if agent not in busy]
         if not free:
             return
         now = svc.now()
@@ -199,6 +202,9 @@ class Worker:
         try:
             for agent in free:
                 with db.transaction(conn):
+                    held = held_agents(svc.state)  # under the write lock: see held_agents
+                    if agent in held or "all" in held:
+                        continue
                     started = db.started_since(conn, agent, day)
                     if started >= svc.config.service.max_reviews_per_day:
                         if (agent, day) not in self.cap_logged:

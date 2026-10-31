@@ -129,9 +129,12 @@ def main():
     if "codex" in agents:  # a shared CODEX_HOME races the service's token refreshes (see above)
         hold = hold_codex(live_state)  # first, so the worker can't start one after the check below  # noqa: F841
         try:
-            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=ro", uri=True)
-            try:
+            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=rw", uri=True,
+                                   timeout=30, isolation_level=None)
+            try:  # in a write transaction, writing nothing: a claim begun before the hold is counted
+                live.execute("BEGIN IMMEDIATE")
                 busy = live.execute("SELECT COUNT(*) FROM jobs WHERE agent='codex' AND status='running'").fetchone()[0]
+                live.execute("ROLLBACK")
             finally:
                 live.close()
         except sqlite3.Error:

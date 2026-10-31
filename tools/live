@@ -52,17 +52,21 @@ hold() {
 }
 
 wait_idle() {
-    # Read-only and without the app's code, so it never migrates the database under an older worker.
+    # Without the app's code, so it never migrates the database under an older worker; it writes nothing.
     [ -f "$state/state.sqlite3" ] || return 0
     local busy announced=
     for _ in $(seq 1 180); do
         # Running reviews count, foreground `review` ones too: the code switched to may migrate the shared
-        # database under them. Posts waiting out a retry don't run until they are due.
+        # database under them. Posts waiting out a retry don't run until they are due. The count is taken
+        # in a write transaction, so a claim the worker began before the hold is finished and counted.
         busy=$(python3 -I -c 'import sqlite3, sys, time
 from pathlib import Path
-conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=rw", uri=True, timeout=30,
+                       isolation_level=None)
+conn.execute("BEGIN IMMEDIATE")
 print(conn.execute("SELECT COUNT(*) FROM jobs WHERE status = ? OR status = ? AND not_before <= ?",
-                   ("running", "posting", int(time.time()))).fetchone()[0])' \
+                   ("running", "posting", int(time.time()))).fetchone()[0])
+conn.execute("ROLLBACK")' \
             "$state/state.sqlite3")
         [ "$busy" = 0 ] && return 0
         [ "${announced:-}" ] || echo "waiting for $busy running review(s) to finish..."

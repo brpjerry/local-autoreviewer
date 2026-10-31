@@ -1093,6 +1093,24 @@ class WorkerTests(EnvTestCase):
         for thread, _token, _agent in worker.threads.values():
             thread.join(30)
 
+    def test_a_hold_taken_as_the_worker_claims_stops_the_claim(self):
+        svc = self.services(make_config(self.tmp, agents=("claude",)))
+        self.enqueue(svc)
+        worker = Worker(lambda c: svc, None)
+        holds, connect = [], svc.connect
+
+        def connect_then_hold():  # tools/live takes its hold just after the worker starts claiming
+            conn = connect()
+            holds.append(self.hold("tools-live", "all"))
+            return conn
+        svc.connect = connect_then_hold
+        worker.claim(svc)
+        svc.connect = connect
+        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
+        holds[0].close()
+        self.assertEqual(worker.threads, {})
+        self.assertEqual([j["status"] for j in self.wait_for(svc, lambda js: True)], ["queued"])
+
     def test_worker_reviews_with_both_agents(self):
         worker, thread, svc = self.start(self.cfg)
         try:
