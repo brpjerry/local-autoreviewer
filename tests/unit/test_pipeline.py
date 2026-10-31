@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
+import contextlib
 import json
 import sqlite3
 import threading
@@ -330,17 +331,27 @@ class PipelineTests(EnvTestCase):
         from local_autoreviewer import __main__ as cli
         svc = self.services()
         args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=False)
-        real_hold = pipeline.hold_foreground_lock
+        svc.connect().close()  # create the schema now, so the first transaction below is the job's
+        real_transaction, calls = db.transaction, []
 
-        def hold_then_fail(state, job_id):  # the lock is taken, then the transaction rolls back
-            real_hold(state, job_id)
+        @contextlib.contextmanager
+        def commit_fails_once(conn):  # the job's lock is taken, then its COMMIT fails
+            if calls:
+                with real_transaction(conn):
+                    yield conn
+                return
+            calls.append(True)
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("ROLLBACK")
             raise sqlite3.OperationalError("database or disk is full")
 
         with mock.patch.object(cli, "load_config", return_value=self.cfg), \
                 mock.patch.object(cli, "build_services", return_value=svc), \
-                mock.patch.object(pipeline, "hold_foreground_lock", side_effect=hold_then_fail), \
+                mock.patch.object(db, "transaction", commit_fails_once), \
                 self.assertRaises(sqlite3.OperationalError):
             cli.cmd_review(args)
+        self.assertEqual(list((self.state / "locks").iterdir()), [])
 
     def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
         svc, (alive,) = self.foreground()
