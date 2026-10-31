@@ -36,11 +36,11 @@ deploy() {
 wait_idle() {
     # Read-only and without the app's code, so it never migrates the database under an older worker.
     [ -f "$state/state.sqlite3" ] || return 0
-    local busy
+    local busy announced=
     for _ in $(seq 1 180); do
         busy=$(python3 -I -c 'import sqlite3, sys
 conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
-print(conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN (\"running\", \"posting\")").fetchone()[0])' \
+print(conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?, ?)", ("running", "posting")).fetchone()[0])' \
             "$state/state.sqlite3")
         [ "$busy" = 0 ] && return 0
         [ "${announced:-}" ] || echo "waiting for $busy running review(s) to finish..."
@@ -64,10 +64,11 @@ setup)
         mkdir -p "$(dirname "$live")"
         git -C "$repo" worktree add --quiet --detach "$live" "${2:-main}"
     fi
+    wait_idle
     deploy "${2:-main}"
     for unit in worker poll; do
         mkdir -p "$units/local-autoreviewer-$unit.service.d"
-        printf '# Written by tools/live; "tools/live teardown" removes it.\n[Service]\nExecStart=\nExecStart=%s %s\n' \
+        printf '# Written by tools/live; "tools/live teardown" removes it.\n[Service]\nExecStart=\nExecStart="%s" %s\n' \
             "$live/bin/local-autoreviewer" "$unit" >"$units/local-autoreviewer-$unit.service.d/live.conf"
     done
     mkdir -p "$(dirname "$command_link")"
@@ -88,6 +89,7 @@ status)
     systemctl --user show local-autoreviewer-worker.service -p ExecStart --value | head -1
     ;;
 teardown)
+    wait_idle
     rm -f "$units/local-autoreviewer-worker.service.d/live.conf" "$units/local-autoreviewer-poll.service.d/live.conf"
     rmdir "$units/local-autoreviewer-worker.service.d" "$units/local-autoreviewer-poll.service.d" 2>/dev/null || true
     rm -f "$command_link"
