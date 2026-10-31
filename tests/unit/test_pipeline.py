@@ -489,6 +489,29 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertEqual(self.poll_jobs(svc), 1)
 
+    def test_overlapping_review_posts_hand_back_once_the_last_one_is_cancelled(self):
+        self.seen_by_poller(self.head)
+        svc = self.services()
+        first = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        self.poll_saw(svc, self.head)  # the poll deferred to the first `review --post`
+        self.clock.advance(5)
+        second = self.add_job(svc, self.head, db.FOREGROUND, "running")
+        pipeline.abandon(svc, [first], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 0)  # the second one still covers the head
+        pipeline.abandon(svc, [second], "foreground review ended before the job finished")
+        self.assertEqual(self.poll_jobs(svc), 1)
+
+    def test_cancel_and_hand_back_commit_together(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(post=True)
+        self.poll_saw(svc, self.head)
+        with mock.patch.object(events, "requeue_for_service", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                self.assertRaises(sqlite3.OperationalError):
+            pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual(self.job(svc, job_id)["status"], "running")  # still there for the worker to clean up
+        pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+        self.assertEqual((self.job(svc, job_id)["status"], self.poll_jobs(svc)), ("cancelled", 1))
+
     def test_hand_back_leaves_other_jobs_alone(self):
         self.seen_by_poller(self.head)  # the poller hasn't seen the newer push yet
         svc, (old,) = self.foreground(post=True)

@@ -296,13 +296,7 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             if wait > FOREGROUND_MAX_WAIT:
                 reason = (f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
                           f"worker retry); {job['reason']}")
-                with db.transaction(conn):  # only if a poll hasn't superseded it meanwhile
-                    cancelled = conn.execute(
-                        "UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status='queued'",
-                        (reason[:1000], svc.now(), job_id)).rowcount
-                if cancelled:
-                    log.info("job %s -> cancelled: %s", job_id, reason)
-                    _hand_back(conn, svc, db.get_job(conn, job_id))
+                _cancel_foreground(conn, svc, job, reason, only_if=("queued",))  # unless a poll ended it meanwhile
                 return db.get_job(conn, job_id)["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
@@ -334,18 +328,26 @@ def abandon(svc, job_ids, reason):
                 continue
             if job["scope_unit"]:
                 svc.runner.cleanup(job["scope_unit"])
-            _finish(conn, svc, job_id, "cancelled", reason)
-            _hand_back(conn, svc, job)
+            _cancel_foreground(conn, svc, job, reason)
     finally:
         conn.close()
 
 
-def _hand_back(conn, svc, job):
-    """After cancelling a foreground `review --post` job, queue the service's own review of its head
-    if the job had stood in for it (see events.requeue_for_service)."""
-    if job["post"]:
-        with db.transaction(conn):
+def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running")):
+    """Cancel a foreground job if its status is still one of only_if. In the same transaction, queue
+    the service's own review of its head if a `review --post` job had stood in for it
+    (events.requeue_for_service), so a crash can't end the job without the replacement. Returns
+    whether the job was cancelled."""
+    marks = ",".join("?" * len(only_if))
+    with db.transaction(conn):
+        cancelled = conn.execute(
+            f"UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status IN ({marks})",
+            (reason[:1000], svc.now(), job["id"], *only_if)).rowcount
+        if cancelled and job["post"]:
             events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.token_owner)
+    if cancelled:
+        log.info("job %s -> cancelled: %s", job["id"], reason)
+    return bool(cancelled)
 
 
 def _cancelled(conn, svc, job, cancel):
@@ -494,9 +496,8 @@ def recover_post(conn, svc, job):
         return _finish(conn, svc, job["id"], "superseded" if reason.startswith("superseded") else "cancelled", reason)
     if not Path(job_paths(svc.state, job["id"]).out, "review.md").is_file():
         if job["source"] == db.FOREGROUND:  # no owner left to run it again
-            status = _finish(conn, svc, job["id"], "cancelled", "interrupted post had no saved review")
-            _hand_back(conn, svc, job)
-            return status
+            _cancel_foreground(conn, svc, job, "interrupted post had no saved review", only_if=("posting",))
+            return db.get_job(conn, job["id"])["status"]
         return _finish(conn, svc, job["id"], "queued", "requeued: review output missing")
     try:
         return post(conn, svc, job)
