@@ -45,7 +45,8 @@ hold() {
     holding=1
     mkdir -p "$state/holds"
     exec 9>"$state/holds/tools-live.lock"
-    flock -n 9 || { echo "tools/live: another tools/live is running" >&2; exit 1; }
+    # Wait a little: the worker briefly takes a shared lock on this file when it checks holds.
+    flock -w 10 9 || { echo "tools/live: another tools/live is running" >&2; exit 1; }
     echo all >&9
     trap 'rm -f "$state/holds/tools-live.lock"' EXIT
 }
