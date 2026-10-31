@@ -28,6 +28,8 @@ deploy() {
         echo "tools/live: unknown ref ${1:-main}" >&2
         exit 2
     }
+    # The poll unit runs the new code on its next tick; a new migration would stop a busy old worker.
+    git -C "$live" diff --quiet HEAD "$commit" -- src/local_autoreviewer/db.py || wait_idle
     git -C "$live" checkout --quiet --detach "$commit"
     echo "live-$(git -C "$live" rev-parse --short=12 HEAD)" >"$live/VERSION"
     echo "live: $(git -C "$live" log -1 --format='%h %s')"
@@ -38,9 +40,13 @@ wait_idle() {
     [ -f "$state/state.sqlite3" ] || return 0
     local busy announced=
     for _ in $(seq 1 180); do
-        busy=$(python3 -I -c 'import sqlite3, sys
-conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
-print(conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?, ?)", ("running", "posting")).fetchone()[0])' \
+        # Only the worker's own work counts: foreground `review` jobs, and posts waiting out a retry,
+        # aren't affected by a restart.
+        busy=$(python3 -I -c 'import sqlite3, sys, time
+from pathlib import Path
+conn = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+print(conn.execute("SELECT COUNT(*) FROM jobs WHERE source != ? AND (status = ? OR status = ? AND not_before <= ?)",
+                   ("foreground", "running", "posting", int(time.time()))).fetchone()[0])' \
             "$state/state.sqlite3")
         [ "$busy" = 0 ] && return 0
         [ "${announced:-}" ] || echo "waiting for $busy running review(s) to finish..."
@@ -76,7 +82,10 @@ setup)
     restart
     ;;
 deploy)
-    [ -e "$live/.git" ] || { echo "tools/live: run 'tools/live setup' first" >&2; exit 2; }
+    if [ ! -e "$live/.git" ] || [ ! -e "$units/local-autoreviewer-worker.service.d/live.conf" ]; then
+        echo "tools/live: run 'tools/live setup' first" >&2
+        exit 2
+    fi
     deploy "${2:-main}"
     ;;
 status)
