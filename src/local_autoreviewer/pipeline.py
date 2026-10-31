@@ -28,7 +28,8 @@ SHA_LAG_RETRY = 60
 SHA_LAG_MAX_ATTEMPTS = 10
 FOREGROUND_MAX_WAIT = 5 * 60  # `review` waits out retries up to this long; usage limits are longer
 FOREGROUND_CANCEL_POLL = 2.0  # seconds between a foreground job's checks for cancel requests
-POST_RECOVERY_RETRY = 5 * 60  # seconds before retrying a post that failed or was interrupted
+POST_RECOVERY_RETRY = FOREGROUND_MAX_WAIT  # seconds before retrying a post; `review --post` waits it out
+assert POST_RECOVERY_RETRY <= FOREGROUND_MAX_WAIT
 
 
 @dataclass
@@ -192,14 +193,17 @@ def release_foreground_lock(state, job_id, handle):
 def orphaned_foreground(state, job_id):
     """Yield True, holding the job's lock, if no live process owns the foreground job."""
     path = foreground_lock_path(state, job_id)
+    handle = unreadable = None
     try:
         handle = open(path, "a")
     except FileNotFoundError:  # no locks directory at all: nobody holds a lock
-        yield True
-        return
+        pass
     except OSError as exc:  # can't tell, so assume the owner is alive
-        log.warning("job %s: cannot check foreground lock %s: %s", job_id, path, exc)
-        yield False
+        unreadable = exc
+    if handle is None:
+        if unreadable:
+            log.warning("job %s: cannot check foreground lock %s: %s", job_id, path, unreadable)
+        yield unreadable is None
         return
     with handle:
         try:
@@ -211,6 +215,12 @@ def orphaned_foreground(state, job_id):
             yield True
         finally:
             path.unlink(missing_ok=True)
+
+
+def remove_lock_if_free(state, job_id):
+    """Delete a job's lock file unless a live process holds it."""
+    with orphaned_foreground(state, job_id):
+        pass  # orphaned_foreground unlinks the file when it gets the lock
 
 
 def _check_cancel(svc, job_id, token):
@@ -238,9 +248,10 @@ def _watch_cancel(svc, job_id, token, done):
 
 
 def _wait_while(svc, conn, job_id, status, wait, sleep, *, stop_on_cancel=False):
-    """Sleep up to `wait` seconds in short steps while the job keeps `status`. Return early, with its
-    status, if a push or close ends it meanwhile; a queued job's status changes then, while a
-    `posting` job only gets a cancel request (stop_on_cancel)."""
+    """Sleep up to `wait` seconds in short steps while the job keeps `status`, and return its status.
+    A push or close ends the wait early: a queued job's status changes then, while a `posting` job
+    only gets a cancel request (with stop_on_cancel, the wait ends but 'posting' is returned, and
+    recover_post deals with the request)."""
     deadline = svc.now() + wait
     while (remaining := deadline - svc.now()) > 0:
         sleep(min(FOREGROUND_CANCEL_POLL, remaining))
@@ -258,15 +269,17 @@ def _finish_post(svc, job_id, sleep, notify):
         while True:
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
-            # POST_RECOVERY_RETRY equals FOREGROUND_MAX_WAIT today, so this only hands a post to the
-            # worker if the two diverge.
             if job["status"] != "posting" or wait > FOREGROUND_MAX_WAIT:
                 return job["status"]
             if wait:
                 notify(f"job {job_id} [{job['agent']}]: {job['reason']}; trying again in {wait}s")
             if _wait_while(svc, conn, job_id, "posting", wait, sleep, stop_on_cancel=True) != "posting":
                 return db.get_job(conn, job_id)["status"]
-            recover_post(conn, svc, db.get_job(conn, job_id))  # also honours a cancel request
+            try:
+                recover_post(conn, svc, db.get_job(conn, job_id))  # also honours a cancel request
+            except Exception as exc:  # e.g. a garbled review listing: a failed attempt, as in the worker
+                log.exception("job %s: post retry failed", job_id)
+                fail_post_attempt(conn, svc, job_id, exc)
     finally:
         conn.close()
 
@@ -294,8 +307,9 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
             job = db.get_job(conn, job_id)
             wait = max(0, job["not_before"] - svc.now())
             if wait > FOREGROUND_MAX_WAIT:
-                reason = (f"not waiting {math.ceil(wait / 60)} min in the foreground (use `enqueue` to let the "
-                          f"worker retry); {job['reason']}")
+                retry = ("use `enqueue` to let the worker retry and post it" if job["post"]
+                         else "run `review` again later")
+                reason = f"not waiting {math.ceil(wait / 60)} min in the foreground ({retry}); {job['reason']}"
                 _cancel_foreground(conn, svc, job, reason, only_if=("queued",))  # unless a poll ended it meanwhile
                 return db.get_job(conn, job_id)["status"]
             if wait:
@@ -475,6 +489,14 @@ def post_failed(conn, svc, job, exc):
         db.update_job(conn, job["id"], post_attempts=post_attempts, reason=f"post failed: {exc}"[:1000],
                       not_before=svc.now() + POST_RECOVERY_RETRY)
     return "posting"
+
+
+def fail_post_attempt(conn, svc, job_id, exc):
+    """Count an unexpected error during a post retry as a failed attempt, if the job is still posting
+    (the error may have come after it was finished, from the hand-back say)."""
+    job = db.get_job(conn, job_id)
+    if job["status"] == "posting":
+        post_failed(conn, svc, job, exc)
 
 
 def recover_post(conn, svc, job):

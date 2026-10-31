@@ -9,6 +9,7 @@ from pathlib import Path
 ACTIVE = ("queued", "running", "posting")
 FINAL = ("posted", "failed", "superseded", "cancelled", "skipped", "blocked")
 STATUSES = ACTIVE + FINAL
+# Job sources: "poll" and "webhook" (a trigger), "manual" (`enqueue`, run by the worker), and FOREGROUND.
 FOREGROUND = "foreground"  # job source for `review`, which runs its jobs itself, never the worker
 
 MIGRATIONS = [

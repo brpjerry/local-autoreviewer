@@ -114,7 +114,7 @@ class Worker:
         except Exception as exc:
             log.exception("job %s: post recovery failed", job_id)
             try:  # counts as a failed attempt, so a persistent error ends the job eventually
-                pipeline.post_failed(conn, svc, db.get_job(conn, job_id), exc)
+                pipeline.fail_post_attempt(conn, svc, job_id, exc)
             except Exception:
                 log.exception("job %s: cannot schedule the retry", job_id)
         finally:
@@ -211,10 +211,12 @@ class Worker:
         log.info("stopping %d running job(s); they will be requeued", len(self.threads))
         for _thread, token, _agent in self.threads.values():
             token.cancel("shutdown")
+        # One deadline for all threads, inside TimeoutStopSec. Best effort: a post recovery can make
+        # several gh calls of up to 120 s each, but being killed mid-post is safe, because the next
+        # recovery checks for the review's marker.
+        deadline = time.monotonic() + 130
         for job_id, (thread, _token, _agent) in list(self.threads.items()):
-            # Best effort: one post recovery can make several gh calls of up to 120 s each. Being
-            # killed mid-post is safe, because the next recovery checks for the review's marker.
-            thread.join(timeout=130)
+            thread.join(timeout=max(0, deadline - time.monotonic()))
             if thread.is_alive():
                 log.warning("job %s did not stop in time", job_id)
 

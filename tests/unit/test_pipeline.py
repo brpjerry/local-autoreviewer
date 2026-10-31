@@ -294,6 +294,32 @@ class PipelineTests(EnvTestCase):
         job = self.job(svc, job_id)
         self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
 
+    def test_taking_a_lock_retries_when_the_file_was_replaced(self):
+        with mock.patch.object(pipeline, "_same_file", side_effect=[False, True]) as same:
+            lock = pipeline.hold_foreground_lock(self.state, 8)
+        lock.close()
+        self.assertEqual(same.call_count, 2)
+
+    def test_review_post_counts_an_unexpected_error_in_its_retry(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+
+        def garbled_listing(*args):
+            raise ValueError("unexpected payload")
+
+        self.github.find_marked_review = garbled_listing
+        status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        job = self.job(svc, job_id)
+        self.assertEqual((status, job["post_attempts"]), ("failed", 3))
+
+    def test_review_post_that_runs_out_of_retries_points_at_the_review(self):
+        svc, (job_id,) = self.foreground(post=True)
+        self.failing_post("gh api repos/o/r timed out")
+        status = pipeline.run_foreground(svc, job_id, sleep=lambda seconds: self.clock.advance(seconds))
+        job = self.job(svc, job_id)
+        self.assertEqual(status, "failed")
+        self.assertIn(f"review saved to {pipeline.job_paths(self.state, job_id).out}/review.md", job["reason"])
+
     def test_a_lock_on_a_deleted_file_is_not_the_lock(self):
         lock = pipeline.hold_foreground_lock(self.state, 7)
         try:
@@ -515,13 +541,16 @@ class PipelineTests(EnvTestCase):
     def test_hand_back_leaves_other_jobs_alone(self):
         self.seen_by_poller(self.head)  # the poller hasn't seen the newer push yet
         svc, (old,) = self.foreground(post=True)
+        self.poll_saw(svc, self.head)
         newer = self.add_job(svc, "b" * 40, db.FOREGROUND, "running")  # a `review --post` of the new head
         pipeline.abandon(svc, [old], "foreground review ended before the job finished")
         self.assertEqual((self.job(svc, newer)["status"], self.job(svc, newer)["cancel_requested"]), ("running", 0))
+        self.assertEqual(self.poll_jobs(svc), 1)  # the old head was handed back, and nothing else changed
 
     def test_hand_back_does_not_duplicate_a_service_review(self):
         self.seen_by_poller(self.head)
         svc = self.services()
+        self.poll_saw(svc, self.head)  # so only the "covered" check stands in the way
         for status in ("queued", "posted"):
             with self.subTest(status=status):
                 service = self.add_job(svc, self.head, "poll", status)
@@ -742,6 +771,13 @@ class PipelineTests(EnvTestCase):
         recover_posts(Worker(lambda cfg: svc, None), svc)
         job = self.job(svc, job_id)
         self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + pipeline.POST_RECOVERY_RETRY))
+
+    def test_orphaned_post_without_output_hands_the_head_back(self):
+        self.seen_by_poller(self.head)
+        svc, job_id = self.orphan("posting")
+        self.poll_saw(svc, self.head)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        self.assertEqual((self.job(svc, job_id)["status"], self.poll_jobs(svc)), ("cancelled", 1))
 
     def test_orphaned_foreground_post_without_output_is_cancelled(self):
         svc, job_id = self.orphan("posting")

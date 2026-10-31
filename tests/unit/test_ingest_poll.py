@@ -34,6 +34,21 @@ class DbTests(EnvTestCase):
         with self.assertRaises(sqlite3.ProgrammingError):  # "Cannot operate on a closed database"
             opened[0].execute("SELECT 1")
 
+    def test_an_existing_database_gains_post_attempts(self):
+        path = self.state / "old.db"
+        old = sqlite3.connect(path, isolation_level=None)
+        for statement in db._statements(db.MIGRATIONS[0]):
+            old.execute(statement)
+        old.execute("PRAGMA user_version=1")
+        old.execute("INSERT INTO jobs (repo, number, head_sha, base_ref, agent, source, status, created_at)"
+                    " VALUES ('o/r', 1, 'abc', 'main', 'claude', 'poll', 'posting', 0)")
+        old.close()
+        conn = db.connect(path)
+        try:
+            self.assertEqual(conn.execute("SELECT post_attempts FROM jobs").fetchone()[0], 0)
+        finally:
+            conn.close()
+
     def test_migrate_does_not_need_the_write_lock_when_current(self):
         db.connect(self.state / "s.db").close()
         writer = sqlite3.connect(self.state / "s.db", isolation_level=None)

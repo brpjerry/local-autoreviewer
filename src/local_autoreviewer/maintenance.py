@@ -69,5 +69,4 @@ def _remove_stale_locks(conn, svc):
             continue
         job = db.get_job(conn, job_id)
         if job is not None and job["status"] not in db.ACTIVE:
-            with pipeline.orphaned_foreground(svc.state, job_id):
-                pass  # removes the file if nobody holds it
+            pipeline.remove_lock_if_free(svc.state, job_id)
