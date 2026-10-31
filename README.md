@@ -166,6 +166,17 @@ The opt-in `tests/integration/test_real_agents.py` runs the real CLIs and uses a
 LOCAL_AUTOREVIEWER_REAL_AGENTS=claude,codex python3 -m unittest tests.integration.test_real_agents
 ```
 
+To run the service from this repository instead of the installed package, so a change goes live in seconds:
+
+```sh
+tools/live setup          # a separate worktree at main, with the user units pointed at it
+tools/live deploy <ref>   # move it to another commit; the worker restarts on it once idle
+local-autoreviewer-live status   # the CLI from the live worktree
+tools/live teardown       # back to the installed package (install one at least as new first)
+```
+
+The live worktree is separate from the checkout you edit, so work in progress never runs.
+
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).
 
 Not built yet:
