@@ -4,6 +4,8 @@ import contextlib
 import io
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -415,6 +417,56 @@ class PipelineTests(EnvTestCase):
         self.assertIn(f"job {job['id']} was interrupted mid-post", stderr.getvalue())
         self.assertEqual(list((self.state / "locks").iterdir()), [])
 
+    def test_review_interrupted_mid_post_is_finished_by_the_worker(self):
+        from local_autoreviewer import __main__ as cli
+        svc = self.services()
+        args = argparse.Namespace(ref=f"{REPO}#1", agent=["claude"], post=True)
+
+        def interrupted_post(svc_, job_id, **kwargs):
+            out = Path(pipeline.job_paths(self.state, job_id).out)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "review.md").write_text("Reviewed.\n")  # the review was ready; the post call hung
+            conn = svc.connect()
+            with db.transaction(conn):
+                db.update_job(conn, job_id, status="posting")
+            conn.close()
+            raise KeyboardInterrupt
+
+        with mock.patch.object(cli, "load_config", return_value=self.cfg), \
+                mock.patch.object(cli, "build_services", return_value=svc), \
+                mock.patch.object(pipeline, "run_foreground", side_effect=interrupted_post), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            cli.cmd_review(args)
+        recover_posts(Worker(lambda cfg: svc, None), svc)
+        conn = svc.connect()
+        (job,) = [dict(r) for r in conn.execute("SELECT * FROM jobs")]
+        conn.close()
+        self.assertEqual(job["status"], "posted")
+        self.assertEqual([r["body"] for r in self.github.posted], ["Reviewed.\n"])
+
+    def test_worker_cleans_up_after_a_killed_review_process(self):
+        svc, job_id = self.orphan("running")
+        pipeline.foreground_lock_path(self.state, job_id).parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(  # stands in for a `review` process holding the job's lock
+            [sys.executable, "-c", "import fcntl, sys, time\n"
+             "handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX)\n"
+             "print('locked', flush=True); time.sleep(60)",
+             str(pipeline.foreground_lock_path(self.state, job_id))], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            worker = Worker(lambda cfg: svc, None)
+            worker.release_orphaned_foreground(svc)
+            self.assertEqual(self.job(svc, job_id)["status"], "running")  # its owner is alive
+            holder.kill()
+            holder.wait(10)
+            worker.release_orphaned_foreground(svc)
+            self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
+            self.assertFalse(pipeline.foreground_lock_path(self.state, job_id).exists())
+        finally:
+            holder.kill()
+            holder.wait(10)
+            holder.stdout.close()
+
     def test_review_command_survives_a_job_row_that_never_committed(self):
         from local_autoreviewer import __main__ as cli
         svc = self.services()
@@ -665,6 +717,15 @@ class WorkerTests(EnvTestCase):
         conn.close()
         self.assertEqual(len(lookups), 1)
         self.assertEqual((job["status"], job["not_before"]), ("posting", self.clock() + POST_RECOVERY_RETRY))
+
+        # Once the retry is due and GitHub answers again, the post is confirmed.
+        del self.github.find_marked_review
+        self.github.post_review(REPO, 2, self.head, f"body\n{review.marker(job_id=job_id, sha=self.head, agent='claude')}")
+        self.clock.advance(POST_RECOVERY_RETRY)
+        recover_posts(worker, svc)
+        conn = svc.connect()
+        self.assertEqual(db.get_job(conn, job_id)["status"], "posted")
+        conn.close()
 
 
 if __name__ == "__main__":
