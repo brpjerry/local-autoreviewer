@@ -18,7 +18,7 @@ DEFAULT_TEST_PATHS = (
 MAX_EDITS = 10  # per finding
 MAX_REPLACEMENT = 20_000  # characters
 MAX_SHOWN_LINES = 80  # per edit, in the review body; the inline suggestion is complete
-ANCHOR_WINDOW = 30  # lines: how far a stated range may be from where its `current` text really is
+ANCHOR_WINDOW = 30  # lines around a stated range searched for the nearest copy of `current`; beyond, only a unique copy
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -109,8 +109,10 @@ def _locate(lines, wanted, start):
     copying), or None. The copy nearest the stated start, at most ANCHOR_WINDOW lines away, wins; failing
     that, the only copy in the file. Two copies equally near, or blank lines away from the stated ones,
     say nothing about where the edit belongs."""
+    stripped = [line.rstrip() for line in lines]
+
     def at(i):
-        return [line.rstrip() for line in lines[i:i + len(wanted)]] == wanted
+        return stripped[i:i + len(wanted)] == wanted
     if not any(wanted):
         return start - 1 if at(start - 1) else None
     window = range(max(0, start - 1 - ANCHOR_WINDOW), min(len(lines) - len(wanted), start - 1 + ANCHOR_WINDOW) + 1)
