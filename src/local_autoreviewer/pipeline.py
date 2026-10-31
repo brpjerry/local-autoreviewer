@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import shutil
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -174,8 +175,12 @@ def orphaned_foreground(state, job_id):
     path = foreground_lock_path(state, job_id)
     try:
         handle = open(path, "a")
-    except OSError:
+    except FileNotFoundError:  # no locks directory at all: nobody holds a lock
         yield True
+        return
+    except OSError as exc:  # can't tell, so assume the owner is alive
+        log.warning("job %s: cannot check foreground lock %s: %s", job_id, path, exc)
+        yield False
         return
     with handle:
         try:
@@ -190,11 +195,15 @@ def orphaned_foreground(state, job_id):
 def _watch_cancel(svc, job_id, token, done):
     """Give a foreground run the worker's cancel semantics (a newer push, the PR closing)."""
     while not done.wait(FOREGROUND_CANCEL_POLL):
-        conn = svc.connect()
         try:
-            row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
-        finally:
-            conn.close()
+            conn = svc.connect()
+            try:
+                row = conn.execute("SELECT cancel_requested, reason FROM jobs WHERE id=?", (job_id,)).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:  # e.g. busy: try again on the next tick rather than stop watching
+            log.debug("job %s: cancel check failed: %s", job_id, exc)
+            continue
         if row is not None and row["cancel_requested"]:
             token.cancel(row["reason"] or "cancelled")
             return
@@ -205,7 +214,8 @@ def run_foreground(svc, job_id, *, sleep=time.sleep, notify=lambda message: None
     in place, and cancel the job rather than wait out a long deferral such as a usage limit."""
     while True:
         token, done = CancelToken(), threading.Event()
-        watcher = threading.Thread(target=_watch_cancel, args=(svc, job_id, token, done), daemon=True)
+        watcher = threading.Thread(target=_watch_cancel, args=(svc, job_id, token, done), daemon=True,
+                                   name=f"cancel-watch-{job_id}")
         watcher.start()
         try:
             status = run_job(svc, job_id, token)

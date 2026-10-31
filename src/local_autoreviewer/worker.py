@@ -78,7 +78,8 @@ class Worker:
                     job = db.get_job(conn, job_id)  # re-read under the lock: the owner may have just finished
                     if job["status"] == "posting":
                         self.recover_posting(svc, conn, job)
-                    elif job["status"] in ("queued", "running"):
+                        job = db.get_job(conn, job_id)  # requeued if there was nothing to post
+                    if job["status"] in ("queued", "running"):
                         if job["scope_unit"]:
                             svc.runner.cleanup(job["scope_unit"])
                         pipeline._finish(conn, svc, job_id, "cancelled", "foreground review exited before finishing")

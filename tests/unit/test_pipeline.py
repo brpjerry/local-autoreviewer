@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import json
+import sqlite3
 import threading
 import time
 import unittest
@@ -8,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.helpers import OWNER, REPO, EnvTestCase, make_config
-from local_autoreviewer import db, events, pipeline
+from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
 from local_autoreviewer.github import GitHubError
 from local_autoreviewer.worker import Worker
@@ -250,6 +251,56 @@ class PipelineTests(EnvTestCase):
         self.assertEqual([(j["agent"], j["source"], j["status"]) for j in jobs],
                          [("claude", pipeline.FOREGROUND, "cancelled"), ("codex", pipeline.FOREGROUND, "cancelled")])
         self.assertEqual(list((self.state / "locks").iterdir()), [])
+
+    def test_cancel_watcher_survives_a_database_error(self):
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="sleep"))
+        real_connect, failed = svc.connect, []
+
+        def connect():
+            if threading.current_thread().name.startswith("cancel-watch") and not failed:
+                failed.append(True)
+                raise sqlite3.OperationalError("database is locked")
+            return real_connect()
+
+        svc.connect = connect
+        with mock.patch.object(pipeline, "FOREGROUND_CANCEL_POLL", 0.05):
+            result = {}
+            thread = threading.Thread(target=lambda: result.setdefault("s", pipeline.run_foreground(svc, job_id)))
+            thread.start()
+            deadline = time.monotonic() + 20
+            while not (self.agent_log("claude") and failed) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            conn = real_connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+            thread.join(20)
+        self.assertEqual(failed, [True])
+        self.assertEqual(result["s"], "superseded")
+
+    def orphan(self, status, agent="codex"):
+        """A foreground job left behind by a killed `review`: no lock is held."""
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent=agent,
+                                   model="", source=pipeline.FOREGROUND, not_before=0, now=self.clock(), post=True)
+            db.update_job(conn, job_id, status=status, started_at=self.clock())
+        conn.close()
+        return svc, job_id
+
+    def test_orphaned_foreground_post_is_recovered(self):
+        svc, job_id = self.orphan("posting")
+        self.github.posted.append({"repo": REPO, "number": 1, "id": 7, "html_url": "https://example/r/7",
+                                   "body": f"... {review.marker(job_id=job_id, sha=self.head, agent='codex')}"})
+        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        job = self.job(svc, job_id)
+        self.assertEqual((job["status"], job["review_url"]), ("posted", "https://example/r/7"))
+
+    def test_orphaned_foreground_post_without_output_is_cancelled(self):
+        svc, job_id = self.orphan("posting")
+        Worker(lambda cfg: svc, None).release_orphaned_foreground(svc)
+        self.assertEqual(self.job(svc, job_id)["status"], "cancelled")
 
     def test_worker_leaves_live_foreground_jobs_alone_and_cleans_up_dead_ones(self):
         svc, (alive,) = self.foreground()

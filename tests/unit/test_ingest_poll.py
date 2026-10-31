@@ -119,15 +119,30 @@ class ManualIngestTests(EnvTestCase):
         self.assertEqual(self.ingest(force=True), [])  # still in flight: no duplicate
         self.assertEqual(len(self.ingest(agents=("claude",))), 0)
 
-    def test_a_foreground_review_does_not_count_as_reviewed(self):
+    def foreground_job(self, status, post):
         svc = self.services()
         conn = svc.connect()
-        with db.transaction(conn):  # a no-post `review` trial of the same head
-            trial = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="claude",
-                                  model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=False)
-            db.update_job(conn, trial, status="skipped")
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=9, head_sha="a" * 40, base_ref="main", agent="claude",
+                                   model="", source=db.FOREGROUND, not_before=0, now=self.clock(), post=post)
+            db.update_job(conn, job_id, status=status)
         conn.close()
+
+    def test_a_no_post_foreground_trial_does_not_count_as_reviewed(self):
+        self.foreground_job("skipped", post=False)
         self.assertEqual(len(self.ingest(agents=("claude",))), 1)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+
+    def test_a_running_trial_does_not_block_a_forced_review(self):
+        self.foreground_job("running", post=False)
+        self.assertEqual(len(self.ingest(agents=("claude",), force=True)), 1)
+
+    def test_a_posted_foreground_review_counts(self):
+        self.foreground_job("posted", post=True)
+        self.assertEqual(self.ingest(agents=("claude",)), [])
+
+    def test_a_running_foreground_review_with_post_blocks_a_duplicate(self):
+        self.foreground_job("running", post=True)
         self.assertEqual(self.ingest(agents=("claude",)), [])
 
     def test_unconfigured_repo_ignored(self):

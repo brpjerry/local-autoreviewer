@@ -66,11 +66,18 @@ def connect(path):
             if attempt == 49:
                 raise
             time.sleep(0.1)
-    migrate(conn)
+    try:
+        migrate(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
 def migrate(conn):
+    # Fast path without the write lock: every connection checks, and most find nothing to do.
+    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+        return
     while True:
         # Read the version under the write lock, so concurrent openers migrate once.
         with transaction(conn):
@@ -122,6 +129,11 @@ def update_job(conn, job_id, **fields):
         raise ValueError(f"unknown job status {fields['status']!r}")
     columns = ", ".join(f"{name}=?" for name in fields)
     conn.execute(f"UPDATE jobs SET {columns} WHERE id=?", (*fields.values(), job_id))
+
+
+def is_trial(job):
+    """A no-post `review` run in the foreground: it neither counts as a review nor blocks one."""
+    return job["source"] == FOREGROUND and not job["post"]
 
 
 def active_jobs(conn, repo, number, agent=None):

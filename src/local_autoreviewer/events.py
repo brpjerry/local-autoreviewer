@@ -91,16 +91,17 @@ def ingest(conn, cfg, event, *, now, token_owner):
             log.info("%s#%s %s: superseded jobs %s", repo, event.number, agent, superseded)
         rerun = 0
         if event.force:
-            if any(same_target(job) for job in db.active_jobs(conn, repo, event.number, agent)):
+            if any(same_target(job) and not db.is_trial(job)
+                   for job in db.active_jobs(conn, repo, event.number, agent)):
                 continue  # already in flight for this exact head
             rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
         else:
             # Dedupe on the head, but a head whose review was cancelled or superseded
             # (closed then reopened, or force-pushed back) gets reviewed again.
-            # A `review` run in the foreground (often a no-post trial) doesn't count as a review.
+            # A no-post `review` trial doesn't count; a foreground `review --post` does.
             latest = conn.execute(
                 "SELECT status, rerun FROM jobs WHERE repo=? AND number=? AND head_sha=? AND base_ref=? AND agent=?"
-                " AND source!=? ORDER BY rerun DESC LIMIT 1",
+                " AND NOT (source=? AND post=0) ORDER BY rerun DESC LIMIT 1",
                 (repo, event.number, event.head_sha, event.base_ref, agent, db.FOREGROUND)).fetchone()
             if latest is None or latest["status"] in ("cancelled", "superseded"):
                 rerun = db.next_rerun(conn, repo, event.number, event.head_sha, event.base_ref, agent)
