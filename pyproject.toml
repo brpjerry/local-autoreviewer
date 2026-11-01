@@ -1,6 +1,6 @@
 [project]
 name = "local-autoreviewer"
-version = "0.4.0"
+version = "0.4.1"
 description = "Review your GitHub pull requests with local Claude Code and Codex sessions"
 readme = "README.md"
 license = "GPL-3.0-or-later"

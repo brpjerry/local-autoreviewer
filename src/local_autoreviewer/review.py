@@ -322,8 +322,14 @@ def _finding(number, item, repo, sha, attribute=False):
     if item["suggestion"]:
         lines.append("> **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n> "))
     lines += _proposed_changes(item.get("edits") or [])
-    # Indent everything after the first line so it stays inside the numbered item.
-    return [lines[0]] + ["   " + text.replace("\n", "\n   ") if text else "" for text in lines[1:]]
+    # The item's continuation, indented past its marker: "10. " needs four spaces where "9. " needs three.
+    return [lines[0]] + _within_item(lines[1:], " " * len(f"{number}. "))
+
+
+def _within_item(lines, indent):
+    """Lines indented to stay inside a list item. Each line of a multi-line entry (a proposed change's diff)
+    is indented too, or Markdown ends the item at the first one that isn't, and the diff with it."""
+    return [indent + text.replace("\n", "\n" + indent) if text else "" for text in lines]
 
 
 ITEM_KEYS = ("findings", "nits", "test_gaps", "questions")
@@ -485,7 +491,7 @@ def render_round(merged, *, repo, number, sha, base_ref):
         for nit in nits:
             where = _location(repo, sha, nit["file"], nit["line"])
             nit_lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}{_by(nit, attribute)}")
-            nit_lines += ["  " + text if text else "" for text in _proposed_changes(nit.get("edits") or [])]
+            nit_lines += _within_item(_proposed_changes(nit.get("edits") or []), "  ")
         nit_lines += ["", "</details>", ""]
     footer = _footer(merged, sha)
     return _fit("\n".join(head + findings + extras + nit_lines + footer), footer,

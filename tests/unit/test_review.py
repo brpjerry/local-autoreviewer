@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import base64
 import json
+import re
 import unittest
 
 from tests.helpers import ROOT  # noqa: F401  (sets up sys.path / share dir)
@@ -98,6 +99,45 @@ class RenderTests(unittest.TestCase):
         huge = dict(change(5, "matched"), current="x" * (suggestions.MAX_REPLACEMENT + 1))
         self.assertEqual(review.validate(dict(SAMPLE, findings=[dict(finding, edits=[huge])]))["findings"][0]["edits"],
                          [])
+
+    def test_proposed_changes_stay_inside_their_list_items(self):
+        def change(line):
+            return {"file": "a.py", "start_line": line, "end_line": line + 1, "replacement": "new\n  newer",
+                    "current": "old\nolder", "original": ["old", "older"], "inline": False, "anchor": "matched"}
+        demoted = dict(SAMPLE["findings"][0], severity="nit", edits=[change(3)])
+        data = dict(SAMPLE, findings=[dict(SAMPLE["findings"][1], edits=[change(1)]), demoted],
+                    nits=[dict(SAMPLE["nits"][0], edits=[change(5)]), {"file": "a.py", "line": 9, "text": "Last."}])
+        body = self.render(data)
+        fences = 0
+        lines = body.splitlines()
+        for number, line in enumerate(lines):
+            opening = re.match(r"^( *)(`{3,})diff$", line)
+            if not opening:
+                continue
+            fences += 1
+            indent, ticks = opening.groups()
+            for inside in lines[number + 1:]:
+                self.assertTrue(inside.startswith(indent), f"{inside!r} leaves the list item of {line!r}")
+                if inside == indent + ticks:
+                    break
+            else:
+                self.fail(f"{line!r} is never closed")
+        self.assertEqual(fences, 3)
+        self.assertIn("\n  ```diff\n  -old\n  -older\n  +new\n  +  newer\n  ```\n", body)  # the nit's
+        self.assertIn("\n- [`a.py:9`]", body)  # the next nit is a list item of its own, not inside the diff
+
+    def test_two_digit_findings_keep_their_continuation_inside_the_item(self):
+        finding = dict(SAMPLE["findings"][1], edits=[{"file": "a.py", "start_line": 1, "end_line": 1,
+                                                      "replacement": "new", "current": "old", "original": ["old"],
+                                                      "inline": False, "anchor": "matched"}])
+        body = self.render(dict(SAMPLE, findings=[finding] * 10, nits=[]))
+        for number, indent in ((9, "   "), (10, "    ")):
+            item = body[body.index(f"\n{number}. **SQL injection**"):]
+            item = item[:item.index("</details>") + len("</details>")]
+            continuation = [line for line in item.splitlines()[2:] if line]
+            self.assertTrue(continuation)
+            self.assertTrue(all(line.startswith(indent) for line in continuation), item)
+            self.assertIn(f"\n{indent}> **Suggestion:** use parameters\n", item)
 
     def test_prompt_version(self):
         self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")
