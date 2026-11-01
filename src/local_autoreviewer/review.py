@@ -322,7 +322,8 @@ def _finding(number, item, repo, sha, attribute=False):
     if item["suggestion"]:
         lines.append("> **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n> "))
     lines += _proposed_changes(item.get("edits") or [])
-    return [lines[0]] + _within_item(lines[1:], "   ")  # the numbered item's continuation
+    # The item's continuation, indented past its marker: "10. " needs four spaces where "9. " needs three.
+    return [lines[0]] + _within_item(lines[1:], " " * len(f"{number}. "))
 
 
 def _within_item(lines, indent):

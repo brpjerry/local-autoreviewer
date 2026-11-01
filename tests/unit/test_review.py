@@ -126,6 +126,19 @@ class RenderTests(unittest.TestCase):
         self.assertIn("\n  ```diff\n  -old\n  -older\n  +new\n  +  newer\n  ```\n", body)  # the nit's
         self.assertIn("\n- [`a.py:9`]", body)  # the next nit is a list item of its own, not inside the diff
 
+    def test_two_digit_findings_keep_their_continuation_inside_the_item(self):
+        finding = dict(SAMPLE["findings"][1], edits=[{"file": "a.py", "start_line": 1, "end_line": 1,
+                                                      "replacement": "new", "current": "old", "original": ["old"],
+                                                      "inline": False, "anchor": "matched"}])
+        body = self.render(dict(SAMPLE, findings=[finding] * 10, nits=[]))
+        for number, indent in ((9, "   "), (10, "    ")):
+            item = body[body.index(f"\n{number}. **SQL injection**"):]
+            item = item[:item.index("</details>") + len("</details>")]
+            continuation = [line for line in item.splitlines()[2:] if line]
+            self.assertTrue(continuation)
+            self.assertTrue(all(line.startswith(indent) for line in continuation), item)
+            self.assertIn(f"\n{indent}> **Suggestion:** use parameters\n", item)
+
     def test_prompt_version(self):
         self.assertRegex(review.prompt_version(), r"^[0-9a-f]{12}$")
         self.assertEqual(review.prompt_version(), review.prompt_version())
