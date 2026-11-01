@@ -96,10 +96,21 @@ class GitHub:
     def pr_view(self, repo, number):
         return self._json(["pr", "view", str(number), "-R", repo, "--json", PR_VIEW_FIELDS])
 
-    def list_reviews(self, repo, number):
+    def _list(self, path):
         # One compact JSON object per line across all pages (no reliance on newer gh flags).
-        output = self._run(["api", "--paginate", f"repos/{repo}/pulls/{number}/reviews", "--jq", ".[] | tojson"])
+        output = self._run(["api", "--paginate", path, "--jq", ".[] | tojson"])
         return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+    def list_reviews(self, repo, number):
+        return self._list(f"repos/{repo}/pulls/{number}/reviews")
+
+    def list_issue_comments(self, repo, number):
+        """The PR's conversation comments."""
+        return self._list(f"repos/{repo}/issues/{number}/comments")
+
+    def list_review_comments(self, repo, number):
+        """The PR's inline comments, replies included (in_reply_to_id: the thread's first comment)."""
+        return self._list(f"repos/{repo}/pulls/{number}/comments")
 
     def find_marked_review(self, repo, number, job_id, login):
         """Find a review we already posted for this job (crash between post and DB update)."""

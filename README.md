@@ -20,6 +20,7 @@ For each update to one of your open PRs on a configured repo, every enabled agen
 - **Links:** every finding links to the file and line at that commit.
 - **Pushes:** a burst of pushes produces one review. A push during a review cancels it in favour of the new commit.
 - **Follow-ups:** after the first review, later commits get a follow-up instead of a full review. Each agent checks whether the previous round's issues (both agents' findings, or a previous follow-up's open ones) are fixed, partly fixed, not fixed or obsolete. It also reports regressions in what changed since, and nothing else. A previous commit that is gone from the mirror means a full review again, and so does a retarget, unless the old base's changes are all in the new one. That usually covers a stacked PR whose PR below has merged, even by squash, so it carries on with follow-ups. If the PR below changed the same lines again after the last review, it's a full review.
+- **Feedback:** every review ends by asking for feedback: a PR comment that starts with **Review feedback**, or a reply to one of its inline suggestions. When the PR closes, the next poll collects that feedback, and again a day later; it is kept, tied to the review it answers, for tuning the prompts (see [Review data](#review-data)).
 
 > **Security model: built for your own PRs.**
 >
@@ -92,6 +93,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | `local-autoreviewer poll --dry-run` | Show which events the next poll would produce |
 | `local-autoreviewer findings [owner/repo#N] [--untriaged] [--json]` | List what reviews reported; `--json` exports it with each review's metadata |
 | `local-autoreviewer triage ID… [--impact 0-10] [--disposition fixed\|declined\|…] [--commit SHA] [--note …]` | Record what was done about findings |
+| `local-autoreviewer feedback [owner/repo#N] [--collect] [--json]` | Feedback on the reviews, collected when PRs close; `--collect` fetches it now; `--json` exports it with the reviews it answers |
 | `journalctl --user -u local-autoreviewer-worker -f` | Watch the worker |
 
 - **Foreground reviews.** `review` waits out retries of up to 5 minutes and cancels a job that would wait longer, such as one hitting a usage limit. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit. With `--post`, a post interrupted by Ctrl-C is finished by the worker, and a run cancelled before its review is ready lets the service review that commit as it otherwise would have.
@@ -106,6 +108,12 @@ Every review that passes the credential scan is also recorded in the state datab
 - **Per review:** the agent, model, effort, a hash of the prompt and schema, the summary, whether the reviewer judged the PR trivial, and which job's post carried it (`posted_with`).
 - **Per item:** each finding with the reviewer's own ratings, plus test gaps, questions and nits. Reviewers rate each finding with a `severity`, an `impact` from 0 (matters only for something like a cosmic-ray bit flip) to 10 (the app would not work), a `likelihood` and a `trigger` (what has to happen). Also recorded: the proposed edits (whether each was a one-click suggestion, and whether it matched its stated lines, was moved or was left out), the readability rating, the net change in non-test lines, and the severity before and after the adjustments. Follow-ups record each previous finding's status (`resolutions`) and their regressions (kind `regression`), so you can see which fixes worked without triaging by hand. Each review is kept as its reviewer wrote it; an item the duplicate check merged into another reviewer's has `duplicate_of` set, and isn't asked about again in a follow-up.
 - **Afterwards:** `triage` records your own impact rating, what was done (`fixed`, `declined`, `false-positive`, `duplicate`, `deferred`), the fixing commit and a note.
+- **Feedback:** when a reviewed PR closes, merged or not, the next poll collects the feedback given on its reviews, and does so once more a day later for feedback given after the merge:
+  - PR comments, and PR reviews other than the service's own, with a line that starts with `Review feedback` (also as a heading or in bold);
+  - every reply in the thread of one of the review's inline suggestions;
+  - other inline comments with such a line.
+
+  Each item is tied to the review it answers: a reply to its thread's review, anything else to the latest review posted before it. `feedback --json` exports them with that review's jobs (agent, model, effort, prompt version) and the file that holds the review as posted. Each collection replaces the PR's previous one, so feedback deleted or untagged in the meantime goes. A collection that fails is retried by the next polls, up to 5 times. A PR that is reopened and closed again is collected again. PRs that closed before this existed are collected too, a few per poll, and so are PRs reviewed by hand that closed before a poll saw them.
 
 `findings --json` exports everything, including the job's commit, so the rounds of review on a PR can be reconstructed. Housekeeping also records reviews saved before this existed, and an expired job loses its checkout but keeps its `out/` directory.
 
