@@ -24,8 +24,9 @@ _IMAGE_RE = re.compile(r"!\[")
 FEEDBACK_TAG = "Review feedback"
 FEEDBACK_REQUEST = (f"_Feedback on this review? Reply in a PR comment that starts with **{FEEDBACK_TAG}**: "
                     "what was useful, wrong or not worth fixing (findings by number) and what the review missed. "
-                    "Replies to its inline suggestions count too. Feedback is collected when the PR merges, to tune "
-                    "the review prompts._")
+                    "Replies to its inline suggestions count too. Feedback is collected when the PR merges or "
+                    "closes, and once more a day later, to tune the review prompts._")
+SKIPPED_HEADING = "### Automated review skipped"
 
 
 class ReviewFormatError(ValueError):
@@ -543,7 +544,7 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
 
 def render_skipped(*, reason, sha, job_id, agent):
     return "\n".join([
-        "### Automated review skipped",
+        SKIPPED_HEADING,
         "",
         clean(reason),
         "",

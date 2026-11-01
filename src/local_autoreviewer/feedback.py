@@ -3,11 +3,15 @@
 
 Every posted review asks for feedback (review.FEEDBACK_REQUEST). What counts as feedback:
 - comment: a PR conversation comment with a line that starts with TAG;
-- review: someone else's PR review whose body has such a line;
+- review: a PR review other than ours whose body has such a line;
 - reply: any reply in the thread of one of our inline suggestions;
 - inline: another inline comment with such a line.
 Each is tied to the review it answers: a reply to the review its thread belongs to, the others to our
-latest review posted before them."""
+latest review posted before them (not counting "review skipped" notices, which ask for nothing).
+
+A closed PR is collected by the first poll that sees it closed, and once more LATE after that, for
+feedback given after the merge. Each collection replaces the PR's earlier one, so feedback deleted or
+untagged since then goes."""
 
 import logging
 import re
@@ -24,9 +28,10 @@ TAG = review.FEEDBACK_TAG
 # A line starting with the tag, perhaps as a heading or in bold; not a quoted line.
 _TAG_RE = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+)?[*_]*" + re.escape(TAG) + r"(?![A-Za-z0-9])",
                      re.IGNORECASE | re.MULTILINE)
-MAX_ATTEMPTS = 5   # GitHub failures before a closed PR's collection is given up
+MAX_ATTEMPTS = 5   # GitHub failures in a row before a closed PR's collection is given up
 PER_POLL = 5       # closed PRs collected per repo per poll
-MAX_TEXT = 65536
+LATE = 86400       # when a closed PR is collected again
+MAX_TEXT = review.MAX_BODY
 
 
 def is_feedback(body):
@@ -64,7 +69,8 @@ def gather(github, repo, number, login):
         for r in ours:
             if _time(r["submitted_at"]) > created_at:
                 break
-            latest = r["id"]
+            if not r["body"].startswith(review.SKIPPED_HEADING):
+                latest = r["id"]
         return latest
 
     rows = []
@@ -94,9 +100,15 @@ def gather(github, repo, number, login):
     return rows
 
 
-def store(conn, repo, number, rows, *, merged, now):
-    """Save collected feedback (again, if a PR is collected twice) and mark the PR collected, in the caller's
-    transaction. merged: None leaves it as it was."""
+def store(conn, repo, number, rows, *, state, now):
+    """Save a PR's collected feedback in place of what an earlier collection found, in the caller's transaction.
+    state: the PR's state on GitHub when it was collected. A closed PR is marked collected only if the poller
+    has it as closed too: a PR that closed during a collection started while it was open is still collected
+    on its close."""
+    found = {(row["source"], row["github_id"]) for row in rows}
+    gone = [row["id"] for row in conn.execute("SELECT id, source, github_id FROM feedback WHERE repo=? AND number=?",
+                                              (repo, number)) if (row["source"], row["github_id"]) not in found]
+    conn.executemany("DELETE FROM feedback WHERE id=?", [(feedback_id,) for feedback_id in gone])
     conn.executemany(
         "INSERT INTO feedback (repo, number, source, github_id, url, author, created_at, body, review_id, context,"
         " collected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -104,13 +116,16 @@ def store(conn, repo, number, rows, *, merged, now):
         " review_id=excluded.review_id, context=excluded.context, collected_at=excluded.collected_at",
         [(repo, number, row["source"], row["github_id"], row["url"], row["author"], row["created_at"], row["body"],
           row["review_id"], row["context"], now) for row in rows])
-    conn.execute("UPDATE prs SET feedback_collected_at=?, merged=COALESCE(?, merged) WHERE repo=? AND number=?",
-                 (now, None if merged is None else int(merged), repo, number))
+    if state == "OPEN":
+        conn.execute("UPDATE prs SET merged=NULL WHERE repo=? AND number=?", (repo, number))
+    else:
+        conn.execute("UPDATE prs SET feedback_collected_at=?, feedback_attempts=0, merged=? WHERE repo=? AND number=?"
+                     " AND state='closed'", (now, int(state == "MERGED"), repo, number))
 
 
 def collect(conn, svc, repo, number):
-    """Collect one PR's feedback now. Returns how many items it found, or None if GitHub failed (then the PR
-    is retried by a later poll, up to MAX_ATTEMPTS times)."""
+    """Collect one PR's feedback now. Returns how many items it found, or None if GitHub failed (then a closed
+    PR is retried by a later poll, up to MAX_ATTEMPTS times)."""
     try:
         state = svc.github.pr_view(repo, number)["state"]
         rows = gather(svc.github, repo, number, svc.token_owner)
@@ -121,23 +136,36 @@ def collect(conn, svc, repo, number):
         log.warning("%s#%s: cannot collect review feedback: %s", repo, number, exc)
         return None
     with db.transaction(conn):
-        store(conn, repo, number, rows, merged=None if state == "OPEN" else state == "MERGED", now=svc.now())
+        store(conn, repo, number, rows, state=state, now=svc.now())
     log.info("%s#%s: collected %d review feedback item(s)", repo, number, len(rows))
     return len(rows)
 
 
-def pending(conn, repo, limit=PER_POLL):
-    """Closed PRs of the repo that we reviewed and whose feedback isn't collected yet (limit -1: all)."""
+def pending(conn, repo, now, limit=PER_POLL):
+    """Closed PRs of the repo that we reviewed and whose feedback is due (limit -1: all of them): not collected
+    since they closed, or not since LATE after. A closed PR's last_seen_at is when the poller saw it close."""
     return [row["number"] for row in conn.execute(
-        "SELECT number FROM prs p WHERE repo=? AND state='closed' AND feedback_collected_at IS NULL"
-        " AND feedback_attempts<? AND EXISTS (SELECT 1 FROM jobs j WHERE j.repo=p.repo AND j.number=p.number"
-        " AND j.review_id IS NOT NULL) ORDER BY feedback_attempts, last_seen_at LIMIT ?",
-        (repo, MAX_ATTEMPTS, limit))]
+        "SELECT number FROM prs p WHERE repo=? AND state='closed' AND feedback_attempts<?"
+        " AND (feedback_collected_at IS NULL OR (feedback_collected_at<last_seen_at+? AND last_seen_at+?<=?))"
+        " AND EXISTS (SELECT 1 FROM jobs j WHERE j.repo=p.repo AND j.number=p.number AND j.review_id IS NOT NULL)"
+        " ORDER BY feedback_attempts, last_seen_at LIMIT ?", (repo, MAX_ATTEMPTS, LATE, LATE, now, limit))]
 
 
 def collect_pending(conn, svc, repo, limit=PER_POLL):
-    for number in pending(conn, repo, limit):
-        collect(conn, svc, repo, number)
+    """Collect the PRs pending() returns; returns how many of them failed."""
+    return sum(collect(conn, svc, repo, number) is None for number in pending(conn, repo, svc.now(), limit))
+
+
+def canonical_repo(conn, config, repo, number):
+    """owner/repo as the database spells it for this PR (the configured name, for PRs the service knows), else
+    as configured, else as given. GitHub ignores case; the database doesn't."""
+    row = conn.execute("SELECT repo FROM prs WHERE repo=? COLLATE NOCASE AND number=? UNION ALL"
+                       " SELECT repo FROM jobs WHERE repo=? COLLATE NOCASE AND number=? LIMIT 1",
+                       (repo, number, repo, number)).fetchone()
+    if row is not None:
+        return row["repo"]
+    repo_cfg = config.repo(repo)
+    return repo_cfg.name if repo_cfg is not None else repo
 
 
 def export(conn, state, repo=None, number=None):

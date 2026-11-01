@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .. import db, events, feedback
 from ..events import PrEvent
-from ..github import pr_author
+from ..github import GitHubError, pr_author
 
 log = logging.getLogger(__name__)
 
@@ -49,19 +49,36 @@ def poll_lock(state):
 def fetch_repo(conn, svc, repo):
     """Everything poll_repo needs from GitHub, fetched before taking the write lock: holding it
     across network calls would stall the worker's writes for as long as GitHub takes.
-    Returns the open PRs and, for each known-open PR missing from them, its current state."""
+    Returns the open PRs and, for each known-open PR missing from them, its current state; also for
+    a few reviewed PRs the poller has never seen, so their close is recorded and their feedback collected."""
     prs = svc.github.list_open_prs(repo)
     listed = {pr["number"] for pr in prs}
     known_open = [row["number"] for row in conn.execute("SELECT number FROM prs WHERE repo=? AND state='open'",
                                                         (repo,))]
     # Gone from the open list: confirm each one, in case the list was truncated.
     gone = {number: svc.github.pr_view(repo, number) for number in known_open if number not in listed}
+    # Reviewed by hand (`review --post`, `enqueue`) and closed before any poll saw them open.
+    unseen = [row["number"] for row in conn.execute(
+        "SELECT DISTINCT number FROM jobs j WHERE repo=? AND review_id IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM prs p WHERE p.repo=j.repo AND p.number=j.number) ORDER BY number",
+        (repo,)) if row["number"] not in listed][:feedback.PER_POLL]
+    for number in unseen:
+        try:
+            gone[number] = svc.github.pr_view(repo, number)
+        except GitHubError as exc:
+            log.warning("%s#%s: cannot look up this reviewed PR: %s", repo, number, exc)
     return prs, gone
 
 
 def poll_repo(conn, svc, repo_cfg, now, prs, gone):
     """Apply one repo's fetched state inside the caller's transaction; return the events produced."""
     repo = repo_cfg.name
+    for number, pr in gone.items():  # a reviewed PR seen for the first time: record it, then treat it as known
+        conn.execute(
+            "INSERT OR IGNORE INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+            " head_changed_at, last_seen_at) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
+            (repo, number, int(pr["isDraft"]), pr["headRefOid"], pr["baseRefName"], pr_author(pr),
+             pr.get("title") or "", now, now))
     known = {row["number"]: row for row in conn.execute("SELECT * FROM prs WHERE repo=?", (repo,))}
     bootstrap_key = f"bootstrapped:{repo.lower()}"
     review_existing = db.kv_get(conn, bootstrap_key) is not None or svc.config.service.bootstrap == "review"
@@ -80,7 +97,7 @@ def poll_repo(conn, svc, repo_cfg, now, prs, gone):
                ON CONFLICT(repo, number) DO UPDATE SET state='open', is_draft=excluded.is_draft,
                    head_sha=excluded.head_sha, base_ref=excluded.base_ref, author=excluded.author,
                    title=excluded.title, head_changed_at=excluded.head_changed_at,
-                   last_seen_at=excluded.last_seen_at""",
+                   last_seen_at=excluded.last_seen_at, merged=NULL""",
             (repo, number, int(pr["isDraft"]), pr["headRefOid"], pr["baseRefName"], pr_author(pr),
              pr.get("title") or "", head_changed_at, now))
         if action and review_existing:

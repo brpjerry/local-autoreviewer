@@ -299,17 +299,18 @@ def cmd_feedback(args):
     repo = number = None
     if args.ref:
         repo, number = parse_ref(args.ref)
+    failures = 0
     if args.collect:
         cfg = load_config()
         svc = build_services(cfg)
         conn = svc.connect()
         try:
             if repo is not None:
-                if feedback.collect(conn, svc, repo, number) is None:
-                    raise CliError(f"cannot collect the feedback on {repo}#{number}; see the log above")
+                repo = feedback.canonical_repo(conn, cfg, repo, number)
+                failures = int(feedback.collect(conn, svc, repo, number) is None)
             else:
                 for repo_cfg in cfg.repos.values():
-                    feedback.collect_pending(conn, svc, repo_cfg.name, limit=-1)
+                    failures += feedback.collect_pending(conn, svc, repo_cfg.name, limit=-1)
         finally:
             conn.close()
     state = paths.state_dir()
@@ -320,7 +321,16 @@ def cmd_feedback(args):
         conn.close()
     if args.json:
         print(json.dumps(rows, indent=2))
-        return 0
+    else:
+        _print_feedback(rows)
+    if failures:
+        print(f"local-autoreviewer: cannot collect the feedback on {failures} PR(s); see the log above",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def _print_feedback(rows):
     for row in rows:
         merged = {None: "", True: " (merged)", False: " (closed)"}[row["merged"]]
         print(f"{row['id']:>5}  {row['repo']}#{row['number']}{merged}  {row['source']} by {row['author']}  "
@@ -333,7 +343,6 @@ def cmd_feedback(args):
             print(f"       in reply to {row['context'][:150]}")
         for line in row["body"].strip().splitlines()[:40]:
             print(f"       | {line}")
-    return 0
 
 
 def _impact_arg(value):
