@@ -20,6 +20,12 @@ AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
 _MENTION_RE = re.compile(r"(?<![\w`/.@])@(?=[A-Za-z0-9][A-Za-z0-9-]*)")
 _HTML_COMMENT_RE = re.compile(r"<!--|-->")
 _IMAGE_RE = re.compile(r"!\[")
+# Every posted review ends with this request; feedback.py collects the answers when the PR closes.
+FEEDBACK_TAG = "Review feedback"
+FEEDBACK_REQUEST = (f"_Feedback on this review? Reply in a PR comment that starts with **{FEEDBACK_TAG}**: "
+                    "what was useful, wrong or not worth fixing (findings by number) and what the review missed. "
+                    "Replies to its inline suggestions count too. Feedback is collected when the PR merges, to tune "
+                    "the review prompts._")
 
 
 class ReviewFormatError(ValueError):
@@ -417,7 +423,8 @@ def _footer(merged, sha, kind=""):
     jobs = (f"job {members[0]['job_id']}" if len(members) == 1
             else "jobs " + ", ".join(str(m["job_id"]) for m in members))
     who = reviewer_names([m["agent"] for m in members])
-    return ["---", f"<sub>local-autoreviewer · {jobs} · {who}{' · ' + kind if kind else ''}</sub>",
+    return ["---", FEEDBACK_REQUEST, "",
+            f"<sub>local-autoreviewer · {jobs} · {who}{' · ' + kind if kind else ''}</sub>",
             *(marker(m["job_id"], sha, m["agent"]) for m in members)]
 
 

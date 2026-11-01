@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -76,12 +77,55 @@ class Remote:
         return sha
 
 
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class FakeGitHub:
     def __init__(self, login=OWNER):
         self.login = login
         self.prs = {}  # (repo, number) -> dict
         self.posted = []
         self.ids = itertools.count(1000)
+        self.clock = None  # stamps posts and comments; EnvTestCase sets it
+        # (repo, number) -> list, as GitHub returns them: other people's reviews, conversation comments,
+        # and inline comments (posted reviews' inline suggestions are added to these).
+        self.reviews = {}
+        self.issue_comments = {}
+        self.review_comments = {}
+        self.reads = []  # (method, repo, number) for the comment and review listings
+        self.fail = None  # an exception for those listings to raise
+
+    def now(self):
+        return iso(self.clock() if self.clock else 0)
+
+    def _read(self, method, repo, number, items):
+        self.reads.append((method, repo, number))
+        if self.fail is not None:
+            raise self.fail
+        return [dict(item) for item in items]
+
+    def list_reviews(self, repo, number):
+        posted = [r for r in self.posted if (r["repo"], r["number"]) == (repo, number)]
+        return self._read("reviews", repo, number, posted + self.reviews.get((repo, number), []))
+
+    def list_issue_comments(self, repo, number):
+        return self._read("issue_comments", repo, number, self.issue_comments.get((repo, number), []))
+
+    def list_review_comments(self, repo, number):
+        return self._read("review_comments", repo, number, self.review_comments.get((repo, number), []))
+
+    def comment(self, number, body, *, repo=REPO, author=OWNER, reply_to=None, kind="issue_comments"):
+        """Add a conversation comment, or with reply_to (an inline comment's id) a reply in its thread."""
+        item = {"id": next(self.ids), "body": body, "user": {"login": author}, "created_at": self.now(),
+                "html_url": f"https://github.com/{repo}/pull/{number}#comment"}
+        if reply_to is not None:
+            kind = "review_comments"
+            root = next(c for c in self.review_comments[(repo, number)] if c["id"] == reply_to)
+            item.update(in_reply_to_id=reply_to, pull_request_review_id=next(self.ids), path=root["path"],
+                        line=root["line"])
+        getattr(self, kind).setdefault((repo, number), []).append(item)
+        return item
 
     def env(self):
         return {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/")}
@@ -105,9 +149,16 @@ class FakeGitHub:
 
     def post_review(self, repo, number, commit_sha, body, comments=None):
         review_id = next(self.ids)
+        url = f"https://github.com/{repo}/pull/{number}#review-{review_id}"
         self.posted.append({"repo": repo, "number": number, "commit_id": commit_sha, "body": body,
-                            "comments": comments or [], "id": review_id, "user": {"login": self.login}})
-        return {"id": review_id, "html_url": f"https://github.com/{repo}/pull/{number}#review-{review_id}"}
+                            "comments": comments or [], "id": review_id, "user": {"login": self.login},
+                            "submitted_at": self.now(), "html_url": url})
+        for comment in comments or []:
+            self.review_comments.setdefault((repo, number), []).append(
+                {"id": next(self.ids), "pull_request_review_id": review_id, "path": comment["path"],
+                 "line": comment.get("line"), "body": comment["body"], "user": {"login": self.login},
+                 "created_at": self.now(), "html_url": f"{url}-comment"})
+        return {"id": review_id, "html_url": url}
 
     def find_marked_review(self, repo, number, job_id, login):
         needle = f"{MARKER_PREFIX}job={job_id} "
@@ -158,6 +209,7 @@ class EnvTestCase(unittest.TestCase):
         self.remote = Remote(self.tmp / "remote")
         self.github = FakeGitHub()
         self.clock = Clock()
+        self.github.clock = self.clock
         self.state = self.tmp / "state"
         self.state.mkdir()
         self.cfg = make_config(self.tmp)

@@ -81,6 +81,21 @@ MIGRATIONS = [
     ALTER TABLE jobs ADD COLUMN trivial INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE findings ADD COLUMN duplicate_of INTEGER REFERENCES findings (id);
     """,
+    # 6: feedback on the posted reviews, collected from a PR's comments once it closes (see feedback.py).
+    # review_id is the GitHub id of the review answered, as in jobs.review_id. Closed PRs from before this
+    # migration have feedback_collected_at NULL too, so their feedback is collected as well.
+    """
+    ALTER TABLE prs ADD COLUMN merged INTEGER;
+    ALTER TABLE prs ADD COLUMN feedback_collected_at INTEGER;
+    ALTER TABLE prs ADD COLUMN feedback_attempts INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE feedback (
+        id INTEGER PRIMARY KEY, repo TEXT NOT NULL, number INTEGER NOT NULL, source TEXT NOT NULL,
+        github_id INTEGER NOT NULL, url TEXT NOT NULL DEFAULT '', author TEXT NOT NULL,
+        created_at INTEGER NOT NULL, body TEXT NOT NULL, review_id INTEGER, context TEXT,
+        collected_at INTEGER NOT NULL,
+        UNIQUE (repo, source, github_id));
+    CREATE INDEX feedback_pr ON feedback (repo, number);
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

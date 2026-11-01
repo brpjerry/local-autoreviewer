@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_mod
-from . import db, events, leakscan, maintenance, paths, pipeline
+from . import db, events, feedback, leakscan, maintenance, paths, pipeline
 from .agents import make_agent
 from .config import ConfigError, ConfigWatcher
 from .github import GitHub, GitHubError, read_token
@@ -295,6 +295,47 @@ def cmd_findings(args):
     return 0
 
 
+def cmd_feedback(args):
+    repo = number = None
+    if args.ref:
+        repo, number = parse_ref(args.ref)
+    if args.collect:
+        cfg = load_config()
+        svc = build_services(cfg)
+        conn = svc.connect()
+        try:
+            if repo is not None:
+                if feedback.collect(conn, svc, repo, number) is None:
+                    raise CliError(f"cannot collect the feedback on {repo}#{number}; see the log above")
+            else:
+                for repo_cfg in cfg.repos.values():
+                    feedback.collect_pending(conn, svc, repo_cfg.name, limit=-1)
+        finally:
+            conn.close()
+    state = paths.state_dir()
+    conn = db.connect(state / "state.sqlite3")
+    try:
+        rows = feedback.export(conn, state, repo, number)
+    finally:
+        conn.close()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    for row in rows:
+        merged = {None: "", True: " (merged)", False: " (closed)"}[row["merged"]]
+        print(f"{row['id']:>5}  {row['repo']}#{row['number']}{merged}  {row['source']} by {row['author']}  "
+              f"{iso(row['created_at'])}")
+        answered = row["review"]
+        if answered:
+            jobs = ", ".join(f"{job['id']} {job['agent']}" for job in answered["jobs"]) or "no recorded jobs"
+            print(f"       on {answered['url'] or 'review ' + str(answered['id'])} ({jobs})")
+        if row["context"]:
+            print(f"       in reply to {row['context'][:150]}")
+        for line in row["body"].strip().splitlines()[:40]:
+            print(f"       | {line}")
+    return 0
+
+
 def _impact_arg(value):
     impact = int(value)
     if not 0 <= impact <= 10:
@@ -521,6 +562,14 @@ def build_parser():
     p.add_argument("--note")
     p.add_argument("--by", default=os.environ.get("USER", ""), help="who triaged (default: $USER)")
     p.set_defaults(func=cmd_triage)
+
+    p = sub.add_parser("feedback", help="list feedback on posted reviews, collected when PRs close (--json exports it)")
+    p.add_argument("ref", nargs="?", help="owner/repo#N: only this PR")
+    p.add_argument("--collect", action="store_true",
+                   help="collect from GitHub first: this PR now, open or not; without a PR, every closed PR not "
+                        "collected yet")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_feedback)
 
     sub.add_parser("doctor", help="check config, credentials, agents and units").set_defaults(func=cmd_doctor)
     sub.add_parser("codex-login", help="log Codex in for reviews (separate CODEX_HOME)").set_defaults(

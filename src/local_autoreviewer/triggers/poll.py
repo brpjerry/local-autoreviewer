@@ -6,7 +6,7 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path
 
-from .. import db, events
+from .. import db, events, feedback
 from ..events import PrEvent
 from ..github import pr_author
 
@@ -93,7 +93,9 @@ def poll_repo(conn, svc, repo_cfg, now, prs, gone):
         pr = gone.get(number)
         if pr is None or pr["state"] == "OPEN":
             continue  # still open; or, defensively, became known as open after fetch_repo ran
-        conn.execute("UPDATE prs SET state='closed', last_seen_at=? WHERE repo=? AND number=?", (now, repo, number))
+        # Each close (again, after a reopen) has its review feedback collected; see feedback.collect_pending.
+        conn.execute("UPDATE prs SET state='closed', last_seen_at=?, feedback_collected_at=NULL, feedback_attempts=0"
+                     " WHERE repo=? AND number=?", (now, repo, number))
         produced.append(PrEvent(repo=repo, number=number, action="closed", head_sha=pr["headRefOid"],
                                 base_ref=pr["baseRefName"], is_draft=pr["isDraft"], author=pr_author(pr),
                                 source="poll"))
@@ -129,6 +131,14 @@ def _poll(svc, dry_run):
                     conn.execute("ROLLBACK")
                 failures += 1
                 log.error("poll %s failed: %s", repo_cfg.name, exc)
+                continue
+            if not dry_run:
+                try:  # not a failed poll: a PR whose collection fails is retried by later polls
+                    feedback.collect_pending(conn, svc, repo_cfg.name)
+                except Exception as exc:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    log.error("collecting review feedback for %s failed: %s", repo_cfg.name, exc)
         if not dry_run:
             with db.transaction(conn):
                 db.kv_set(conn, "last_poll", svc.now())
