@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -235,6 +236,36 @@ class CollectionTests(EnvTestCase):
         self.assertEqual(self.rows("SELECT number, body FROM feedback"),
                          [{"number": 2, "body": "Review feedback: useful."}])
         self.assertEqual(self.rows("SELECT merged FROM prs WHERE number=2"), [{"merged": 1}])
+
+    def test_a_reviewed_pr_missing_from_the_open_list_is_handled_as_open(self):
+        head = self.remote.open_pr(2, {"src/calc.py": "def divide(a, b):\n    return a // b\n"})
+        self.github.set_pr(2, head)
+        self.post_review(number=2, head=head)
+        newer = self.remote.push_pr(2, {"src/calc.py": "def divide(a, b):\n    return a // b if b else 0\n"})
+        self.github.set_pr(2, newer)
+        listing = self.github.list_open_prs
+        self.github.list_open_prs = lambda repo, limit=500: [pr for pr in listing(repo, limit) if pr["number"] != 2]
+        self.assertEqual(self.poll(), [(2, "opened")])  # truncated away, but open: its new head is reviewed
+        self.assertEqual(self.rows("SELECT head_sha, status FROM jobs WHERE number=2 ORDER BY id"),
+                         [{"head_sha": head, "status": "posted"}, {"head_sha": newer, "status": "queued"}])
+        self.assertEqual(self.rows("SELECT state, head_sha FROM prs WHERE number=2"),
+                         [{"state": "open", "head_sha": newer}])
+
+    def test_a_manual_collection_waits_for_a_running_poll(self):
+        self.post_review()
+        self.github.comment(1, "Review feedback: early.")
+        result = {}
+        with poll_mod.poll_lock(self.state):  # a poll is running
+            thread = threading.Thread(target=lambda: result.setdefault("r", self.cli("feedback", "--collect",
+                                                                                      f"{REPO}#1")))
+            thread.start()
+            thread.join(0.3)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(self.github.reads, [])
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["r"][0], 0)
+        self.assertEqual(self.collected_prs(), [1])
 
     def test_a_failure_while_collecting_is_not_a_failed_poll(self):
         self.post_review()

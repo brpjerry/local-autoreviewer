@@ -305,12 +305,15 @@ def cmd_feedback(args):
         svc = build_services(cfg)
         conn = svc.connect()
         try:
-            if repo is not None:
-                repo = feedback.canonical_repo(conn, cfg, repo, number)
-                failures = int(feedback.collect(conn, svc, repo, number) is None)
-            else:
-                for repo_cfg in cfg.repos.values():
-                    failures += feedback.collect_pending(conn, svc, repo_cfg.name, limit=-1)
+            # One collection at a time, as polls (which collect too) run: a collection replaces the PR's
+            # previous one, so an older fetch committed last would drop what a newer one saved.
+            with poll_mod.poll_lock(svc.state):
+                if repo is not None:
+                    repo = feedback.canonical_repo(conn, cfg, repo, number)
+                    failures = int(feedback.collect(conn, svc, repo, number) is None)
+                else:
+                    for repo_cfg in cfg.repos.values():
+                        failures += feedback.collect_pending(conn, svc, repo_cfg.name, limit=-1)
         finally:
             conn.close()
     state = paths.state_dir()

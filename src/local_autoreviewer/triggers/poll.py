@@ -49,8 +49,9 @@ def poll_lock(state):
 def fetch_repo(conn, svc, repo):
     """Everything poll_repo needs from GitHub, fetched before taking the write lock: holding it
     across network calls would stall the worker's writes for as long as GitHub takes.
-    Returns the open PRs and, for each known-open PR missing from them, its current state; also for
-    a few reviewed PRs the poller has never seen, so their close is recorded and their feedback collected."""
+    Returns the open PRs and, for each known-open PR missing from them, its current state. A few
+    reviewed PRs the poller has never seen are looked up too: an open one joins the open PRs, a closed
+    one the others, so its close is recorded and its feedback collected."""
     prs = svc.github.list_open_prs(repo)
     listed = {pr["number"] for pr in prs}
     known_open = [row["number"] for row in conn.execute("SELECT number FROM prs WHERE repo=? AND state='open'",
@@ -64,16 +65,21 @@ def fetch_repo(conn, svc, repo):
         (repo,)) if row["number"] not in listed][:feedback.PER_POLL]
     for number in unseen:
         try:
-            gone[number] = svc.github.pr_view(repo, number)
+            pr = svc.github.pr_view(repo, number)
         except GitHubError as exc:
             log.warning("%s#%s: cannot look up this reviewed PR: %s", repo, number, exc)
+            continue
+        if pr["state"] == "OPEN":  # missing from a truncated list: an open PR like any other
+            prs.append(pr)
+        else:
+            gone[number] = pr
     return prs, gone
 
 
 def poll_repo(conn, svc, repo_cfg, now, prs, gone):
     """Apply one repo's fetched state inside the caller's transaction; return the events produced."""
     repo = repo_cfg.name
-    for number, pr in gone.items():  # a reviewed PR seen for the first time: record it, then treat it as known
+    for number, pr in gone.items():  # a closed PR seen for the first time: record it as open, then close it
         conn.execute(
             "INSERT OR IGNORE INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
             " head_changed_at, last_seen_at) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)",
