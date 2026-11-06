@@ -208,14 +208,31 @@ class SuggestionTests(unittest.TestCase):
         (comment,) = suggestions.comments(dropped, review.comment_label(dropped))
         self.assertNotIn("other place", comment["body"])
 
-    def test_a_fix_too_long_for_its_comment_is_left_to_the_review(self):
+    def test_a_fix_too_long_for_its_comment_is_shortened_then_left_to_the_review(self):
         huge = "\n".join("x" * 99 for _ in range(400))
-        data = {"findings": [self.finding("minor", [edit("src/app.py", 1, 1, "A", original=["a"], inline=True)]
-                                          + [edit("src/app.py", 2, 2, huge, original=["b"], inline=False)] * 3)],
-                "nits": []}
-        (comment,) = suggestions.comments(data, review.comment_label(data))
-        self.assertLessEqual(len(comment["body"]), suggestions.MAX_COMMENT)
-        self.assertTrue(comment["body"].endswith("_The fix also changes 3 other places, shown in the review._"))
+
+        def comment_for(count):
+            data = {"findings": [self.finding("minor", [edit("src/app.py", 1, 1, "A", original=["a"], inline=True)]
+                                              + [edit("src/app.py", 2, 2, huge, original=["b"], inline=False)] * count)],
+                    "nits": []}
+            (comment,) = suggestions.comments(data, review.comment_label(data))
+            self.assertLessEqual(len(comment["body"]), suggestions.MAX_COMMENT)
+            return comment["body"]
+        # Too long in full: shortened, as a long review's body would have it.
+        body = comment_for(3)
+        self.assertEqual(body.count("more lines"), 3)
+        self.assertNotIn("shown in the review", body)
+        # Too long even so: the review has it.
+        self.assertTrue(comment_for(20).endswith("_The fix also changes 20 other places, shown in the review._"))
+
+    def test_a_shortened_diff_is_capped_in_characters_too(self):
+        minified = "x" * 30_000
+        diff = suggestions.shown_diff(edit("a.py", 1, 1, minified + "\nnext", original=["old"]), shorten=True)
+        self.assertLessEqual(len(diff), suggestions.MAX_SHOWN_CHARS + 100)
+        self.assertIn("… 2 more lines", diff)  # the long line's start, then the rest counted
+        whole = suggestions.shown_diff(edit("a.py", 1, 1, minified, original=["old"]), shorten=False)
+        self.assertIn(minified, whole)  # a body-only edit isn't cut by characters
+        self.assertEqual(suggestions.edit_where(edit("a.py", 3, 5, "")), "a.py:3–5")
 
 
 if __name__ == "__main__":

@@ -157,7 +157,8 @@ class RenderTests(unittest.TestCase):
         # Cut before a whole finding: what's left ends with a finding that is complete.
         kept = body.split("\n\n_Review truncated")[0]
         self.assertTrue(kept.endswith("x" * 100))
-        self.assertEqual(kept.count("**Name**"), body.count("**Name**"))
+        self.assertGreater(kept.count("**Name**"), 0)
+        self.assertEqual(kept.count("x" * 5000), kept.count("**Name**"))  # every finding kept is whole
 
     def body_only(self, lines, count):
         """A finding whose fix is count edits of `lines` lines each, none of them an inline suggestion."""
@@ -172,20 +173,70 @@ class RenderTests(unittest.TestCase):
         body = self.render(data)
         self.assertLessEqual(len(body), review.MAX_BODY)
         self.assertNotIn("truncated", body)
-        self.assertIn("… 101 more lines", body)  # cut to the usual 80
+        self.assertRegex(body, r"… \d+ more lines")  # shortened as usual (80 lines, 4,000 characters)
         self.assertIn("<summary>Nits (1)</summary>", body)  # the nits stay
         short = dict(SAMPLE, findings=[self.body_only(180, 1)])  # fits whole: shown whole
         self.assertNotIn("more lines", self.render(short))
 
     def test_a_cut_never_leaves_a_block_open(self):
-        data = dict(SAMPLE, findings=[dict(self.body_only(80, 10), detail="z" * 3000)] * 12,
+        data = dict(SAMPLE, findings=[dict(self.body_only(80, 3), detail="z" * 3000)] * 12,
                     nits=[{"file": "a.py", "line": 1, "text": "n" * 900}] * 15)
         body = self.render(data)
         self.assertLessEqual(len(body), review.MAX_BODY)
         self.assertIn("_Review truncated to GitHub's size limit._", body)
+        self.assertGreater(body.count("<details>"), 0)  # some findings are kept, with their diffs
         self.assertEqual(body.count("<details>"), body.count("</details>"))
         fences = [line for line in body.splitlines() if line.strip().startswith("```")]
+        self.assertTrue(fences)
         self.assertEqual(len(fences) % 2, 0)
+
+    def test_one_huge_finding_still_leaves_the_others_in(self):
+        # Ten edits of long lines: over the limit even at 80 lines each, but not at 4,000 characters each.
+        wide = [{"file": "a.py", "start_line": n + 1, "end_line": n + 1, "replacement": "\n".join("w" * 240 for _ in range(80)),
+                 "original": ["old"], "inline": False, "anchor": "exact"} for n in range(10)]
+        data = dict(SAMPLE, findings=[dict(SAMPLE["findings"][1], edits=wide), *SAMPLE["findings"][::2]])
+        body = self.render(data)
+        self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertNotIn("truncated", body)
+        self.assertIn("**SQL injection**", body)
+        self.assertIn("**Name**", body)
+
+    def test_a_reviewers_own_lines_are_never_a_cut_point(self):
+        # Findings bring the body near the limit; then test gaps whose own text has list-like lines in a fence.
+        fenced = "Example:\n```\n" + "\n".join(f"- sample {n} " + "q" * 90 for n in range(18)) + "\n```"
+        body = self.render(dict(SAMPLE, findings=[dict(SAMPLE["findings"][0], detail="x" * 6000)] * 10,
+                                test_gaps=[fenced] * 5, nits=[]))
+        self.assertIn("_Review truncated to GitHub's size limit._", body)
+        self.assertIn("#### Test gaps\n- Example:", body)  # the cut falls among the gaps
+        fences = [line for line in body.splitlines() if line.strip().startswith("```")]
+        self.assertEqual(len(fences) % 2, 0)  # at a gap's start, not inside its fence
+
+    def test_a_cut_leaves_no_label_without_a_finding(self):
+        huge = dict(SAMPLE["findings"][1], detail="d" * 70_000)  # the blocker: alone too long for the body
+        body = self.render(dict(SAMPLE, findings=[huge, SAMPLE["findings"][0]], test_gaps=[], nits=[]))
+        kept = body.split("\n\n_Review truncated")[0].rstrip()
+        self.assertFalse(kept.endswith("**Blocker**"))
+        self.assertFalse(kept.endswith("#### Findings"))
+
+    def test_a_merged_review_shortens_the_other_reviewers_fix_too(self):
+        long = "\n".join(f"line {n}" for n in range(300))
+        edits = [{"file": "a.py", "start_line": 1, "end_line": 1, "replacement": long, "original": ["old"],
+                  "inline": False, "anchor": "exact"}]
+        merged = {"members": [], "findings": [dict(SAMPLE["findings"][0], edits=[],
+                  alternatives=[{"agent": "codex", "suggestion": "", "edits": edits}])], "nits": []}
+        compact = review._compacted(merged)
+        self.assertTrue(compact["findings"][0]["alternatives"][0]["edits"][0]["shorten"])
+
+    def test_a_review_saved_by_0_6_posts_one_suggestion_per_item(self):
+        many = [{"file": "a.py", "start_line": n, "end_line": n, "replacement": f"x{n}", "original": ["o"],
+                 "inline": True, "anchor": "exact"} for n in (1, 2, 3)]  # 0.6.0 marked every edit in the diff
+        saved = review.validate(dict(SAMPLE, findings=[dict(SAMPLE["findings"][0], edits=many)]))
+        merged = review.merge([{"job_id": 1, "agent": "claude", "model": "", "review": saved}])
+        self.assertEqual([e["inline"] for e in merged["findings"][0]["edits"]], [True, False, False])
+        self.assertEqual(len(suggestions.comments(merged, review.comment_label(merged))), 1)
+        body = review.render_round(merged, repo="o/r", number=5, sha="a" * 40, base_ref="main")
+        self.assertEqual(body.count("(also a one-click suggestion on the PR)"), 1)
+        self.assertEqual([e["inline"] for e in saved["findings"][0]["edits"]], [True, True, True])  # as recorded
 
     def test_validate_rejects_garbage(self):
         for data in (None, [], {"summary": ""}, {"summary": "x", "findings": ["no"]}):

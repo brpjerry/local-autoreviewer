@@ -301,9 +301,7 @@ def _proposed_changes(edits, by=""):
         lines.append(f"_{dropped} proposed change{'s' if dropped > 1 else ''} didn't match the file and "
                      f"{'were' if dropped > 1 else 'was'} left out._")
     for edit in shown:
-        span = f"{edit['start_line']}" if edit["start_line"] == edit["end_line"] else \
-            f"{edit['start_line']}–{edit['end_line']}"
-        where = clean(f"{edit['file']}:{span}", 300)
+        where = clean(suggestions.edit_where(edit), 300)
         note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
         # Shortened to the usual length when the inline suggestion has it whole, or when the review is too long
         # (see _compacted); otherwise the body is its one copy, so only a huge one is cut.
@@ -431,6 +429,12 @@ def merge(members, duplicates=None, *, unchecked=""):
                 jobs = sorted({m["job_id"], *(r[0] for r in others)}, key=order.get)
                 entry["reviewers"] = list(dict.fromkeys(agent_of[job_id] for job_id in jobs))
                 if key in ("findings", "nits"):
+                    # One inline suggestion per item: a review saved by 0.6.0 or earlier may mark several.
+                    # Only the post is changed; the review as recorded stays as it was.
+                    edits = entry.get("edits") or []
+                    first = next((n for n, edit in enumerate(edits)
+                                  if edit.get("inline") and edit.get("anchor") != "dropped"), None)
+                    entry["edits"] = [{**edit, "inline": n == first} for n, edit in enumerate(edits)]
                     entry["alternatives"] = _alternatives_of(item, [
                         (reviews[job_id][other_key][other_position], agent_of[job_id])
                         for job_id, other_key, other_position in others])
@@ -522,13 +526,15 @@ def _compacted(merged):
 
 # Where a block of the body starts: a numbered finding, a heading, a bold label, a list item, the nits.
 _BLOCK_RE = re.compile(r"^(?:\d+\. \*\*|#### |\*\*\S|- |<details>)", re.MULTILINE)
+_LABEL_RE = re.compile(r"\s*(?:\*\*\w+\*\*|#### [^\n]*)\s*")  # a block that is only a label or heading
 
 
 def _fit(parts, merged):
     """The body within GitHub's limit. parts(merged) gives its lines, its nits' lines and its footer. The
     first of these that fits: the review as is; with every proposed change shortened in the body (an inline
-    suggestion still has its edit whole); that without its nits; and that cut before the last block that
-    doesn't fit, so the cut never lands inside a diff or a list item."""
+    suggestion still has its edit whole); that without its nits; and that cut before the first block that
+    doesn't fit. A block starts at one of the renderer's own lines (a numbered finding, a heading, a list item;
+    see _BLOCK_RE) and runs to the next, so the cut never lands inside a diff, a list item or a model's text."""
     compact = _compacted(merged)
     for candidate, nits in ((merged, True), (compact, True), (compact, False)):
         lines, nit_lines, footer = parts(candidate)
@@ -538,9 +544,21 @@ def _fit(parts, merged):
         if len(body) <= MAX_BODY:
             return body
     tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
-    text = "\n".join(lines + nit_lines)
+    chunks = lines + nit_lines
+    text = "\n".join(chunks)
     limit = MAX_BODY - len(tail) - 100
-    starts = [match.start() for match in _BLOCK_RE.finditer(text, 0, limit + 1)]
+    starts, offset = [], 0
+    for chunk in chunks:  # only where a line of the renderer's starts: not inside a test gap's own lines
+        block = chunk.lstrip("\n")
+        start = offset + len(chunk) - len(block)
+        if start > limit:
+            break
+        if _BLOCK_RE.match(block):
+            starts.append(start)
+        offset += len(chunk) + 1
+    # A severity label or heading left with nothing under it goes too.
+    while len(starts) > 1 and _LABEL_RE.fullmatch(text[starts[-2]:starts[-1]]):
+        starts.pop()
     return text[:starts[-1] if starts else limit].rstrip() + tail
 
 

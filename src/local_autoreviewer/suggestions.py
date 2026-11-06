@@ -7,6 +7,7 @@ the reviewer rates less readable goes down two. The levels are nit < minor < maj
 finding can end up a nit, and one only goes up to blocker from major.
 """
 
+import html
 import re
 from pathlib import Path
 
@@ -19,6 +20,7 @@ MAX_EDITS = 10  # per finding
 MAX_REPLACEMENT = 20_000  # characters
 MAX_SHOWN_LINES = 80  # per edit that is also an inline suggestion, in the review body; that one is complete
 MAX_BODY_ONLY_LINES = 400  # per edit shown only in the review body, so a few huge ones can't fill it
+MAX_SHOWN_CHARS = 4_000  # and characters, so a few long lines (minified code, data) can't fill the body
 MAX_COMMENT = 60_000  # characters of an inline comment; GitHub refuses the whole review past 65,536
 ANCHOR_WINDOW = 30  # lines around a stated range searched for the nearest copy of `current`; beyond, only a unique copy
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -205,8 +207,10 @@ def comments(review, label):
             continue
         body = f"{label(index, item)}\n\n{fence('suggestion', inline['replacement'])}"
         others = [edit for edit in edits if edit is not inline]
-        if others:
+        if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
             rest = _rest_of_fix(others)
+            if len(body) + len(rest) > MAX_COMMENT:
+                rest = _rest_of_fix(others, shorten=True)
             body += (rest if len(body) + len(rest) <= MAX_COMMENT else
                      f"\n\n_The fix also changes {_places(len(others))}, shown in the review._")
         comment = {"path": inline["file"], "line": inline["end_line"], "side": "RIGHT", "body": body}
@@ -220,23 +224,36 @@ def _places(count):
     return f"{count} other place{'s' if count > 1 else ''}"
 
 
-def _rest_of_fix(edits):
+def _rest_of_fix(edits, *, shorten=False):
     """An item's edits other than its suggestion, as collapsed diffs for its inline comment."""
     parts = [f"\n\nThe fix also changes {_places(len(edits))}:"]
     for edit in edits:
-        span = str(edit["start_line"]) if edit["start_line"] == edit["end_line"] else \
-            f"{edit['start_line']}–{edit['end_line']}"
-        where = f"{edit['file']}:{span}".replace("<", "&lt;")
-        diff = shown_diff(edit, shorten=False).replace("<!--", "<!\u200b--")
+        where = html.escape(edit_where(edit)[:300])  # as the body's label: escaped, so no HTML comment either
+        diff = shown_diff(edit, shorten=shorten).replace("<!--", "<!\u200b--")
         parts.append(f"\n\n<details><summary><code>{where}</code></summary>\n\n{diff}\n\n</details>")
     return "".join(parts)
 
 
 def shown_diff(edit, *, shorten=True):
-    """The edit as a diff for the review body: shortened if long and shorten is set (the inline suggestion
-    has it whole), else only if huge."""
+    """The edit as a diff for the review body: shortened if long and shorten is set (to MAX_SHOWN_LINES lines
+    and MAX_SHOWN_CHARS characters; the inline suggestion has it whole), else only if huge."""
     lines = [f"-{line}" for line in edit["original"]] + [f"+{line}" for line in replacement_lines(edit["replacement"])]
     limit = MAX_SHOWN_LINES if shorten else MAX_BODY_ONLY_LINES
-    if len(lines) > limit:
-        lines = lines[:limit] + [f"… {len(lines) - limit} more lines"]
-    return fence("diff", "\n".join(lines))
+    shown, size = [], 0
+    for line in lines[:limit]:
+        if shorten and size + len(line) > MAX_SHOWN_CHARS:
+            if not shown:  # one line longer than the budget: its start
+                shown.append(line[:MAX_SHOWN_CHARS] + " …")
+            break
+        shown.append(line)
+        size += len(line) + 1
+    if len(shown) < len(lines):
+        shown.append(f"… {len(lines) - len(shown)} more lines")
+    return fence("diff", "\n".join(shown))
+
+
+def edit_where(edit):
+    """Where an edit goes, as `file:line` or `file:first–last`."""
+    span = str(edit["start_line"]) if edit["start_line"] == edit["end_line"] else \
+        f"{edit['start_line']}–{edit['end_line']}"
+    return f"{edit['file']}:{span}"
