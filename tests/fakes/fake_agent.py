@@ -33,12 +33,18 @@ def followup(context, new_code=False):
     """A follow-up answer: the first previous finding fixed, the rest not, and one regression. With new_code,
     the changes added new code, so the whole PR was reviewed: a test gap and a nit too."""
     previous = json.loads((context / "previous-findings.json").read_text())
+    # A finding the author replied "won't fix" to, in its thread, is declined.
+    comments = context / "author-comments.json"
+    declined = {item["title"] for comment in (json.loads(comments.read_text()) if comments.is_file() else [])
+                if "won't fix" in comment["body"].lower() for item in previous
+                if item["title"] in (comment.get("thread") or "")}
     regression = dict(REVIEW["findings"][0], title="The fix dropped the docstring", severity="minor", impact=2,
                       likelihood="common", edits=[{"file": "src/calc.py", "start_line": 1, "end_line": 1,
                                                     "replacement": "def divide(a, b):\n    \"\"\"Divide.\"\"\""}])
     return {"summary": f"{len(previous)} previous finding(s) checked.",
-            "resolutions": [{"finding": item["id"], "status": "fixed" if n == 0 else "not_fixed",
-                             "detail": "checked"} for n, item in enumerate(previous)],
+            "resolutions": [{"finding": item["id"], "status": "declined" if item["title"] in declined
+                             else "fixed" if n == 0 else "not_fixed", "detail": "checked"}
+                            for n, item in enumerate(previous)],
             "regressions": [regression], "new_code": new_code,
             "test_gaps": ["No test for the new code."] if new_code else [], "questions": [],
             "nits": [dict(REVIEW["nits"][0], text="Name the new helper.")] if new_code else []}

@@ -11,16 +11,18 @@ latest review posted before them (not counting "review skipped" notices, which a
 
 A closed PR is collected by the first poll that sees it closed, and once more LATE after that, for
 feedback given after the merge. Each collection replaces the PR's earlier one, so feedback deleted or
-untagged since then goes."""
+untagged since then goes.
+
+It also lists the PR author's comments for a follow-up (author_comments), from the same listings: the
+follow-up reads which findings the author decided not to fix. The pipeline imports this module for that."""
 
 import logging
 import re
 from datetime import datetime
 from pathlib import Path
 
-from . import db, review
+from . import db, pipeline, review  # pipeline imports this module too: use its names at call time only
 from .github import MARKER_PREFIX, GitHubError
-from .pipeline import job_paths
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,70 @@ def _context(comment):
     """Where an inline suggestion was, and its heading, for the replies in its thread."""
     heading = (comment.get("body") or "").strip().split("\n", 1)[0][:300]
     return f"{_where(comment)} {heading}".strip()
+
+
+MAX_AUTHOR_COMMENTS = 60  # the author's latest comments a follow-up reads
+_NUMBERED_RE = re.compile(r"^\d+\. \*\*.*$", re.MULTILINE)  # a numbered finding's heading in our post
+MAX_AUTHOR_TEXT = 3000
+
+
+def author_comments(github, repo, number, author, *, login=None):
+    """What the PR's author wrote on it since our first review, oldest first (the latest MAX_AUTHOR_COMMENTS),
+    for a follow-up to read, for instance to see which findings they decided not to fix: conversation comments,
+    review bodies, and inline comments, a reply in one of our threads with that thread's heading. Our own posts
+    are left out (reviews by their marker and our login, which defaults to the author's; our suggestions by
+    their review), and so is anyone else's comment: only the author decides what they won't fix. Another
+    comment carries the id of our review before it, and the first that does carries that review's numbered
+    findings too, so a "won't fix 2" can be matched to the finding the post numbered 2."""
+    reviews = github.list_reviews(repo, number)
+    ours = [r for r in reviews if _login(r).lower() == (login or author).lower()
+            and MARKER_PREFIX in (r.get("body") or "") and r.get("submitted_at")]
+    if not ours:
+        return []
+    since = min(_time(r["submitted_at"]) for r in ours)
+    our_ids = {r["id"] for r in ours}
+    found = []
+
+    def add(kind, item, created_at, **where):
+        body = (item.get("body") or "").strip()
+        if (_login(item).lower() != author.lower() or not body or MARKER_PREFIX in body
+                or _time(created_at) < since):
+            return
+        found.append((_time(created_at), {"kind": kind, **where, "created_at": created_at,
+                                          "body": body[:MAX_AUTHOR_TEXT]}))
+
+    for comment in github.list_issue_comments(repo, number):
+        add("comment", comment, comment["created_at"])
+    for r in reviews:
+        if r["id"] not in our_ids and r.get("submitted_at"):
+            add("review", r, r["submitted_at"])
+    comments = github.list_review_comments(repo, number)
+    by_id = {c["id"]: c for c in comments}
+    for comment in comments:
+        if comment.get("pull_request_review_id") in our_ids:
+            continue  # one of our suggestions
+        root = by_id.get(comment.get("in_reply_to_id"))
+        if root is not None and root.get("pull_request_review_id") in our_ids:
+            add("reply", comment, comment["created_at"], thread=_context(root))
+        else:
+            add("inline", comment, comment["created_at"], where=_where(comment))
+    found.sort(key=lambda pair: pair[0])
+    kept = [item for _, item in found[-MAX_AUTHOR_COMMENTS:]]
+    shown = set()
+    for item in kept:  # oldest first: a review's numbering goes with the first comment that answers it
+        if item["kind"] == "reply":
+            continue  # its thread's heading names the finding
+        before = [r for r in ours if _time(r["submitted_at"]) <= _time(item["created_at"])
+                  and not (r.get("body") or "").startswith(review.SKIPPED_HEADING)]
+        if not before:
+            continue
+        answered = max(before, key=lambda r: (_time(r["submitted_at"]), r["id"]))
+        item["review_id"] = answered["id"]
+        if answered["id"] not in shown:
+            shown.add(answered["id"])
+            item["review"] = {"id": answered["id"], "commit": answered.get("commit_id") or "",
+                              "numbered_findings": _NUMBERED_RE.findall(answered.get("body") or "")}
+    return kept
 
 
 def gather(github, repo, number, login):
@@ -194,7 +260,7 @@ def _review(conn, state, repo, review_id):
     body_file = None
     for job in jobs:  # the post's job: its round.md if it carried other reviews, else its review.md
         if job["posted_with"] in (None, job["id"]):
-            out = Path(job_paths(state, job["id"]).out)
+            out = Path(pipeline.job_paths(state, job["id"]).out)
             name = "round.md" if job["posted_with"] == job["id"] else "review.md"
             body_file = str(out / name) if (out / name).is_file() else None
             break

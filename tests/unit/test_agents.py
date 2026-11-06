@@ -65,6 +65,33 @@ class ArgvTests(unittest.TestCase):
         disabled = {argv[i + 1] for i, a in enumerate(argv) if a == "--disable"}
         self.assertTrue({"shell_tool", "unified_exec"} <= disabled)
 
+    def test_codex_inline_mode_keeps_the_latest_author_comments(self):
+        import json
+        from pathlib import Path
+        from local_autoreviewer.agents import codex as codex_mod
+        _, codex = agents(mode="inline")
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = JobPaths(root=tmp, worktree=f"{tmp}/repo", context=f"{tmp}/context", out=f"{tmp}/out")
+            Path(paths.context).mkdir()
+            Path(paths.context, "pr.diff").write_text("diff")
+            Path(paths.context, "files.txt").write_text("")
+            comments = [{"kind": "comment", "body": f"note {n} " + "é" * 2900} for n in range(40)]
+            comments[-1]["body"] = "Won't fix 2: the caller closes it."
+            Path(paths.context, "author-comments.json").write_text(json.dumps(comments, indent=2))
+            text = codex.inline_context(paths)
+        self.assertIn("## author-comments.json", text)
+        self.assertIn("Won't fix 2: the caller closes it.", text)  # the latest survives the cut
+        self.assertNotIn("note 0 ", text)
+        self.assertIn("oldest comments left out: size limit", text)
+        self.assertNotIn("\\u00e9", text)  # not spent on escapes
+        self.assertEqual(codex_mod._latest_comments("not json", 10), ("not json", ""))
+        # The numbering of a review whose first comment is left out goes to the next comment answering it.
+        numbered = {"id": 9, "commit": "c", "numbered_findings": ["1. **Leak**", "2. **Race**"]}
+        kept = [{"kind": "comment", "body": "x" * 500, "review_id": 9, "review": numbered},
+                {"kind": "comment", "body": "won't fix 2", "review_id": 9}]
+        shown, _ = codex_mod._latest_comments(json.dumps(kept), 400)
+        self.assertEqual(json.loads(shown), [dict(kept[1], review=numbered)])
+
 
 class EnvTests(unittest.TestCase):
     def test_env_is_allowlisted(self):

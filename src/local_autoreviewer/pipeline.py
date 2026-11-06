@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, leakscan, review, suggestions
+from . import combine, db, events, feedback, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS
@@ -470,6 +470,16 @@ def previous_round(conn, job, base_contains=lambda base_sha: False):
     raised = _finding_rows(conn, f"f.job_id IN (SELECT id FROM jobs WHERE {scope}) AND f.duplicate_of IS NULL AND"
                                  " (f.kind IN ('nit', 'test_gap', 'question') OR (f.kind IN ('finding', 'regression')"
                                  " AND f.disposition IS NOT NULL AND f.disposition!='fixed'))", (*args, db.FOREGROUND))
+    # Findings a follow-up found the author declined, and no reviewer still has open: not asked about again
+    # either, so told of the same way, with that follow-up's account of the author's reason.
+    declined = {finding_id: detail for finding_id, detail in conn.execute(
+        f"SELECT finding_id, detail FROM resolutions WHERE status='declined' AND job_id IN"
+        f" (SELECT id FROM jobs WHERE {scope}) ORDER BY id", (*args, db.FOREGROUND))}
+    closed = sorted(set(declined) - {f["id"] for f in findings} - {f["id"] for f in raised})
+    if closed:
+        raised = sorted(raised + [dict(f, disposition="declined", note=declined[f["id"]]) for f in _finding_rows(
+            conn, f"f.id IN ({','.join('?' * len(closed))}) AND f.duplicate_of IS NULL AND f.disposition IS NULL",
+            closed)], key=lambda f: f["id"])
     return PreviousRound(row["head_sha"], findings, raised)
 
 
@@ -483,6 +493,18 @@ def _finding_rows(conn, where, params):
     for row in rows:
         row["also_found_by"] = [agent for agent in json.loads(row["also_found_by"] or "[]") if agent != row["agent"]]
     return rows
+
+
+def _author_comments(svc, job, pr):
+    """The PR author's comments for a follow-up (see feedback.author_comments); none if GitHub can't list them,
+    which only costs the follow-up that context."""
+    author = (pr.get("author") or {}).get("login") or ""
+    try:
+        return (feedback.author_comments(svc.github, job["repo"], job["number"], author, login=svc.token_owner)
+                if author else [])
+    except (GitHubError, ValueError, KeyError, TypeError, AttributeError) as exc:  # unexpected JSON too, as collect
+        log.warning("job %s: cannot read the author's comments (%s); the follow-up goes without them", job["id"], exc)
+        return []
 
 
 def _run(conn, svc, job, cancel):
@@ -545,6 +567,10 @@ def _run(conn, svc, job, cancel):
 
     if cancel():
         return _cancelled(conn, svc, job, cancel)
+    if previous:  # what the author said about the findings since, such as which ones they won't fix
+        Path(paths.context, "author-comments.json").write_text(json.dumps(_author_comments(svc, job, pr), indent=2))
+        if cancel():  # and after its listing calls: a push or close may have come during them
+            return _cancelled(conn, svc, job, cancel)
 
     session_id = agent.new_session_id()
     unit = scope_unit(job["id"])

@@ -370,6 +370,103 @@ class FollowupTests(EnvTestCase):
         self.assertEqual(len(shown), pipeline.MAX_RAISED)
         self.assertEqual((shown[0]["text"], shown[-1]["text"]), ("nit 5", f"nit {pipeline.MAX_RAISED + 4}"))
 
+    def test_a_finding_the_author_declines_is_not_asked_about_again(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        suggestion = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        self.github.comment(1, "Won't fix: callers never pass 0.", reply_to=suggestion["id"])
+        self.github.comment(1, "won't fix, says someone else", author="someone-else")  # not the author: ignored
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        comments = json.loads(self.context(second, "author-comments.json").read_text())
+        self.assertEqual([(c["kind"], c["body"]) for c in comments], [("reply", "Won't fix: callers never pass 0.")])
+        self.assertIn(finding["title"], comments[0]["thread"])
+        self.assertEqual(self.rows("SELECT status FROM resolutions WHERE job_id=?", second), [{"status": "declined"}])
+        self.assertIn(f"🙅 Declined by the author: {finding['title']}", self.github.posted[-1]["body"])
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        previous = json.loads(self.context(third, "previous-findings.json").read_text())
+        self.assertNotIn(finding["id"], [p["id"] for p in previous])
+
+    def test_a_followup_goes_on_without_the_authors_comments_if_github_fails(self):
+        from local_autoreviewer.github import GitHubError
+        self.review_at(self.head_a)
+        self.github.fail = GitHubError("HTTP 502")
+        second, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(json.loads(self.context(second, "author-comments.json").read_text()), [])
+        self.github.fail = None
+        self.assertEqual(status, "posted")
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "followup"}])
+
+    def test_a_push_during_the_comment_listing_starts_no_review(self):
+        self.review_at(self.head_a)
+        calls = len(self.agent_log("claude"))
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        self.github.set_pr(1, head_b)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="claude",
+                                   model="opus", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, job_id, status="running", started_at=self.clock())
+        conn.close()
+        token = pipeline.CancelToken()
+
+        def listing(*args):
+            token.cancel("superseded: head moved")
+            return []
+        from unittest import mock
+        with mock.patch.object(pipeline, "_author_comments", side_effect=listing):
+            status = pipeline.run_job(self.svc, job_id, token)
+        self.assertEqual(status, "cancelled")  # "superseded" when the canceller records why, as the worker does
+        self.assertEqual(len(self.agent_log("claude")), calls)  # the reviewer never started
+        # Cancelled before the listing: no GitHub calls for it at all.
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            again = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="claude",
+                                  model="opus", source="manual", not_before=0, now=self.clock(),
+                                  rerun=db.next_rerun(conn, REPO, 1, head_b, "main", "claude"))
+            db.update_job(conn, again, status="running", started_at=self.clock())
+        conn.close()
+        early = pipeline.CancelToken()
+        early.cancel("shutdown")
+        with mock.patch.object(pipeline, "_author_comments") as listing:
+            pipeline.run_job(self.svc, again, early)
+        listing.assert_not_called()
+
+    def decline_first_finding(self):
+        """A first review whose one finding the author declines in its thread, and the follow-up that marks it."""
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        suggestion = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        self.github.comment(1, "Won't fix: callers never pass 0.", reply_to=suggestion["id"])
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        return finding, second
+
+    def test_a_declined_finding_is_already_raised_for_a_whole_pr_review(self):
+        finding, _ = self.decline_first_finding()
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        raised = {r["text"]: r for r in json.loads(self.context(third, "already-raised.json").read_text())}
+        self.assertEqual((raised[finding["title"]]["decision"], raised[finding["title"]]["note"]), ("declined", "checked"))
+        self.assertNotIn(finding["id"], [p["id"] for p in
+                                         json.loads(self.context(third, "previous-findings.json").read_text())])
+
+    def test_a_finding_one_reviewer_still_has_open_is_asked_about_again(self):
+        finding, second = self.decline_first_finding()
+        conn = self.svc.connect()
+        with db.transaction(conn):  # the round's other reviewer found it not fixed
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=self.rows(
+                "SELECT head_sha FROM jobs WHERE id=?", second)[0]["head_sha"], base_ref="main", agent="codex",
+                model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock(),
+                          review_kind="followup", followup_of=self.head_a)
+            conn.execute("INSERT INTO resolutions (job_id, finding_id, status) VALUES (?, ?, 'not_fixed')",
+                         (other, finding["id"]))
+        conn.close()
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        previous = json.loads(self.context(third, "previous-findings.json").read_text())
+        self.assertIn(finding["id"], [p["id"] for p in previous])
+        raised = json.loads(self.context(third, "already-raised.json").read_text())
+        self.assertNotIn(finding["title"], [r["text"] for r in raised])  # asked about, so not listed as closed
+
     def test_a_saved_followup_keeps_new_code(self):
         self.review_at(self.head_a)
         self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))
@@ -433,6 +530,13 @@ class FollowupFormatTests(unittest.TestCase):
         self.assertIn("- ❔ Not checked: Typo _(Claude Code, minor)_", body)
         self.assertIn("No regressions found.", body)
         self.assertTrue(body.endswith(review.marker(7, "b" * 40, "claude")))
+
+    def test_declined_is_a_status_that_closes_a_finding(self):
+        self.assertIn("declined", review.followup_schema()["properties"]["resolutions"]["items"]["properties"]
+                      ["status"]["enum"])
+        self.assertNotIn("declined", review.OPEN_STATUSES)
+        raw = {"summary": "s", "regressions": [], "resolutions": [{"finding": 1, "status": "declined", "detail": "x"}]}
+        self.assertEqual(review.validate_followup(raw, {1})["resolutions"][0]["status"], "declined")
 
     def test_schema_reuses_the_finding_definition(self):
         schema = review.followup_schema()
