@@ -739,6 +739,11 @@ class DuplicateTests(unittest.TestCase):
         # Only the kept, inline edit is shortened: the other two have no copy outside the body.
         self.assertEqual(body.count("… 21 more lines"), 1)
         self.assertEqual(body.count("+line 99"), 2)
+        # A huge one is still cut, at a much higher limit, so a few can't fill the review.
+        huge = "\n".join(f"line {n}" for n in range(600))
+        members, pairs = self.with_fixes([edit(1, "x")], [edit(3, huge)])
+        body = review.render_round(review.merge(members, pairs), repo="o/r", number=1, sha="a" * 40, base_ref="main")
+        self.assertIn(f"… {601 - suggestions.MAX_BODY_ONLY_LINES} more lines", body)
 
     def test_alternatives_are_not_repeated(self):
         members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "with open(p) as f:")])
@@ -750,8 +755,11 @@ class DuplicateTests(unittest.TestCase):
         pairs.update({(2, "findings", 1): (1, "findings", 0), (1, "findings", 1): (1, "findings", 0)})
         merged = review.merge(members, pairs)
         self.assertEqual([a["agent"] for a in merged["findings"][0]["alternatives"]], ["claude", "codex"])
-        # Trailing whitespace doesn't make a fix different.
-        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "f.close()   ")])
+        # Trailing spaces can change what a fix does (here, the string's value); a final newline doesn't.
+        members, pairs = self.with_fixes([edit(1, 'message = """hello\nworld"""')],
+                                         [edit(1, 'message = """hello  \nworld"""')])
+        self.assertEqual(len(review.merge(members, pairs)["findings"][0]["alternatives"]), 1)
+        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "f.close()\n")])
         self.assertEqual(review.merge(members, pairs)["findings"][0]["alternatives"], [])
 
     def test_malformed_ids_are_ignored(self):

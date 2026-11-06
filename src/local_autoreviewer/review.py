@@ -301,7 +301,8 @@ def _proposed_changes(edits, by=""):
             f"{edit['start_line']}–{edit['end_line']}"
         where = clean(f"{edit['file']}:{span}", 300)
         note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
-        # Shortened only when the inline suggestion has it whole; otherwise the body is its one copy.
+        # Shortened to the usual length only when the inline suggestion has it whole; otherwise the body is
+        # its one copy, so only a huge one is cut.
         diff = suggestions.shown_diff(edit, shorten=bool(edit.get("inline"))).replace("<!--", "<!\u200b--")
         lines += [f"<details><summary>{what} to <code>{where}</code>{note}</summary>", "", diff, "",
                   "</details>"]
@@ -374,9 +375,10 @@ ITEM_KEYS = ("findings", "nits", "test_gaps", "questions")
 
 
 def _edit_key(edit):
-    """An edit's place and text, ignoring trailing whitespace, which doesn't make a fix different."""
+    """An edit's place and replacement lines. Trailing whitespace counts: in a string or a Markdown hard
+    break it changes what the fix does. Only a final newline doesn't (see suggestions.replacement_lines)."""
     return (edit["file"], edit["start_line"], edit["end_line"],
-            tuple(line.rstrip() for line in edit["replacement"].splitlines()))
+            tuple(suggestions.replacement_lines(edit["replacement"])))
 
 
 def _alternatives_of(item, others):

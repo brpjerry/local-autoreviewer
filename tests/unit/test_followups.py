@@ -363,6 +363,13 @@ class FollowupTests(EnvTestCase):
                          ("declined", "Callers never pass 0.", "claude", self.head_a))
         self.assertNotIn("decision", next(r for r in raised if r["kind"] == "nit"))
 
+    def test_only_the_latest_raised_items_are_shown(self):
+        rows = [{"kind": "nit", "agent": "claude", "file": "a.py", "line": n, "raised_at": "abc", "title": f"nit {n}",
+                 "disposition": None, "note": None} for n in range(pipeline.MAX_RAISED + 5)]
+        shown = pipeline.PreviousRound("abc", [], rows).raised_for_agent()
+        self.assertEqual(len(shown), pipeline.MAX_RAISED)
+        self.assertEqual((shown[0]["text"], shown[-1]["text"]), ("nit 5", f"nit {pipeline.MAX_RAISED + 4}"))
+
     def test_a_saved_followup_keeps_new_code(self):
         self.review_at(self.head_a)
         self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))

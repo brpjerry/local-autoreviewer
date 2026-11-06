@@ -422,7 +422,7 @@ class PreviousRound:
     def raised_for_agent(self):
         """The earlier rounds' other items as the follow-up agent sees them (already-raised.json)."""
         out = []
-        for f in self.raised[:MAX_RAISED]:
+        for f in self.raised[-MAX_RAISED:]:  # the latest, if there are more: they're about the newest code
             item = {"kind": "finding" if f["kind"] in ("finding", "regression") else f["kind"], "reviewer": f["agent"],
                     "file": f["file"], "line": f["line"], "raised_at": f["raised_at"],
                     "text": f["title"][:MAX_RAISED_TEXT]}
