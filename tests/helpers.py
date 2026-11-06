@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 os.environ["LOCAL_AUTOREVIEWER_SHARE"] = str(ROOT)
 
 from local_autoreviewer import config as config_mod, pipeline  # noqa: E402
-from local_autoreviewer.github import MARKER_PREFIX  # noqa: E402
+from local_autoreviewer.github import MARKER_PREFIX, GitHubError  # noqa: E402
 from local_autoreviewer.gitops import Git  # noqa: E402
 from local_autoreviewer.runner import DirectRunner  # noqa: E402
 
@@ -95,6 +95,10 @@ class FakeGitHub:
         self.review_comments = {}
         self.reads = []  # (method, repo, number) for the comment and review listings
         self.fail = None  # an exception for those listings to raise
+        self.resolved = set()  # ids of resolved review threads (a thread's id: "T" + its first comment's id)
+        self.resolve_calls = []  # every resolve_thread call, in order
+        self.fail_resolve_after = None  # resolve_thread raises once this many calls have succeeded
+        self.fail_threads = None  # an exception for the thread calls to raise
 
     def now(self):
         return iso(self.clock() if self.clock else 0)
@@ -159,6 +163,21 @@ class FakeGitHub:
                  "line": comment.get("line"), "body": comment["body"], "user": {"login": self.login},
                  "created_at": self.now(), "html_url": f"{url}-comment"})
         return {"id": review_id, "html_url": url}
+
+    def review_threads(self, repo, number):
+        if self.fail_threads is not None:
+            raise self.fail_threads
+        return [{"id": f"T{c['id']}", "resolved": f"T{c['id']}" in self.resolved, "body": c["body"],
+                 "review_id": c.get("pull_request_review_id")}
+                for c in self.review_comments.get((repo, number), []) if not c.get("in_reply_to_id")]
+
+    def resolve_thread(self, thread_id):
+        if self.fail_threads is not None:
+            raise self.fail_threads
+        if self.fail_resolve_after is not None and len(self.resolve_calls) >= self.fail_resolve_after:
+            raise GitHubError("HTTP 502")
+        self.resolve_calls.append(thread_id)
+        self.resolved.add(thread_id)
 
     def find_marked_review(self, repo, number, job_id, login):
         needle = f"{MARKER_PREFIX}job={job_id} "
