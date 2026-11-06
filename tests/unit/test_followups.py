@@ -345,6 +345,24 @@ class FollowupTests(EnvTestCase):
         previous = json.loads(self.context(third, "previous-findings.json").read_text())
         self.assertEqual([p["title"] for p in previous], ["The fix dropped the docstring"])
 
+    def test_the_followup_is_told_what_was_already_raised(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id FROM findings WHERE job_id=? AND kind='finding'", first)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            db.triage(conn, finding["id"], now=self.clock(), disposition="declined", note="Callers never pass 0.")
+        conn.close()
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(json.loads(self.context(second, "previous-findings.json").read_text()), [])
+        raised = json.loads(self.context(second, "already-raised.json").read_text())
+        self.assertEqual(sorted((r["kind"], r["text"]) for r in raised),
+                         [("finding", "Division by zero is unhandled"), ("nit", "Add a docstring."),
+                          ("test_gap", "No test for b == 0.")])
+        declined = next(r for r in raised if r["kind"] == "finding")
+        self.assertEqual((declined["decision"], declined["note"], declined["reviewer"], declined["raised_at"]),
+                         ("declined", "Callers never pass 0.", "claude", self.head_a))
+        self.assertNotIn("decision", next(r for r in raised if r["kind"] == "nit"))
+
     def test_a_saved_followup_keeps_new_code(self):
         self.review_at(self.head_a)
         self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))
@@ -428,11 +446,27 @@ class FollowupFormatTests(unittest.TestCase):
         self.assertEqual((older["new_code"], older["test_gaps"], older["questions"], older["nits"]),
                          (False, [], [], []))
         self.assertFalse(review.validate_followup(dict(raw, new_code="yes"), set())["new_code"])
+        # Without new code there was no review of the whole PR, so whatever the agent put there is dropped.
+        without = review.validate_followup(dict(raw, new_code=False), set())
+        self.assertEqual((without["test_gaps"], without["questions"], without["nits"]), ([], [], []))
+
+    def test_a_long_followup_drops_its_nits_first(self):
+        nits = [{"file": "a.py", "line": 1, "text": "x" * 900} for _ in range(15)]
+        data = review.validate_followup({"summary": "s", "new_code": True, "resolutions": [], "regressions": [
+            {"severity": "minor", "title": "T", "file": "a.py", "line": 1, "detail": "d" * 5000} for _ in range(12)],
+            "nits": nits}, set())
+        body = review.render_followup(data, [], repo="o/r", number=5, sha="b" * 40, previous_sha="a" * 40,
+                                      agent="claude", model="opus", job_id=7)
+        self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertIn("_Nits omitted: review too long._", body)
+        self.assertNotIn("<summary>Nits", body)
+        self.assertTrue(body.endswith(review.marker(7, "b" * 40, "claude")))
 
     def test_the_prompt_carries_the_full_review_for_new_code(self):
         prompt = review.build_followup_prompt(previous_sha="a" * 40, previous_count=1, repo="o/r", number=5,
                                               title="T", author="me", base_ref="main", head_sha="b" * 40,
                                               worktree="/w", context="/c")
+        self.assertIn("/c/already-raised.json", prompt)
         order = [prompt.index(text) for text in ("3. **New code.**", "## A full review, for job 3",
                                                  "## Method: this is the only pass",
                                                  "## What to cover (a thorough review)", "## Proposed changes",
@@ -452,7 +486,7 @@ class FollowupFormatTests(unittest.TestCase):
              "nits": [{"file": "b.py", "line": 1, "text": "Name it export_rows."}]}, {1})
         body = review.render_followup(data, previous, repo="o/r", number=5, sha="b" * 40, previous_sha="a" * 40,
                                       agent="claude", model="opus", job_id=7)
-        self.assertIn("The changes since add new code, so the reviewer also reviewed the whole PR again.", body)
+        self.assertIn("The changes since add new code, so the reviewer also reviewed the whole PR.", body)
         self.assertIn("#### New findings\n1. **Export ignores --since**", body)
         self.assertIn("#### Test gaps\n- Nothing tests export.", body)
         self.assertIn("#### Questions\n- Why CSV?", body)
@@ -469,9 +503,22 @@ class FollowupFormatTests(unittest.TestCase):
             return {"job_id": job_id, "agent": agent, "model": "", "review": data}
         merged = review.merge([member(1, "claude", False), member(2, "codex", True)])
         body = review.render_followup_round(merged, [], repo="o/r", number=5, sha="b" * 40, previous_sha="a" * 40)
-        self.assertIn("The changes since add new code, so Codex also reviewed the whole PR again.", body)
+        self.assertIn("The changes since add new code, so Codex also reviewed the whole PR.", body)
         self.assertIn("**Codex:** codex checked.", body)
-        self.assertIn("No new issues found.", body)
+        # Claude's findings would only be regressions, so the round doesn't call them all new findings.
+        self.assertIn("No regressions or new issues found.", body)
+        regression = {"severity": "minor", "title": "Breaks X", "file": "a.py", "line": 1}
+
+        def heading(*flags):
+            members = [member(n, agent, flag) for n, (agent, flag) in enumerate(zip(("claude", "codex"), flags), 1)]
+            members[0]["review"] = review.validate_followup({"summary": "s", "new_code": flags[0],
+                                                             "regressions": [regression], "resolutions": []}, set())
+            text = review.render_followup_round(review.merge(members), [], repo="o/r", number=5, sha="b" * 40,
+                                                previous_sha="a" * 40)
+            return next(line for line in text.splitlines() if line.startswith("#### "))
+        self.assertEqual(heading(True, True), "#### New findings")
+        self.assertEqual(heading(False, True), "#### Regressions and new findings")
+        self.assertEqual(heading(False, False), "#### Regressions")
 
     def test_agents_take_the_followup_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

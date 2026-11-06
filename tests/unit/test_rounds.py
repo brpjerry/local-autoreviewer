@@ -481,6 +481,36 @@ class RoundTests(EnvTestCase):
         self.assertIn("_(Claude Code and Codex; correctness, impact 2/10, common)_", body)
         self.assertIn("· follow-up</sub>", body)
 
+    def test_a_whole_pr_followup_round_merges_its_nits_and_test_gaps(self):
+        svc, (claude, codex) = self.queue()
+        self.run_job(svc, claude)
+        self.run_job(svc, codex)
+        self.clock.advance(60)
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        self.github.set_pr(1, head_b)
+        svc, (claude_b, codex_b) = self.queue(cfg=make_config(self.tmp, claude="newcode", codex="newcode"), head=head_b)
+        self.run_job(svc, claude_b)
+        self.assertEqual(self.run_job(svc, codex_b), "posted")
+        body = self.github.posted[-1]["body"]
+        self.assertIn("so Claude Code and Codex also reviewed the whole PR.", body)
+        self.assertIn("#### New findings", body)
+        self.assertEqual(body.count("No test for the new code."), 1)  # both reported it; posted once
+        self.assertIn("- No test for the new code. _(Claude Code and Codex)_", body)
+        self.assertEqual(body.count("Name the new helper."), 1)
+        # The second reviewer's copies are recorded as duplicates of the first's, as for a full review.
+        copies = self.rows(svc, "SELECT kind FROM findings WHERE job_id=? AND duplicate_of IS NOT NULL ORDER BY kind",
+                           codex_b)
+        self.assertEqual([row["kind"] for row in copies], ["nit", "regression", "test_gap"])
+        # A third round is told of the nit and the test gap once each, and of the first review's own.
+        head_c = self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"})
+        self.github.set_pr(1, head_c)
+        svc, (claude_c, _) = self.queue(head=head_c)
+        self.run_job(svc, claude_c)
+        raised = json.loads(Path(pipeline.job_paths(self.state, claude_c).context, "already-raised.json").read_text())
+        self.assertEqual(sorted((r["kind"], r["text"]) for r in raised),
+                         [("nit", "Add a docstring."), ("nit", "Name the new helper."),
+                          ("test_gap", "No test for b == 0."), ("test_gap", "No test for the new code.")])
+
     def test_review_post_command_posts_once(self):
         from local_autoreviewer import __main__ as cli
         svc = self.services()
@@ -692,6 +722,37 @@ class DuplicateTests(unittest.TestCase):
         self.assertIn("</details>\n\n  **Codex proposed a different fix.**", body)  # inside the nit's item
         self.assertIn("<summary>Codex's proposed change to <code>a.py:1</code></summary>", body)
         self.assertNotIn("Codex's suggestion", body)  # a nit has none
+
+    def test_a_partly_dropped_alternative_says_so(self):
+        members, pairs = self.with_fixes([edit(1, "f.close()")],
+                                         [edit(1, "with open(p) as f:"), dict(edit(5, "x"), anchor="dropped")])
+        merged = review.merge(members, pairs)
+        body = review.render_round(merged, repo="o/r", number=1, sha="a" * 40, base_ref="main")
+        self.assertIn("Codex proposed a different fix.**\n   > **Codex's suggestion:** Use a with block.\n"
+                      "   _1 proposed change didn't match the file and was left out._", body)
+        self.assertEqual(body.count("Codex's proposed change to"), 1)
+
+    def test_an_edit_without_an_inline_copy_is_shown_whole(self):
+        long = "\n".join(f"line {n}" for n in range(100))
+        members, pairs = self.with_fixes([edit(1, long), edit(2, long, inline=False)], [edit(3, long)])
+        body = review.render_round(review.merge(members, pairs), repo="o/r", number=1, sha="a" * 40, base_ref="main")
+        # Only the kept, inline edit is shortened: the other two have no copy outside the body.
+        self.assertEqual(body.count("… 21 more lines"), 1)
+        self.assertEqual(body.count("+line 99"), 2)
+
+    def test_alternatives_are_not_repeated(self):
+        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "with open(p) as f:")])
+        # A second copy from Codex with the same fix, and one from Claude with another: only a new fix is listed,
+        # under the reviewer that proposed it, even when that's the kept item's own reviewer.
+        members[1]["review"]["findings"].append(dict(members[1]["review"]["findings"][0]))
+        members[0]["review"]["findings"].append(dict(members[0]["review"]["findings"][0],
+                                                     edits=[edit(2, "f = None")]))
+        pairs.update({(2, "findings", 1): (1, "findings", 0), (1, "findings", 1): (1, "findings", 0)})
+        merged = review.merge(members, pairs)
+        self.assertEqual([a["agent"] for a in merged["findings"][0]["alternatives"]], ["claude", "codex"])
+        # Trailing whitespace doesn't make a fix different.
+        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "f.close()   ")])
+        self.assertEqual(review.merge(members, pairs)["findings"][0]["alternatives"], [])
 
     def test_malformed_ids_are_ignored(self):
         answer = {"duplicates": [{"ids": [["F1"], {"x": 1}, "F1", "F2"]}]}

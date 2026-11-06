@@ -151,9 +151,11 @@ def validate_followup(raw, previous_ids):
     none of these."""
     if not isinstance(raw, dict):
         raise ReviewFormatError("follow-up is not an object")
+    new_code = raw.get("new_code") is True
+    # Without new code the follow-up didn't review the whole PR, so it has no test gaps, questions or nits.
     base = validate({"summary": raw.get("summary"), "findings": raw.get("regressions") or [],
-                     **{key: raw.get(key) for key in ("test_gaps", "questions", "nits")}})
-    base["new_code"] = raw.get("new_code") is True
+                     **{key: raw.get(key) if new_code else [] for key in ("test_gaps", "questions", "nits")}})
+    base["new_code"] = new_code
     resolutions = {}
     for item in raw.get("resolutions") or []:
         if not isinstance(item, dict) or item.get("status") not in FOLLOWUP_STATUSES:
@@ -299,7 +301,8 @@ def _proposed_changes(edits, by=""):
             f"{edit['start_line']}–{edit['end_line']}"
         where = clean(f"{edit['file']}:{span}", 300)
         note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
-        diff = suggestions.shown_diff(edit).replace("<!--", "<!\u200b--")
+        # Shortened only when the inline suggestion has it whole; otherwise the body is its one copy.
+        diff = suggestions.shown_diff(edit, shorten=bool(edit.get("inline"))).replace("<!--", "<!\u200b--")
         lines += [f"<details><summary>{what} to <code>{where}</code>{note}</summary>", "", diff, "",
                   "</details>"]
     return lines
@@ -371,18 +374,25 @@ ITEM_KEYS = ("findings", "nits", "test_gaps", "questions")
 
 
 def _edit_key(edit):
-    return edit["file"], edit["start_line"], edit["end_line"], edit["replacement"]
+    """An edit's place and text, ignoring trailing whitespace, which doesn't make a fix different."""
+    return (edit["file"], edit["start_line"], edit["end_line"],
+            tuple(line.rstrip() for line in edit["replacement"].splitlines()))
 
 
-def _alternative(item, other, agent):
-    """Another reviewer's fix for a duplicate of item, if it proposes a change item's edits don't: all of
-    its applied edits (a fix is shown whole), not as inline suggestions; otherwise None."""
-    edits = suggestions.applied(other.get("edits") or [])
-    known = {_edit_key(edit) for edit in suggestions.applied(item.get("edits") or [])}
-    if not any(_edit_key(edit) not in known for edit in edits):
-        return None
-    return {"agent": agent, "suggestion": other.get("suggestion") or "",  # a nit has none
-            "edits": [{**edit, "inline": False} for edit in edits]}
+def _alternatives_of(item, others):
+    """The other reviewers' fixes for item's duplicates (others: (item, agent) pairs, in display order):
+    each one that proposes a change neither item nor an earlier alternative does. A fix is kept whole,
+    with its dropped edits so the review can say some were left out, and none of it becomes an inline
+    suggestion."""
+    out, shown = [], [{_edit_key(edit) for edit in suggestions.applied(item.get("edits") or [])}]
+    for other, agent in others:
+        applied = {_edit_key(edit) for edit in suggestions.applied(other.get("edits") or [])}
+        if not applied or any(applied <= edits for edits in shown):
+            continue
+        shown.append(applied)
+        out.append({"agent": agent, "suggestion": other.get("suggestion") or "",  # a nit has none
+                    "edits": [{**edit, "inline": False} for edit in other.get("edits") or []]})
+    return out
 
 
 def merge(members, duplicates=None, *, unchecked=""):
@@ -414,9 +424,9 @@ def merge(members, duplicates=None, *, unchecked=""):
                 jobs = sorted({m["job_id"], *(r[0] for r in others)}, key=order.get)
                 entry["reviewers"] = list(dict.fromkeys(agent_of[job_id] for job_id in jobs))
                 if key in ("findings", "nits"):
-                    entry["alternatives"] = [alternative for alternative in (
-                        _alternative(item, reviews[job_id][other_key][other_position], agent_of[job_id])
-                        for job_id, other_key, other_position in others) if alternative]
+                    entry["alternatives"] = _alternatives_of(item, [
+                        (reviews[job_id][other_key][other_position], agent_of[job_id])
+                        for job_id, other_key, other_position in others])
                 if key == "findings":
                     entry["also"] = []
                     for job_id, other_key, other_position in others:
@@ -582,7 +592,7 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
     whole = [member["agent"] for member in merged["members"] if member.get("new_code")]
     if whole:
         who = reviewer_names(whole) if attribute else "the reviewer"
-        scope = f". The changes since add new code, so {who} also reviewed the whole PR again"
+        scope = f". The changes since add new code, so {who} also reviewed the whole PR"
     else:
         scope = ", and for regressions in the changes since"
     lines = [_heading("Follow-up review", merged["members"]), "",
@@ -612,13 +622,20 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
                     line += " — " + clean(answer["detail"], 2000).replace("\n", " ")
                 lines.append(line)
         lines.append("")
+    # What the findings are depends on who reviewed the whole PR: all, some or none of the reviewers.
+    if not whole:
+        heading, none_found = "Regressions", "No regressions found."
+    elif len(whole) == len(merged["members"]):
+        heading, none_found = "New findings", "No new issues found."
+    else:
+        heading, none_found = "Regressions and new findings", "No regressions or new issues found."
     if merged["findings"]:
-        lines.append("#### New findings" if whole else "#### Regressions")
+        lines.append(f"#### {heading}")
         for n, item in enumerate(merged["findings"], 1):
             lines += _finding(n, item, repo, sha, attribute)
         lines.append("")
     else:
-        lines += ["No new issues found." if whole else "No regressions found.", ""]
+        lines += [none_found, ""]
     lines += _extras(merged, attribute)
     nit_lines = _nits(merged, [], repo, sha, attribute)
     footer = _footer(merged, sha, "follow-up")

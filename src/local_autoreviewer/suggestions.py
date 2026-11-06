@@ -17,7 +17,7 @@ DEFAULT_TEST_PATHS = (
 )
 MAX_EDITS = 10  # per finding
 MAX_REPLACEMENT = 20_000  # characters
-MAX_SHOWN_LINES = 80  # per edit, in the review body; the inline suggestion is complete
+MAX_SHOWN_LINES = 80  # per edit that is also an inline suggestion, in the review body; that one is complete
 ANCHOR_WINDOW = 30  # lines around a stated range searched for the nearest copy of `current`; beyond, only a unique copy
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -199,9 +199,9 @@ def comments(review, label):
     return out
 
 
-def shown_diff(edit):
-    """The edit as a diff for the review body, shortened if long."""
+def shown_diff(edit, *, shorten=True):
+    """The edit as a diff for the review body, shortened if long and shorten is set."""
     lines = [f"-{line}" for line in edit["original"]] + [f"+{line}" for line in replacement_lines(edit["replacement"])]
-    if len(lines) > MAX_SHOWN_LINES:
+    if shorten and len(lines) > MAX_SHOWN_LINES:
         lines = lines[:MAX_SHOWN_LINES] + [f"… {len(lines) - MAX_SHOWN_LINES} more lines"]
     return fence("diff", "\n".join(lines))

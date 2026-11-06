@@ -202,14 +202,15 @@ class Git:
         merged = self.run(["-C", m, "merge-tree", "--write-tree", merge_base, previous_sha], check=False)
         return merged.stdout.split()[0] if merged.returncode == 0 else None
 
-    def write_followup_context(self, mirror, start, head_sha, ctx_dir, *, exclude, previous):
+    def write_followup_context(self, mirror, start, head_sha, ctx_dir, *, exclude, previous, raised=()):
         """A follow-up's extra context: what the PR changed since the previous review (from start, see
-        since_review_start), and that review's findings."""
+        since_review_start), that review's open findings, and what earlier reviews raised besides."""
         excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
         diff = self.run(["-C", str(mirror), "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
                          start, head_sha, "--", ".", *excludes], text=False).stdout
         (Path(ctx_dir) / "since-review.diff").write_bytes(diff)
         (Path(ctx_dir) / "previous-findings.json").write_text(json.dumps(previous, indent=2))
+        (Path(ctx_dir) / "already-raised.json").write_text(json.dumps(list(raised), indent=2))
         names = self.run(["-C", str(mirror), "diff", "--no-color", "--name-only", "-z", start, head_sha, "--", ".",
                           *excludes], text=False).stdout
         return len(diff), names.count(b"\0")  # for the size limits, like the PR's own diff

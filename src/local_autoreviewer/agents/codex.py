@@ -67,7 +67,7 @@ class CodexAgent:
         diff = Path(paths.context, "pr.diff").read_text(errors="replace")
         parts.append(f"\n## pr.diff\n\n```diff\n{diff[:INLINE_LIMIT // 2]}\n```\n")
         size += len(parts[-1])
-        for name in ("previous-findings.json", "since-review.diff"):  # a follow-up review's context
+        for name in ("previous-findings.json", "already-raised.json", "since-review.diff"):  # a follow-up's context
             extra = Path(paths.context, name)
             if extra.is_file():
                 text = extra.read_text(errors="replace")
