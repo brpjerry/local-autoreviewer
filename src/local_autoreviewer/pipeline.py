@@ -696,6 +696,7 @@ def _saved_review(svc, job):
     structured = review.validate(data)
     if isinstance(data.get("resolutions"), list):  # a follow-up's statuses of the previous findings
         structured["resolutions"] = data["resolutions"]
+        structured["new_code"] = data.get("new_code") is True
     return {"job_id": job["id"], "agent": job["agent"], "model": job["model"], "review": structured}
 
 

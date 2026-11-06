@@ -72,12 +72,20 @@ def followup_schema(prompts=None):
     """The follow-up schema, built from the review schema (from a snapshot if given) so a finding has one
     definition."""
     text = (prompts or {}).get("review.schema.json") or schema_path().read_text()
-    finding = json.loads(text)["properties"]["findings"]["items"]
+    full = json.loads(text)["properties"]
+    finding = full["findings"]["items"]
+    only_new_code = " Only when new_code is true; otherwise empty."
     return {
-        "type": "object", "additionalProperties": False, "required": ["summary", "resolutions", "regressions"],
+        "type": "object", "additionalProperties": False,
+        "required": ["summary", "new_code", "resolutions", "regressions", "test_gaps", "questions", "nits"],
         "properties": {
             "summary": {"type": "string",
-                        "description": "2-4 sentences: how the previous findings stand, and any regressions."},
+                        "description": "2-4 sentences: how the previous findings stand, any regressions, and whether "
+                                       "the changes added new code, so the whole PR was reviewed."},
+            "new_code": {"type": "boolean",
+                         "description": "true if the changes since the previous review add new code, so you reviewed "
+                                        "the whole PR as a full review would; false if they only fix the previous "
+                                        "findings."},
             "resolutions": {
                 "type": "array", "description": "Exactly one entry per previous finding, by its id.",
                 "items": {
@@ -91,7 +99,10 @@ def followup_schema(prompts=None):
                 },
             },
             "regressions": {"type": "array", "description": "New problems the changes since the previous review "
-                                                            "introduce. Empty if none.", "items": finding},
+                                                            "introduce, and with new code any other problem in the "
+                                                            "PR. Empty if none.", "items": finding},
+            **{key: {**full[key], "description": full[key]["description"] + only_new_code}
+               for key in ("test_gaps", "questions", "nits")},
         },
     }
 
@@ -120,22 +131,29 @@ def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, c
 
 
 def build_followup_prompt(*, previous_sha, previous_count, prompts=None, **fields):
-    """The follow-up prompt. It shares the review prompt's sections on proposed changes and severity, so
-    the two can't drift apart."""
+    """The follow-up prompt. It shares the review prompt's sections on method, coverage, proposed changes and
+    severity (the first two for a follow-up that finds new code and reviews the whole PR), so the two can't
+    drift apart."""
     prompts = prompts or snapshot(followup=True)
     full = prompts["review.md"]
     # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
     text = Template(prompts["followup.md"]).safe_substitute(
+        method=_section(full, "Method: this is the only pass"),
+        coverage=_section(full, "What to cover (a thorough review)"),
         proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
         previous_sha=previous_sha, previous_count=previous_count)
     return build_prompt(**fields, template=Template(text))
 
 
 def validate_followup(raw, previous_ids):
-    """Coerce a follow-up's structured output; regressions are checked like a review's findings."""
+    """Coerce a follow-up's structured output; regressions are checked like a review's findings, and the test
+    gaps, questions and nits of one that found new code like a review's. Follow-ups from before new_code have
+    none of these."""
     if not isinstance(raw, dict):
         raise ReviewFormatError("follow-up is not an object")
-    base = validate({"summary": raw.get("summary"), "findings": raw.get("regressions") or []})
+    base = validate({"summary": raw.get("summary"), "findings": raw.get("regressions") or [],
+                     **{key: raw.get(key) for key in ("test_gaps", "questions", "nits")}})
+    base["new_code"] = raw.get("new_code") is True
     resolutions = {}
     for item in raw.get("resolutions") or []:
         if not isinstance(item, dict) or item.get("status") not in FOLLOWUP_STATUSES:
@@ -265,10 +283,12 @@ def marker(job_id, sha, agent):
     return f"<!-- local-autoreviewer job={job_id} sha={sha} agent={agent} -->"
 
 
-def _proposed_changes(edits):
+def _proposed_changes(edits, by=""):
     """Each proposed change as a collapsed diff, so the review stands on its own without its inline
-    suggestions. The diff is code; only marker-like HTML comments are broken up."""
+    suggestions. The diff is code; only marker-like HTML comments are broken up. by: the reviewer whose
+    alternative these are, for a merged duplicate's own fix."""
     lines = []
+    what = f"{by}'s proposed change" if by else "Proposed change"
     shown = suggestions.applied(edits)
     dropped = len(edits) - len(shown)
     if dropped:
@@ -280,8 +300,22 @@ def _proposed_changes(edits):
         where = clean(f"{edit['file']}:{span}", 300)
         note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
         diff = suggestions.shown_diff(edit).replace("<!--", "<!\u200b--")
-        lines += [f"<details><summary>Proposed change to <code>{where}</code>{note}</summary>", "", diff, "",
+        lines += [f"<details><summary>{what} to <code>{where}</code>{note}</summary>", "", diff, "",
                   "</details>"]
+    return lines
+
+
+def _alternatives(item):
+    """The fixes the other reviewers of a merged duplicate proposed, where they differ from the kept one's:
+    their suggestion and their own changes, shown in the body only (never as a competing inline suggestion)."""
+    lines = []
+    for other in item.get("alternatives") or []:
+        name = reviewer_names([other["agent"]])
+        # A blank line first: right after a </details> or a quote, Markdown would take it as part of that.
+        lines += ["", f"**{name} proposed a different fix.**"]
+        if other.get("suggestion"):
+            lines.append(f"> **{name}'s suggestion:** " + clean(other["suggestion"]).replace("\n", "\n> "))
+        lines += _proposed_changes(other["edits"], by=name)
     return lines
 
 
@@ -322,6 +356,7 @@ def _finding(number, item, repo, sha, attribute=False):
     if item["suggestion"]:
         lines.append("> **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n> "))
     lines += _proposed_changes(item.get("edits") or [])
+    lines += _alternatives(item)
     # The item's continuation, indented past its marker: "10. " needs four spaces where "9. " needs three.
     return [lines[0]] + _within_item(lines[1:], " " * len(f"{number}. "))
 
@@ -335,10 +370,26 @@ def _within_item(lines, indent):
 ITEM_KEYS = ("findings", "nits", "test_gaps", "questions")
 
 
+def _edit_key(edit):
+    return edit["file"], edit["start_line"], edit["end_line"], edit["replacement"]
+
+
+def _alternative(item, other, agent):
+    """Another reviewer's fix for a duplicate of item, if it proposes a change item's edits don't: all of
+    its applied edits (a fix is shown whole), not as inline suggestions; otherwise None."""
+    edits = suggestions.applied(other.get("edits") or [])
+    known = {_edit_key(edit) for edit in suggestions.applied(item.get("edits") or [])}
+    if not any(_edit_key(edit) not in known for edit in edits):
+        return None
+    return {"agent": agent, "suggestion": other.get("suggestion") or "",  # a nit has none
+            "edits": [{**edit, "inline": False} for edit in edits]}
+
+
 def merge(members, duplicates=None, *, unchecked=""):
     """One or more reviews of a commit as one, the shape the renderers take. members: dicts with job_id,
     agent, model and review (validated), in display order. duplicates maps an item that repeats another, as
-    (job_id, key, position), to the item it repeats, which is kept and credited to both reviewers.
+    (job_id, key, position), to the item it repeats, which is kept and credited to both reviewers. Where a
+    repeat proposes a different fix, the kept item lists it in alternatives.
     unchecked: why the reviews couldn't be checked for duplicates, if they couldn't."""
     duplicates = duplicates or {}
     agent_of = {m["job_id"]: m["agent"] for m in members}
@@ -348,7 +399,8 @@ def merge(members, duplicates=None, *, unchecked=""):
         repeats.setdefault(tuple(kept), []).append(tuple(dropped))
     order = {m["job_id"]: n for n, m in enumerate(members)}
     merged = {"members": [{"job_id": m["job_id"], "agent": m["agent"], "model": m.get("model") or "",
-                           "summary": m["review"]["summary"], "trivial": bool(m["review"].get("trivial"))}
+                           "summary": m["review"]["summary"], "trivial": bool(m["review"].get("trivial")),
+                           "new_code": bool(m["review"].get("new_code"))}
                           for m in members],
               "unchecked": unchecked, **{key: [] for key in ITEM_KEYS}}
     for m in members:
@@ -361,6 +413,10 @@ def merge(members, duplicates=None, *, unchecked=""):
                 entry = {"text": item} if isinstance(item, str) else dict(item)
                 jobs = sorted({m["job_id"], *(r[0] for r in others)}, key=order.get)
                 entry["reviewers"] = list(dict.fromkeys(agent_of[job_id] for job_id in jobs))
+                if key in ("findings", "nits"):
+                    entry["alternatives"] = [alternative for alternative in (
+                        _alternative(item, reviews[job_id][other_key][other_position], agent_of[job_id])
+                        for job_id, other_key, other_position in others) if alternative]
                 if key == "findings":
                     entry["also"] = []
                     for job_id, other_key, other_position in others:
@@ -475,27 +531,38 @@ def render_round(merged, *, repo, number, sha, base_ref):
         findings.append("")
     else:
         findings += ["No significant issues found.", ""]
-    extras = []
-    for title, items in (("Test gaps", merged["test_gaps"]), ("Questions", merged["questions"])):
-        if items:
-            extras.append(f"#### {title}")
-            extras += [f"- {clean(item['text'], 2000)}{_by(item, attribute)}" for item in items]
-            extras.append("")
-    demoted = [(n, item) for n, item in numbered if item["severity"] == "nit"]
-    nits = merged["nits"][:MAX_NITS * len(merged["members"])]
-    nit_lines = []
-    if demoted or nits:
-        nit_lines += [f"<details><summary>Nits ({len(demoted) + len(nits)})</summary>", ""]
-        for n, item in demoted:
-            nit_lines += _finding(n, item, repo, sha, attribute)
-        for nit in nits:
-            where = _location(repo, sha, nit["file"], nit["line"])
-            nit_lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}{_by(nit, attribute)}")
-            nit_lines += _within_item(_proposed_changes(nit.get("edits") or []), "  ")
-        nit_lines += ["", "</details>", ""]
+    extras = _extras(merged, attribute)
+    nit_lines = _nits(merged, [(n, item) for n, item in numbered if item["severity"] == "nit"], repo, sha, attribute)
     footer = _footer(merged, sha)
     return _fit("\n".join(head + findings + extras + nit_lines + footer), footer,
                 shorter="\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer))
+
+
+def _extras(merged, attribute):
+    """The test gaps and questions sections."""
+    lines = []
+    for title, items in (("Test gaps", merged["test_gaps"]), ("Questions", merged["questions"])):
+        if items:
+            lines.append(f"#### {title}")
+            lines += [f"- {clean(item['text'], 2000)}{_by(item, attribute)}" for item in items]
+            lines.append("")
+    return lines
+
+
+def _nits(merged, demoted, repo, sha, attribute):
+    """The collapsed nits section: findings demoted to nits (numbered, as they're listed with the findings'
+    numbers), then the nits, each with its proposed change and any other reviewer's."""
+    nits = merged["nits"][:MAX_NITS * len(merged["members"])]
+    if not demoted and not nits:
+        return []
+    lines = [f"<details><summary>Nits ({len(demoted) + len(nits)})</summary>", ""]
+    for n, item in demoted:
+        lines += _finding(n, item, repo, sha, attribute)
+    for nit in nits:
+        where = _location(repo, sha, nit["file"], nit["line"])
+        lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}{_by(nit, attribute)}")
+        lines += _within_item(_proposed_changes(nit.get("edits") or []) + _alternatives(nit), "  ")
+    return lines + ["", "</details>", ""]
 
 
 def render_followup(review, previous, *, repo, number, sha, previous_sha, agent, model, job_id):
@@ -505,14 +572,22 @@ def render_followup(review, previous, *, repo, number, sha, previous_sha, agent,
 
 def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
     """A follow-up, or several merged: each previous finding's status (from each reviewer), then any
-    regressions as numbered findings. previous: the finding rows checked, with the agent that raised each
-    and, in also_found_by, the agents whose duplicates of it were merged into it."""
+    regressions as numbered findings. A follow-up that found new code reviewed the whole PR, so its
+    findings are new findings, with test gaps, questions and nits as in a review. previous: the finding rows
+    checked, with the agent that raised each and, in also_found_by, the agents whose duplicates of it were
+    merged into it."""
     attribute = len(merged["members"]) > 1
     commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
     before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
+    whole = [member["agent"] for member in merged["members"] if member.get("new_code")]
+    if whole:
+        who = reviewer_names(whole) if attribute else "the reviewer"
+        scope = f". The changes since add new code, so {who} also reviewed the whole PR again"
+    else:
+        scope = ", and for regressions in the changes since"
     lines = [_heading("Follow-up review", merged["members"]), "",
-             f"Checked commit {commit} for the {len(previous)} issue(s) open after {before}, and for regressions in "
-             "the changes since. Automated read-only review.", "", *_summaries(merged)]
+             f"Checked commit {commit} for the {len(previous)} issue(s) open after {before}{scope}. "
+             "Automated read-only review.", "", *_summaries(merged)]
     if previous:
         lines.append("#### Previous findings")
         for item in previous:
@@ -538,14 +613,17 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
                 lines.append(line)
         lines.append("")
     if merged["findings"]:
-        lines.append("#### Regressions")
+        lines.append("#### New findings" if whole else "#### Regressions")
         for n, item in enumerate(merged["findings"], 1):
             lines += _finding(n, item, repo, sha, attribute)
         lines.append("")
     else:
-        lines += ["No regressions found.", ""]
+        lines += ["No new issues found." if whole else "No regressions found.", ""]
+    lines += _extras(merged, attribute)
+    nit_lines = _nits(merged, [], repo, sha, attribute)
     footer = _footer(merged, sha, "follow-up")
-    return _fit("\n".join(lines + footer), footer)
+    return _fit("\n".join(lines + nit_lines + footer), footer,
+                shorter="\n".join(lines + (["_Nits omitted: review too long._", ""] if nit_lines else []) + footer))
 
 
 def render_skipped(*, reason, sha, job_id, agent):

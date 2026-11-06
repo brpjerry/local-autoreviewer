@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.helpers import REPO, EnvTestCase, make_config
-from local_autoreviewer import combine, db, events, pipeline, review
+from local_autoreviewer import combine, db, events, pipeline, review, suggestions
 from local_autoreviewer.github import GitHubError
 from local_autoreviewer.worker import Worker
 
@@ -575,6 +575,12 @@ def finding(title, severity="minor", impact=3, **extra):
             "file": "a.py", "line": 1, "title": title, "detail": "", "suggestion": "", "edits": [], **extra}
 
 
+def edit(line, replacement, inline=True):
+    """A proposed edit as suggestions.apply() leaves it: checked against the file, one-click if in the diff."""
+    return {"file": "a.py", "start_line": line, "end_line": line, "replacement": replacement, "original": ["old"],
+            "inline": inline, "anchor": "exact"}
+
+
 class DuplicateTests(unittest.TestCase):
     def members(self):
         first = review.validate({"summary": "one", "findings": [finding("Leak", "major", 6)],
@@ -631,6 +637,61 @@ class DuplicateTests(unittest.TestCase):
         body = review.render_round(merged, repo="o/r", number=1, sha="a" * 40, base_ref="main")
         self.assertIn("Codex rated it minor (impact 3/10).", body)
         self.assertNotIn("reported it as a nit", body)
+
+    def with_fixes(self, claude_edits, codex_edits, key="findings"):
+        """The members, with each reviewer's copy of one issue proposing the given edits."""
+        members = self.members()
+        if key == "findings":
+            for member, edits, suggestion in ((members[0], claude_edits, "Close it."),
+                                              (members[1], codex_edits, "Use a with block.")):
+                member["review"]["findings"] = [dict(member["review"]["findings"][0], edits=edits,
+                                                     suggestion=suggestion)]
+            return members, {(2, "findings", 0): (1, "findings", 0)}
+        for member, edits in ((members[0], claude_edits), (members[1], codex_edits)):
+            member["review"]["nits"] = [{"file": "a.py", "line": 1, "text": "Rename x", "edits": edits}]
+        return members, {(2, "nits", 0): (1, "nits", 0)}
+
+    def test_a_repeat_with_another_fix_shows_it_under_the_kept_finding(self):
+        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "with open(p) as f:"), edit(4, "pass")])
+        merged = review.merge(members, pairs)
+        (kept,) = [f for f in merged["findings"] if f["title"] == "Leak"]
+        self.assertEqual([(a["agent"], len(a["edits"])) for a in kept["alternatives"]], [("codex", 2)])
+        body = review.render_round(merged, repo="o/r", number=1, sha="a" * 40, base_ref="main")
+        self.assertIn("**Codex proposed a different fix.**", body)
+        self.assertIn("> **Codex's suggestion:** Use a with block.", body)
+        self.assertEqual(body.count("<summary>Codex's proposed change to <code>a.py:"), 2)
+        self.assertIn("<summary>Proposed change to <code>a.py:1</code> (also a one-click suggestion on the PR)", body)
+        self.assertNotIn("Codex's proposed change to <code>a.py:1</code> (also", body)  # never inline
+        # Only the kept fix is an inline suggestion, so two never compete for the same lines.
+        comments = suggestions.comments(merged, review.comment_label(merged))
+        self.assertEqual([c["body"].split("```suggestion\n", 1)[1] for c in comments], ["f.close()\n```"])
+        # Inside the finding's list item, like its own proposed change, and after a blank line: right after
+        # the </details> above, GitHub would show it as raw text.
+        self.assertIn("</details>\n\n   **Codex proposed a different fix.**", body)
+
+    def test_a_repeat_with_the_same_fix_adds_nothing(self):
+        members, pairs = self.with_fixes([edit(1, "f.close()")], [edit(1, "f.close()")])
+        merged = review.merge(members, pairs)
+        self.assertEqual(merged["findings"][0]["alternatives"], [])
+        self.assertNotIn("proposed a different fix",
+                         review.render_round(merged, repo="o/r", number=1, sha="a" * 40, base_ref="main"))
+        # Nor does one with no fix, or one whose edits didn't match the file.
+        for codex_edits in ([], [dict(edit(3, "x"), anchor="dropped")]):
+            members, pairs = self.with_fixes([edit(1, "f.close()")], codex_edits)
+            self.assertEqual(review.merge(members, pairs)["findings"][0]["alternatives"], [])
+
+    def test_a_kept_finding_without_a_fix_shows_the_repeats(self):
+        members, pairs = self.with_fixes([], [edit(1, "with open(p) as f:")])
+        merged = review.merge(members, pairs)
+        self.assertEqual(len(merged["findings"][0]["alternatives"]), 1)
+
+    def test_a_repeated_nit_with_another_change_shows_it(self):
+        members, pairs = self.with_fixes([edit(1, "count = 0")], [edit(1, "total = 0")], key="nits")
+        merged = review.merge(members, pairs)
+        body = review.render_round(merged, repo="o/r", number=1, sha="a" * 40, base_ref="main")
+        self.assertIn("</details>\n\n  **Codex proposed a different fix.**", body)  # inside the nit's item
+        self.assertIn("<summary>Codex's proposed change to <code>a.py:1</code></summary>", body)
+        self.assertNotIn("Codex's suggestion", body)  # a nit has none
 
     def test_malformed_ids_are_ignored(self):
         answer = {"duplicates": [{"ids": [["F1"], {"x": 1}, "F1", "F2"]}]}

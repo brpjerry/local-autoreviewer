@@ -29,8 +29,9 @@ REVIEW = {
 }
 
 
-def followup(context):
-    """A follow-up answer: the first previous finding fixed, the rest not, and one regression."""
+def followup(context, new_code=False):
+    """A follow-up answer: the first previous finding fixed, the rest not, and one regression. With new_code,
+    the changes added new code, so the whole PR was reviewed: a test gap and a nit too."""
     previous = json.loads((context / "previous-findings.json").read_text())
     regression = dict(REVIEW["findings"][0], title="The fix dropped the docstring", severity="minor", impact=2,
                       likelihood="common", edits=[{"file": "src/calc.py", "start_line": 1, "end_line": 1,
@@ -38,7 +39,9 @@ def followup(context):
     return {"summary": f"{len(previous)} previous finding(s) checked.",
             "resolutions": [{"finding": item["id"], "status": "fixed" if n == 0 else "not_fixed",
                              "detail": "checked"} for n, item in enumerate(previous)],
-            "regressions": [regression]}
+            "regressions": [regression], "new_code": new_code,
+            "test_gaps": ["No test for the new code."] if new_code else [], "questions": [],
+            "nits": [dict(REVIEW["nits"][0], text="Name the new helper.")] if new_code else []}
 
 
 def anchored(review, offset):
@@ -80,8 +83,8 @@ def main():
                                  "prompt": prompt, "pid": os.getpid()}) + "\n")
     codex = "exec" in argv
     review = dict(REVIEW)
-    if "This is a follow-up, not a new review." in prompt:
-        review = followup(Path(os.getcwd()).parent / "context")
+    if "This is a follow-up." in prompt:
+        review = followup(Path(os.getcwd()).parent / "context", new_code=mode == "newcode")
     if mode == "trivial":
         review = dict(review, summary="Bumps the version.", trivial=True, findings=[], test_gaps=[], nits=[])
     if "Your only job is to find the duplicates" in prompt:
