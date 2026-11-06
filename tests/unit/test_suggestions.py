@@ -229,7 +229,8 @@ class SuggestionTests(unittest.TestCase):
         minified = "x" * 30_000
         diff = suggestions.shown_diff(edit("a.py", 1, 1, minified + "\nnext", original=["old"]), shorten=True)
         self.assertLessEqual(len(diff), suggestions.MAX_SHOWN_CHARS + 100)
-        self.assertIn("… 2 more lines", diff)  # the long line's start, then the rest counted
+        self.assertIn("-old\n+" + "x" * 1000, diff)  # after the removed line, the long line's start
+        self.assertIn("… 1 more lines", diff)  # then the rest counted
         whole = suggestions.shown_diff(edit("a.py", 1, 1, minified, original=["old"]), shorten=False)
         self.assertIn(minified, whole)  # a body-only edit isn't cut by characters
         self.assertEqual(suggestions.edit_where(edit("a.py", 3, 5, "")), "a.py:3–5")

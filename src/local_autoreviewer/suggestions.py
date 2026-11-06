@@ -242,8 +242,9 @@ def shown_diff(edit, *, shorten=True):
     shown, size = [], 0
     for line in lines[:limit]:
         if shorten and size + len(line) > MAX_SHOWN_CHARS:
-            if not shown:  # one line longer than the budget: its start
-                shown.append(line[:MAX_SHOWN_CHARS] + " …")
+            room = MAX_SHOWN_CHARS - size
+            if not shown or room >= 200:  # a line too long for what's left: its start, in the room there is
+                shown.append(line[:room] + " …")
             break
         shown.append(line)
         size += len(line) + 1

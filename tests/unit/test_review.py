@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import unittest
+from unittest import mock
 
 from tests.helpers import ROOT  # noqa: F401  (sets up sys.path / share dir)
 from local_autoreviewer import leakscan, review, suggestions
@@ -201,6 +202,27 @@ class RenderTests(unittest.TestCase):
         self.assertIn("**SQL injection**", body)
         self.assertIn("**Name**", body)
 
+    def test_a_finding_too_long_even_shortened_keeps_its_text(self):
+        # A merged duplicate: ten long-line edits of its own and ten of the other reviewer's.
+        def wide(n, text):
+            return {"file": "a.py", "start_line": n, "end_line": n, "replacement": text, "original": ["old"],
+                    "inline": False, "anchor": "exact"}
+        own = [wide(n + 1, "\n".join("w" * 240 for _ in range(80))) for n in range(10)]
+        other = [wide(n + 20, "\n".join("v" * 240 for _ in range(80))) for n in range(10)]
+        item = dict(review.validate({"summary": "s", "findings": [SAMPLE["findings"][1]]})["findings"][0],
+                    edits=own, reviewers=["claude", "codex"], also=[],
+                    alternatives=[{"agent": "codex", "suggestion": "Use parameters.", "edits": other}])
+        merged = {"members": [{"job_id": 1, "agent": "claude", "model": "", "summary": "s", "trivial": False},
+                              {"job_id": 2, "agent": "codex", "model": "", "summary": "s", "trivial": False}],
+                  "unchecked": "", "findings": [item], "nits": [], "test_gaps": [], "questions": []}
+        body = review.render_round(merged, repo="o/r", number=5, sha="a" * 40, base_ref="main")
+        self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertIn("_Review truncated to GitHub's size limit._", body)
+        self.assertIn("**SQL injection**", body)  # the finding stays, with its text
+        self.assertIn("user input reaches query", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+        self.assertEqual(len([line for line in body.splitlines() if line.strip().startswith("```")]) % 2, 0)
+
     def test_a_reviewers_own_lines_are_never_a_cut_point(self):
         # Findings bring the body near the limit; then test gaps whose own text has list-like lines in a fence.
         fenced = "Example:\n```\n" + "\n".join(f"- sample {n} " + "q" * 90 for n in range(18)) + "\n```"
@@ -212,8 +234,11 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(len(fences) % 2, 0)  # at a gap's start, not inside its fence
 
     def test_a_cut_leaves_no_label_without_a_finding(self):
-        huge = dict(SAMPLE["findings"][1], detail="d" * 70_000)  # the blocker: alone too long for the body
-        body = self.render(dict(SAMPLE, findings=[huge, SAMPLE["findings"][0]], test_gaps=[], nits=[]))
+        huge = dict(SAMPLE["findings"][1], detail="d" * review.MAX_FIELD)  # the blocker: alone too long here
+        with mock.patch.object(review, "MAX_BODY", 4_000):
+            body = self.render(dict(SAMPLE, findings=[huge, SAMPLE["findings"][0]], test_gaps=[], nits=[]))
+            self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertIn("_Review truncated to GitHub's size limit._", body)
         kept = body.split("\n\n_Review truncated")[0].rstrip()
         self.assertFalse(kept.endswith("**Blocker**"))
         self.assertFalse(kept.endswith("#### Findings"))

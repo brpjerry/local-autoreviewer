@@ -534,7 +534,9 @@ def _fit(parts, merged):
     first of these that fits: the review as is; with every proposed change shortened in the body (an inline
     suggestion still has its edit whole); that without its nits; and that cut before the first block that
     doesn't fit. A block starts at one of the renderer's own lines (a numbered finding, a heading, a list item;
-    see _BLOCK_RE) and runs to the next, so the cut never lands inside a diff, a list item or a model's text."""
+    see _BLOCK_RE) and runs to the next, so the cut never lands inside a diff, a list item or a model's text.
+    A finding's proposed changes (each a <details> of its own) are blocks too: a finding too long even then
+    keeps its title, detail and suggestion, and loses only the diffs that don't fit."""
     compact = _compacted(merged)
     for candidate, nits in ((merged, True), (compact, True), (compact, False)):
         lines, nit_lines, footer = parts(candidate)
@@ -553,7 +555,7 @@ def _fit(parts, merged):
         start = offset + len(chunk) - len(block)
         if start > limit:
             break
-        if _BLOCK_RE.match(block):
+        if _BLOCK_RE.match(block) or block.lstrip(" ").startswith("<details><summary>"):
             starts.append(start)
         offset += len(chunk) + 1
     # A severity label or heading left with nothing under it goes too.
