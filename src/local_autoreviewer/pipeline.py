@@ -980,9 +980,11 @@ def post_failed(conn, svc, job, exc):
         except Exception:
             existing = None
         if existing:
-            return _finish(conn, svc, job["id"], "posted", "review found after a failed post", posted_at=svc.now(),
-                           post_attempts=post_attempts, review_id=existing.get("id"),
-                           review_url=existing.get("html_url"))
+            status = _finish(conn, svc, job["id"], "posted", "review found after a failed post", posted_at=svc.now(),
+                             post_attempts=post_attempts, review_id=existing.get("id"),
+                             review_url=existing.get("html_url"))
+            _resolve_after_post(conn, svc, job)
+            return status
     if rejected or post_attempts >= svc.config.service.max_attempts:
         saved = f"review saved to {job_paths(svc.state, job['id']).out}/{'round' if current['posted_with'] else 'review'}.md"
         return _finish(conn, svc, job["id"], "failed", f"post failed: {exc}; {saved}"[:1000],
@@ -1013,8 +1015,10 @@ def recover_post(conn, svc, job):
             return post_failed(conn, svc, job, exc)
         existing = None  # a push or close ended the job: don't wait on GitHub any longer
     if existing:
-        return _finish(conn, svc, job["id"], "posted", "review found after an interrupted post",
-                       posted_at=svc.now(), review_id=existing.get("id"), review_url=existing.get("html_url"))
+        status = _finish(conn, svc, job["id"], "posted", "review found after an interrupted post",
+                         posted_at=svc.now(), review_id=existing.get("id"), review_url=existing.get("html_url"))
+        _resolve_after_post(conn, svc, job)
+        return status
     job = db.get_job(conn, job["id"])
     if job["cancel_requested"]:
         reason = job["reason"] or "cancelled"
@@ -1061,39 +1065,65 @@ def post(conn, svc, job):
         return post_failed(conn, svc, job, exc)
     status = _finish(conn, svc, job["id"], "posted", "review posted", posted_at=svc.now(),
                      review_id=review_id, review_url=review_url)
-    if job["followup_of"]:
-        resolve_fixed_threads(conn, svc, job)
+    _resolve_after_post(conn, svc, job)
     return status
 
 
+def _resolve_after_post(conn, svc, job):
+    """For a posted follow-up: resolve_fixed_threads, best effort. Nothing may escape it: the job is posted
+    already, and an error reaching run_job would requeue it and post the review again."""
+    if not job["followup_of"]:
+        return
+    try:
+        resolve_fixed_threads(conn, svc, db.get_job(conn, job["id"]))
+    except Exception:
+        log.exception("job %s: could not resolve the threads of fixed findings; they stay open", job["id"])
+
+
 RESOLVED_STATUSES = ("fixed", "obsolete")  # a previous finding's thread is resolved when every answer is one
-_THREAD_TITLE_RE = re.compile(r"^\*\*\d+\. (.*)\*\* \(local-autoreviewer")  # review.comment_label's heading
+# review.comment_label's heading; a title can run over lines, and stops at the first label end.
+_THREAD_TITLE_RE = re.compile(r"^\*\*\d+\. (.*?)\*\* \(local-autoreviewer", re.DOTALL)
 
 
 def resolve_fixed_threads(conn, svc, job):
     """After a follow-up round is posted, resolve the review threads of the previous findings that every
-    reviewer of the round found fixed or obsolete, so their stale suggestions collapse on the PR. A finding's
-    threads are the inline comments its own round posted for it: in that round's review, under the heading
-    comment_label gave it. Best effort: if GitHub fails, the threads stay open. Returns how many were resolved."""
-    jobs = [job["id"], *(row["id"] for row in _members(conn, job))]
+    reviewer of the round found fixed or obsolete, so their stale suggestions collapse on the PR. The round is
+    every posted follow-up of this commit (posted together or apart); while one is still to finish, nothing is
+    resolved, and its own post decides. A finding's threads are the inline comments its own round posted for
+    it: in that round's review, under the heading comment_label gave it. A heading two findings share is
+    resolved only when both are done. Best effort: if GitHub fails, the threads stay open. Returns how many
+    were resolved."""
+    siblings = _siblings(conn, job, (*db.ACTIVE, "posted"))
+    if any(row["status"] in db.ACTIVE for row in siblings):
+        return 0
+    jobs = sorted({job["id"], *(row["id"] for row in _members(conn, job)),
+                   *(row["id"] for row in siblings if row["followup_of"] == job["followup_of"])})
     answers = {}
     for finding_id, status in conn.execute(
             f"SELECT finding_id, status FROM resolutions WHERE job_id IN ({','.join('?' * len(jobs))})", jobs):
-        answers.setdefault(finding_id, set()).add(status)
-    done = [finding_id for finding_id, statuses in answers.items() if statuses <= set(RESOLVED_STATUSES)]
+        answers.setdefault(finding_id, []).append(status)
+    done = {finding_id for finding_id, statuses in answers.items()
+            if len(statuses) == len(jobs) and set(statuses) <= set(RESOLVED_STATUSES)}
     if not done:
         return 0
-    wanted = {(row["review_id"], review.clean(row["title"], 300)) for row in conn.execute(
-        "SELECT f.title, j.review_id FROM findings f JOIN jobs j ON j.id=f.job_id"
-        f" WHERE f.id IN ({','.join('?' * len(done))}) AND j.review_id IS NOT NULL", done)}
+    headings = {}
+    for row in conn.execute("SELECT f.id, f.title, j.review_id FROM findings f JOIN jobs j ON j.id=f.job_id"
+                            " WHERE j.repo=? AND j.number=? AND j.review_id IS NOT NULL AND f.duplicate_of IS NULL"
+                            " AND f.kind IN ('finding', 'regression')", (job["repo"], job["number"])):
+        headings.setdefault((row["review_id"], review.clean(row["title"], 300)), set()).add(row["id"])
+    wanted = {key for key, finding_ids in headings.items() if finding_ids & done and finding_ids <= done}
     resolved = 0
     try:
         for thread in svc.github.review_threads(job["repo"], job["number"]):
             match = _THREAD_TITLE_RE.match(thread["body"])
-            if not thread["resolved"] and match and (thread["review_id"], match.group(1)) in wanted:
+            if not match:
+                continue
+            if thread["review_id"] is None:
+                log.warning("job %s: GitHub gave no review id for thread %s; it stays open", job["id"], thread["id"])
+            elif not thread["resolved"] and (thread["review_id"], match.group(1)) in wanted:
                 svc.github.resolve_thread(thread["id"])
                 resolved += 1
-    except (GitHubError, KeyError, TypeError) as exc:  # an error, or an answer not shaped as expected
+    except (GitHubError, ValueError, KeyError, TypeError, AttributeError) as exc:  # malformed answers too
         log.warning("job %s: could not resolve the threads of fixed findings (%s: %s); they stay open", job["id"],
                     type(exc).__name__, exc)
     if resolved:

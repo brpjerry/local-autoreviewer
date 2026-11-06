@@ -96,6 +96,7 @@ class FakeGitHub:
         self.reads = []  # (method, repo, number) for the comment and review listings
         self.fail = None  # an exception for those listings to raise
         self.resolved = set()  # ids of resolved review threads (a thread's id: "T" + its first comment's id)
+        self.resolve_calls = []  # every resolve_thread call, in order
         self.fail_threads = None  # an exception for the thread calls to raise
 
     def now(self):
@@ -172,6 +173,7 @@ class FakeGitHub:
     def resolve_thread(self, thread_id):
         if self.fail_threads is not None:
             raise self.fail_threads
+        self.resolve_calls.append(thread_id)
         self.resolved.add(thread_id)
 
     def find_marked_review(self, repo, number, job_id, login):

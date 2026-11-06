@@ -515,7 +515,9 @@ class GitHubListingTests(unittest.TestCase):
              "nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [
                  {"body": "**1. Leak** (local-autoreviewer)", "pullRequestReview": {"databaseId": 9}}]}}]},
             {"hasNextPage": False, "endCursor": None,
-             "nodes": [{"id": "T2", "isResolved": True, "comments": {"nodes": []}}]},
+             "nodes": [{"id": "T2", "isResolved": True, "comments": {"nodes": []}},
+                       {"id": "T3", "isResolved": False, "comments": {"nodes": [
+                           {"body": "b", "pullRequestReview": {"databaseId": None, "fullDatabaseId": "5795814319"}}]}}]},
         ]
         calls = []
 
@@ -531,7 +533,8 @@ class GitHubListingTests(unittest.TestCase):
         with mock.patch.object(github, "_run", side_effect=run):
             self.assertEqual(github.review_threads("o/r", 3), [
                 {"id": "T1", "resolved": False, "body": "**1. Leak** (local-autoreviewer)", "review_id": 9},
-                {"id": "T2", "resolved": True, "body": "", "review_id": None}])
+                {"id": "T2", "resolved": True, "body": "", "review_id": None},
+                {"id": "T3", "resolved": False, "body": "b", "review_id": 5795814319}])  # past 32 bits
             github.resolve_thread("T1")
         self.assertIn("-F", calls[0])
         self.assertIn("number=3", calls[0])

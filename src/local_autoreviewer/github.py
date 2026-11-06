@@ -49,7 +49,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { id isResolved comments(first: 1) { nodes { body pullRequestReview { databaseId } } } }
+        nodes { id isResolved comments(first: 1) { nodes { body pullRequestReview { databaseId fullDatabaseId } } } }
       }
     }
   }
@@ -129,7 +129,8 @@ class GitHub:
 
     def review_threads(self, repo, number):
         """The PR's review threads: id, resolved, and the body of the thread's first comment and the id of the
-        review it belongs to (review_id, as REST numbers reviews)."""
+        review it belongs to (review_id, as REST numbers reviews: fullDatabaseId, which GitHub added because
+        review ids outgrow databaseId's 32-bit Int, else databaseId; None if neither)."""
         owner, name = repo.split("/", 1)
         threads, after = [], None
         while True:
@@ -138,8 +139,10 @@ class GitHub:
             page = self._json(args)["data"]["repository"]["pullRequest"]["reviewThreads"]
             for node in page["nodes"]:
                 first = (node["comments"]["nodes"] or [{}])[0]
+                posted_in = first.get("pullRequestReview") or {}
+                review_id = posted_in.get("fullDatabaseId") or posted_in.get("databaseId")
                 threads.append({"id": node["id"], "resolved": bool(node["isResolved"]), "body": first.get("body") or "",
-                                "review_id": (first.get("pullRequestReview") or {}).get("databaseId")})
+                                "review_id": int(review_id) if review_id is not None else None})
             if not page["pageInfo"]["hasNextPage"]:
                 return threads
             after = page["pageInfo"]["endCursor"]
