@@ -85,6 +85,12 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("oldest comments left out: size limit", text)
         self.assertNotIn("\\u00e9", text)  # not spent on escapes
         self.assertEqual(codex_mod._latest_comments("not json", 10), ("not json", ""))
+        # The numbering of a review whose first comment is left out goes to the next comment answering it.
+        numbered = {"id": 9, "commit": "c", "numbered_findings": ["1. **Leak**", "2. **Race**"]}
+        kept = [{"kind": "comment", "body": "x" * 500, "review_id": 9, "review": numbered},
+                {"kind": "comment", "body": "won't fix 2", "review_id": 9}]
+        shown, _ = codex_mod._latest_comments(json.dumps(kept), 400)
+        self.assertEqual(json.loads(shown), [dict(kept[1], review=numbered)])
 
 
 class EnvTests(unittest.TestCase):

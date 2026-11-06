@@ -20,7 +20,8 @@ REQUIRED_FLAGS = ("--ignore-user-config", "--ignore-rules", "--sandbox", "--outp
 
 
 def _latest_comments(text, limit):
-    """author-comments.json within limit characters, by leaving out its oldest comments whole."""
+    """author-comments.json within limit characters, by leaving out its oldest comments whole. A left-out
+    comment's review numbering (see feedback.author_comments) passes to the next one answering that review."""
     try:
         comments = json.loads(text)
     except ValueError:
@@ -29,7 +30,12 @@ def _latest_comments(text, limit):
         return text, ""
     shown, dropped = json.dumps(comments, ensure_ascii=False, indent=2), 0
     while len(shown) > limit and len(comments) > 1:
-        comments.pop(0)
+        gone = comments.pop(0)
+        if isinstance(gone, dict) and isinstance(gone.get("review"), dict):  # keep its review's numbering
+            heir = next((c for c in comments if isinstance(c, dict)
+                         and c.get("review_id") == gone["review"].get("id")), None)
+            if heir is not None and "review" not in heir:
+                heir["review"] = gone["review"]
         dropped += 1
         shown = json.dumps(comments, ensure_ascii=False, indent=2)
     return shown, f"\n(the {dropped} oldest comments left out: size limit)" if dropped else ""

@@ -396,6 +396,28 @@ class FollowupTests(EnvTestCase):
         self.assertEqual(status, "posted")
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "followup"}])
 
+    def test_a_push_during_the_comment_listing_starts_no_review(self):
+        self.review_at(self.head_a)
+        calls = len(self.agent_log("claude"))
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        self.github.set_pr(1, head_b)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="claude",
+                                   model="opus", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, job_id, status="running", started_at=self.clock())
+        conn.close()
+        token = pipeline.CancelToken()
+
+        def listing(*args):
+            token.cancel("superseded: head moved")
+            return []
+        from unittest import mock
+        with mock.patch.object(pipeline, "_author_comments", side_effect=listing):
+            status = pipeline.run_job(self.svc, job_id, token)
+        self.assertEqual(status, "cancelled")  # "superseded" when the canceller records why, as the worker does
+        self.assertEqual(len(self.agent_log("claude")), calls)  # the reviewer never started
+
     def decline_first_finding(self):
         """A first review whose one finding the author declines in its thread, and the follow-up that marks it."""
         first, _ = self.review_at(self.head_a)
