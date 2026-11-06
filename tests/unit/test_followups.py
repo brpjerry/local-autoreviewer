@@ -370,6 +370,31 @@ class FollowupTests(EnvTestCase):
         self.assertEqual(len(shown), pipeline.MAX_RAISED)
         self.assertEqual((shown[0]["text"], shown[-1]["text"]), ("nit 5", f"nit {pipeline.MAX_RAISED + 4}"))
 
+    def test_a_finding_the_author_declines_is_not_asked_about_again(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        suggestion = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        self.github.comment(1, "Won't fix: callers never pass 0.", reply_to=suggestion["id"])
+        self.github.comment(1, "won't fix, says someone else", author="someone-else")  # not the author: ignored
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        comments = json.loads(self.context(second, "author-comments.json").read_text())
+        self.assertEqual([(c["kind"], c["body"]) for c in comments], [("reply", "Won't fix: callers never pass 0.")])
+        self.assertIn(finding["title"], comments[0]["thread"])
+        self.assertEqual(self.rows("SELECT status FROM resolutions WHERE job_id=?", second), [{"status": "declined"}])
+        self.assertIn(f"🙅 Declined by the author: {finding['title']}", self.github.posted[-1]["body"])
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        previous = json.loads(self.context(third, "previous-findings.json").read_text())
+        self.assertNotIn(finding["id"], [p["id"] for p in previous])
+
+    def test_a_followup_goes_on_without_the_authors_comments_if_github_fails(self):
+        from local_autoreviewer.github import GitHubError
+        self.review_at(self.head_a)
+        self.github.fail = GitHubError("HTTP 502")
+        second, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(json.loads(self.context(second, "author-comments.json").read_text()), [])
+        self.github.fail = None
+        self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "followup"}])
+
     def test_a_saved_followup_keeps_new_code(self):
         self.review_at(self.head_a)
         self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))
@@ -433,6 +458,13 @@ class FollowupFormatTests(unittest.TestCase):
         self.assertIn("- ❔ Not checked: Typo _(Claude Code, minor)_", body)
         self.assertIn("No regressions found.", body)
         self.assertTrue(body.endswith(review.marker(7, "b" * 40, "claude")))
+
+    def test_declined_is_a_status_that_closes_a_finding(self):
+        self.assertIn("declined", review.followup_schema()["properties"]["resolutions"]["items"]["properties"]
+                      ["status"]["enum"])
+        self.assertNotIn("declined", review.OPEN_STATUSES)
+        raw = {"summary": "s", "regressions": [], "resolutions": [{"finding": 1, "status": "declined", "detail": "x"}]}
+        self.assertEqual(review.validate_followup(raw, {1})["resolutions"][0]["status"], "declined")
 
     def test_schema_reuses_the_finding_definition(self):
         schema = review.followup_schema()

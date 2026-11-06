@@ -62,10 +62,13 @@ def prompt_version(prompts=None, followup=False):
     return digest.hexdigest()[:12]
 
 
-FOLLOWUP_STATUSES = ("fixed", "partly_fixed", "not_fixed", "obsolete")
-OPEN_STATUSES = ("not_fixed", "partly_fixed", "unchecked")  # unchecked: the follow-up gave no status
+FOLLOWUP_STATUSES = ("fixed", "partly_fixed", "not_fixed", "obsolete", "declined")
+# Asked about again in the next follow-up. unchecked: the follow-up gave no status. A declined finding isn't:
+# the author said they won't fix it.
+OPEN_STATUSES = ("not_fixed", "partly_fixed", "unchecked")
 STATUS_LABELS = {"fixed": "✅ Fixed", "partly_fixed": "🟡 Partly fixed", "not_fixed": "❌ Not fixed",
-                 "obsolete": "➖ No longer applies", "unchecked": "❔ Not checked", None: "❔ Not checked"}
+                 "obsolete": "➖ No longer applies", "declined": "🙅 Declined by the author",
+                 "unchecked": "❔ Not checked", None: "❔ Not checked"}
 
 
 def followup_schema(prompts=None):
@@ -94,7 +97,8 @@ def followup_schema(prompts=None):
                         "finding": {"type": "integer", "description": "The previous finding's id."},
                         "status": {"type": "string", "enum": list(FOLLOWUP_STATUSES)},
                         "detail": {"type": "string",
-                                   "description": "Why: what the code at the new head does about it, with file and line."},
+                                   "description": "Why: what the code at the new head does about it, with file and line; "
+                                                  "for declined, where the author said so and their reason."},
                     },
                 },
             },

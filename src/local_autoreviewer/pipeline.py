@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, leakscan, review, suggestions
+from . import combine, db, events, feedback, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS
@@ -485,6 +485,17 @@ def _finding_rows(conn, where, params):
     return rows
 
 
+def _author_comments(svc, job, pr):
+    """The PR author's comments for a follow-up (see feedback.author_comments); none if GitHub can't list them,
+    which only costs the follow-up that context."""
+    author = (pr.get("author") or {}).get("login") or ""
+    try:
+        return feedback.author_comments(svc.github, job["repo"], job["number"], author) if author else []
+    except GitHubError as exc:
+        log.warning("job %s: cannot read the author's comments (%s); the follow-up goes without them", job["id"], exc)
+        return []
+
+
 def _run(conn, svc, job, cancel):
     cfg = svc.config
     repo_cfg = cfg.repo(job["repo"])
@@ -530,6 +541,8 @@ def _run(conn, svc, job, cancel):
                 for name in ("since-review.diff", "previous-findings.json", "already-raised.json"):
                     Path(paths.context, name).unlink(missing_ok=True)
                 previous = None
+    if previous:  # what the author said about the findings since, such as which ones they won't fix
+        Path(paths.context, "author-comments.json").write_text(json.dumps(_author_comments(svc, job, pr), indent=2))
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))
     with db.transaction(conn):

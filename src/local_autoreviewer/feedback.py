@@ -18,9 +18,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from . import db, review
+from . import db, pipeline, review  # pipeline imports this module too: use its names at call time only
 from .github import MARKER_PREFIX, GitHubError
-from .pipeline import job_paths
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +54,51 @@ def _context(comment):
     """Where an inline suggestion was, and its heading, for the replies in its thread."""
     heading = (comment.get("body") or "").strip().split("\n", 1)[0][:300]
     return f"{_where(comment)} {heading}".strip()
+
+
+MAX_AUTHOR_COMMENTS = 60  # the author's latest comments a follow-up reads
+MAX_AUTHOR_TEXT = 3000
+
+
+def author_comments(github, repo, number, author):
+    """What the PR's author wrote on it since our first review, oldest first (the latest MAX_AUTHOR_COMMENTS),
+    for a follow-up to read, for instance to see which findings they decided not to fix: conversation comments,
+    review bodies, and inline comments, a reply in one of our threads with that thread's heading. Our own posts
+    are left out (reviews by their marker, our suggestions by their review), and so is anyone else's comment:
+    only the author decides what they won't fix."""
+    reviews = github.list_reviews(repo, number)
+    ours = [r for r in reviews if MARKER_PREFIX in (r.get("body") or "") and r.get("submitted_at")]
+    if not ours:
+        return []
+    since = min(_time(r["submitted_at"]) for r in ours)
+    our_ids = {r["id"] for r in ours}
+    found = []
+
+    def add(kind, item, created_at, **where):
+        body = (item.get("body") or "").strip()
+        if (_login(item).lower() != author.lower() or not body or MARKER_PREFIX in body
+                or _time(created_at) < since):
+            return
+        found.append((_time(created_at), {"kind": kind, **where, "created_at": created_at,
+                                          "body": body[:MAX_AUTHOR_TEXT]}))
+
+    for comment in github.list_issue_comments(repo, number):
+        add("comment", comment, comment["created_at"])
+    for r in reviews:
+        if r["id"] not in our_ids and r.get("submitted_at"):
+            add("review", r, r["submitted_at"])
+    comments = github.list_review_comments(repo, number)
+    by_id = {c["id"]: c for c in comments}
+    for comment in comments:
+        if comment.get("pull_request_review_id") in our_ids:
+            continue  # one of our suggestions
+        root = by_id.get(comment.get("in_reply_to_id"))
+        if root is not None and root.get("pull_request_review_id") in our_ids:
+            add("reply", comment, comment["created_at"], thread=_context(root))
+        else:
+            add("inline", comment, comment["created_at"], where=_where(comment))
+    found.sort(key=lambda pair: pair[0])
+    return [item for _, item in found[-MAX_AUTHOR_COMMENTS:]]
 
 
 def gather(github, repo, number, login):
@@ -194,7 +238,7 @@ def _review(conn, state, repo, review_id):
     body_file = None
     for job in jobs:  # the post's job: its round.md if it carried other reviews, else its review.md
         if job["posted_with"] in (None, job["id"]):
-            out = Path(job_paths(state, job["id"]).out)
+            out = Path(pipeline.job_paths(state, job["id"]).out)
             name = "round.md" if job["posted_with"] == job["id"] else "review.md"
             body_file = str(out / name) if (out / name).is_file() else None
             break

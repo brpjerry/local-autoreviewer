@@ -46,6 +46,49 @@ class RequestTests(unittest.TestCase):
             self.assertFalse(feedback.is_feedback(body), body)
 
 
+class AuthorCommentTests(EnvTestCase):
+    """What a follow-up is told the PR's author said (feedback.author_comments)."""
+
+    def setUp(self):
+        super().setUp()
+        self.github.clock = self.clock
+
+    def test_only_the_authors_comments_since_our_first_review(self):
+        self.github.comment(1, "Before any review.")
+        self.clock.advance(60)
+        posted = self.github.post_review(REPO, 1, "a" * 40, f"Review {review.marker(7, 'a' * 40, 'claude')}",
+                                         [{"path": "a.py", "line": 3, "body": "**1. Leaks** (local-autoreviewer)"}])
+        ours = next(c for c in self.github.review_comments[(REPO, 1)] if c["pull_request_review_id"] == posted["id"])
+        self.clock.advance(60)
+        self.github.comment(1, "Won't fix: it's closed by the caller.", reply_to=ours["id"])
+        self.clock.advance(1)
+        self.github.reviews[(REPO, 1)] = [{"id": 5, "body": "Approving my own fix.", "user": {"login": OWNER},
+                                           "submitted_at": iso(self.clock())}]
+        self.clock.advance(1)
+        self.github.comment(1, "Review feedback: 1 was useful.")
+        self.github.comment(1, "Spam from a stranger.", author="someone-else")
+        self.github.comment(1, "   ")  # empty
+        comments = feedback.author_comments(self.github, REPO, 1, OWNER)
+        self.assertEqual([(c["kind"], c["body"]) for c in comments],
+                         [("reply", "Won't fix: it's closed by the caller."), ("review", "Approving my own fix."),
+                          ("comment", "Review feedback: 1 was useful.")])  # oldest first, whatever the kind
+        self.assertEqual(comments[0]["thread"], "a.py:3 **1. Leaks** (local-autoreviewer)")
+        # Matched by login without regard to case, as GitHub logins are.
+        self.assertEqual(len(feedback.author_comments(self.github, REPO, 1, OWNER.upper())), 3)
+
+    def test_nothing_before_a_review_and_only_the_latest(self):
+        self.github.comment(1, "No review yet.")
+        self.assertEqual(feedback.author_comments(self.github, REPO, 1, OWNER), [])
+        self.github.post_review(REPO, 1, "a" * 40, f"Review {review.marker(7, 'a' * 40, 'claude')}")
+        for n in range(feedback.MAX_AUTHOR_COMMENTS + 3):
+            self.clock.advance(1)
+            self.github.comment(1, f"note {n}" + "x" * feedback.MAX_AUTHOR_TEXT)
+        comments = feedback.author_comments(self.github, REPO, 1, OWNER)
+        self.assertEqual(len(comments), feedback.MAX_AUTHOR_COMMENTS)
+        self.assertTrue(comments[0]["body"].startswith("note 3"))
+        self.assertEqual(len(comments[-1]["body"]), feedback.MAX_AUTHOR_TEXT)
+
+
 class CollectionTests(EnvTestCase):
     def setUp(self):
         super().setUp()
