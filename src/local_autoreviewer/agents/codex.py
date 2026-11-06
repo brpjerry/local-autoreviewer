@@ -19,6 +19,22 @@ REQUIRED_FLAGS = ("--ignore-user-config", "--ignore-rules", "--sandbox", "--outp
                   "--output-last-message", "--skip-git-repo-check", "--json")
 
 
+def _latest_comments(text, limit):
+    """author-comments.json within limit characters, by leaving out its oldest comments whole."""
+    try:
+        comments = json.loads(text)
+    except ValueError:
+        return text, ""
+    if not isinstance(comments, list):
+        return text, ""
+    shown, dropped = json.dumps(comments, ensure_ascii=False, indent=2), 0
+    while len(shown) > limit and len(comments) > 1:
+        comments.pop(0)
+        dropped += 1
+        shown = json.dumps(comments, ensure_ascii=False, indent=2)
+    return shown, f"\n(the {dropped} oldest comments left out: size limit)" if dropped else ""
+
+
 class CodexAgent:
     name = "codex"
 
@@ -71,7 +87,11 @@ class CodexAgent:
             extra = Path(paths.context, name)
             if extra.is_file():
                 text = extra.read_text(errors="replace")
-                cut = "\n(truncated: size limit)" if len(text) > INLINE_LIMIT // 4 else ""
+                cut = ""
+                if name == "author-comments.json":  # oldest first: leave out whole old ones, keep the latest
+                    text, cut = _latest_comments(text, INLINE_LIMIT // 4)
+                if len(text) > INLINE_LIMIT // 4:
+                    cut = "\n(truncated: size limit)"
                 parts.append(f"\n## {name}\n\n```\n{text[:INLINE_LIMIT // 4]}\n```{cut}\n")
                 size += len(parts[-1])
         for line in Path(paths.context, "files.txt").read_text().splitlines():

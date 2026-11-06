@@ -76,6 +76,39 @@ class AuthorCommentTests(EnvTestCase):
         # Matched by login without regard to case, as GitHub logins are.
         self.assertEqual(len(feedback.author_comments(self.github, REPO, 1, OWNER.upper())), 3)
 
+    def test_a_comment_carries_the_numbering_of_the_review_it_answers(self):
+        body = ("Review\n\n1. **Leaks a handle** — x\n   detail\n2. **Races on close** — y\n"
+                f"{review.marker(7, 'a' * 40, 'claude')}")
+        first = self.github.post_review(REPO, 1, "a" * 40, body)
+        self.clock.advance(60)
+        self.github.comment(1, "Review feedback: won't fix 2, the caller holds the lock.")
+        self.clock.advance(1)
+        self.github.comment(1, "And 1 is fixed.")
+        comments = feedback.author_comments(self.github, REPO, 1, OWNER)
+        self.assertEqual(comments[0]["review"], {"id": first["id"], "commit": "a" * 40, "numbered_findings": [
+            "1. **Leaks a handle** — x", "2. **Races on close** — y"]})
+        self.assertEqual((comments[1]["review_id"], "review" in comments[1]), (first["id"], False))  # once each
+
+    def test_a_copied_marker_doesnt_make_a_review_ours(self):
+        self.github.post_review(REPO, 1, "a" * 40, f"Review {review.marker(7, 'a' * 40, 'claude')}")
+        self.clock.advance(60)
+        fake = {"id": 77, "body": f"Looks official {review.marker(8, 'a' * 40, 'claude')}",
+                "user": {"login": "someone-else"}, "submitted_at": iso(self.clock())}
+        self.github.reviews[(REPO, 1)] = [fake]
+        self.github.review_comments.setdefault((REPO, 1), []).append(
+            {"id": 78, "pull_request_review_id": 77, "path": "a.py", "line": 1, "body": "**1. Real title** (x)",
+             "user": {"login": "someone-else"}, "created_at": iso(self.clock())})
+        self.clock.advance(1)
+        self.github.comment(1, "Won't fix.", reply_to=78)
+        (comment,) = feedback.author_comments(self.github, REPO, 1, OWNER)
+        self.assertEqual(comment["kind"], "inline")  # not a reply in one of our threads
+        self.assertNotIn("thread", comment)
+        # The posting account can differ from the PR's author: our reviews are by the account that posts them.
+        self.github.comment(1, "A note.", author="bob")
+        self.assertEqual([c["body"] for c in feedback.author_comments(self.github, REPO, 1, "bob", login=OWNER)],
+                         ["A note."])
+        self.assertEqual(feedback.author_comments(self.github, REPO, 1, "bob"), [])  # no review posted as bob: none
+
     def test_nothing_before_a_review_and_only_the_latest(self):
         self.github.comment(1, "No review yet.")
         self.assertEqual(feedback.author_comments(self.github, REPO, 1, OWNER), [])

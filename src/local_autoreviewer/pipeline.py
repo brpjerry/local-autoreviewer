@@ -470,6 +470,16 @@ def previous_round(conn, job, base_contains=lambda base_sha: False):
     raised = _finding_rows(conn, f"f.job_id IN (SELECT id FROM jobs WHERE {scope}) AND f.duplicate_of IS NULL AND"
                                  " (f.kind IN ('nit', 'test_gap', 'question') OR (f.kind IN ('finding', 'regression')"
                                  " AND f.disposition IS NOT NULL AND f.disposition!='fixed'))", (*args, db.FOREGROUND))
+    # Findings a follow-up found the author declined, and no reviewer still has open: not asked about again
+    # either, so told of the same way, with that follow-up's account of the author's reason.
+    declined = {finding_id: detail for finding_id, detail in conn.execute(
+        f"SELECT finding_id, detail FROM resolutions WHERE status='declined' AND job_id IN"
+        f" (SELECT id FROM jobs WHERE {scope}) ORDER BY id", (*args, db.FOREGROUND))}
+    closed = sorted(set(declined) - {f["id"] for f in findings} - {f["id"] for f in raised})
+    if closed:
+        raised = sorted(raised + [dict(f, disposition="declined", note=declined[f["id"]]) for f in _finding_rows(
+            conn, f"f.id IN ({','.join('?' * len(closed))}) AND f.duplicate_of IS NULL AND f.disposition IS NULL",
+            closed)], key=lambda f: f["id"])
     return PreviousRound(row["head_sha"], findings, raised)
 
 
@@ -490,8 +500,9 @@ def _author_comments(svc, job, pr):
     which only costs the follow-up that context."""
     author = (pr.get("author") or {}).get("login") or ""
     try:
-        return feedback.author_comments(svc.github, job["repo"], job["number"], author) if author else []
-    except GitHubError as exc:
+        return (feedback.author_comments(svc.github, job["repo"], job["number"], author, login=svc.token_owner)
+                if author else [])
+    except (GitHubError, ValueError, KeyError, TypeError, AttributeError) as exc:  # unexpected JSON too, as collect
         log.warning("job %s: cannot read the author's comments (%s); the follow-up goes without them", job["id"], exc)
         return []
 
@@ -541,8 +552,6 @@ def _run(conn, svc, job, cancel):
                 for name in ("since-review.diff", "previous-findings.json", "already-raised.json"):
                     Path(paths.context, name).unlink(missing_ok=True)
                 previous = None
-    if previous:  # what the author said about the findings since, such as which ones they won't fix
-        Path(paths.context, "author-comments.json").write_text(json.dumps(_author_comments(svc, job, pr), indent=2))
     if removed:
         log.info("job %s: removed agent files from checkout: %s", job["id"], ", ".join(removed))
     with db.transaction(conn):
@@ -558,6 +567,8 @@ def _run(conn, svc, job, cancel):
 
     if cancel():
         return _cancelled(conn, svc, job, cancel)
+    if previous:  # what the author said about the findings since, such as which ones they won't fix
+        Path(paths.context, "author-comments.json").write_text(json.dumps(_author_comments(svc, job, pr), indent=2))
 
     session_id = agent.new_session_id()
     unit = scope_unit(job["id"])

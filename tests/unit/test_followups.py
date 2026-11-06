@@ -393,7 +393,44 @@ class FollowupTests(EnvTestCase):
         second, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
         self.assertEqual(json.loads(self.context(second, "author-comments.json").read_text()), [])
         self.github.fail = None
+        self.assertEqual(status, "posted")
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "followup"}])
+
+    def decline_first_finding(self):
+        """A first review whose one finding the author declines in its thread, and the follow-up that marks it."""
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        suggestion = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        self.github.comment(1, "Won't fix: callers never pass 0.", reply_to=suggestion["id"])
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        return finding, second
+
+    def test_a_declined_finding_is_already_raised_for_a_whole_pr_review(self):
+        finding, _ = self.decline_first_finding()
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), claude="newcode"))
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        raised = {r["text"]: r for r in json.loads(self.context(third, "already-raised.json").read_text())}
+        self.assertEqual((raised[finding["title"]]["decision"], raised[finding["title"]]["note"]), ("declined", "checked"))
+        self.assertNotIn(finding["id"], [p["id"] for p in
+                                         json.loads(self.context(third, "previous-findings.json").read_text())])
+
+    def test_a_finding_one_reviewer_still_has_open_is_asked_about_again(self):
+        finding, second = self.decline_first_finding()
+        conn = self.svc.connect()
+        with db.transaction(conn):  # the round's other reviewer found it not fixed
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=self.rows(
+                "SELECT head_sha FROM jobs WHERE id=?", second)[0]["head_sha"], base_ref="main", agent="codex",
+                model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="posted", review_recorded=1, finished_at=self.clock(),
+                          review_kind="followup", followup_of=self.head_a)
+            conn.execute("INSERT INTO resolutions (job_id, finding_id, status) VALUES (?, ?, 'not_fixed')",
+                         (other, finding["id"]))
+        conn.close()
+        third, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        previous = json.loads(self.context(third, "previous-findings.json").read_text())
+        self.assertIn(finding["id"], [p["id"] for p in previous])
+        raised = json.loads(self.context(third, "already-raised.json").read_text())
+        self.assertNotIn(finding["title"], [r["text"] for r in raised])  # asked about, so not listed as closed
 
     def test_a_saved_followup_keeps_new_code(self):
         self.review_at(self.head_a)

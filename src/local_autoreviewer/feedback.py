@@ -11,7 +11,10 @@ latest review posted before them (not counting "review skipped" notices, which a
 
 A closed PR is collected by the first poll that sees it closed, and once more LATE after that, for
 feedback given after the merge. Each collection replaces the PR's earlier one, so feedback deleted or
-untagged since then goes."""
+untagged since then goes.
+
+It also lists the PR author's comments for a follow-up (author_comments), from the same listings: the
+follow-up reads which findings the author decided not to fix. The pipeline imports this module for that."""
 
 import logging
 import re
@@ -57,17 +60,21 @@ def _context(comment):
 
 
 MAX_AUTHOR_COMMENTS = 60  # the author's latest comments a follow-up reads
+_NUMBERED_RE = re.compile(r"^\d+\. \*\*.*$", re.MULTILINE)  # a numbered finding's heading in our post
 MAX_AUTHOR_TEXT = 3000
 
 
-def author_comments(github, repo, number, author):
+def author_comments(github, repo, number, author, *, login=None):
     """What the PR's author wrote on it since our first review, oldest first (the latest MAX_AUTHOR_COMMENTS),
     for a follow-up to read, for instance to see which findings they decided not to fix: conversation comments,
     review bodies, and inline comments, a reply in one of our threads with that thread's heading. Our own posts
-    are left out (reviews by their marker, our suggestions by their review), and so is anyone else's comment:
-    only the author decides what they won't fix."""
+    are left out (reviews by their marker and our login, which defaults to the author's; our suggestions by
+    their review), and so is anyone else's comment: only the author decides what they won't fix. Another
+    comment carries the id of our review before it, and the first that does carries that review's numbered
+    findings too, so a "won't fix 2" can be matched to the finding the post numbered 2."""
     reviews = github.list_reviews(repo, number)
-    ours = [r for r in reviews if MARKER_PREFIX in (r.get("body") or "") and r.get("submitted_at")]
+    ours = [r for r in reviews if _login(r).lower() == (login or author).lower()
+            and MARKER_PREFIX in (r.get("body") or "") and r.get("submitted_at")]
     if not ours:
         return []
     since = min(_time(r["submitted_at"]) for r in ours)
@@ -98,7 +105,22 @@ def author_comments(github, repo, number, author):
         else:
             add("inline", comment, comment["created_at"], where=_where(comment))
     found.sort(key=lambda pair: pair[0])
-    return [item for _, item in found[-MAX_AUTHOR_COMMENTS:]]
+    kept = [item for _, item in found[-MAX_AUTHOR_COMMENTS:]]
+    shown = set()
+    for item in kept:  # oldest first: a review's numbering goes with the first comment that answers it
+        if item["kind"] == "reply":
+            continue  # its thread's heading names the finding
+        before = [r for r in ours if _time(r["submitted_at"]) <= _time(item["created_at"])
+                  and not (r.get("body") or "").startswith(review.SKIPPED_HEADING)]
+        if not before:
+            continue
+        answered = max(before, key=lambda r: (_time(r["submitted_at"]), r["id"]))
+        item["review_id"] = answered["id"]
+        if answered["id"] not in shown:
+            shown.add(answered["id"])
+            item["review"] = {"id": answered["id"], "commit": answered.get("commit_id") or "",
+                              "numbered_findings": _NUMBERED_RE.findall(answered.get("body") or "")}
+    return kept
 
 
 def gather(github, repo, number, login):
