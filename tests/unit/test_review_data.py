@@ -230,7 +230,7 @@ class ReviewDataTests(EnvTestCase):
         job_id, _ = self.run_job()
         paths = pipeline.job_paths(self.state, job_id)
         self.expire(job_id)
-        with mock.patch.object(maintenance.shutil, "copyfile", side_effect=OSError("No space left on device")):
+        with mock.patch.object(maintenance.shutil, "copyfileobj", side_effect=OSError("No space left on device")):
             maintenance.housekeeping(self.svc)
         self.assertFalse(Path(paths.worktree).exists())  # the checkout, the large part, still goes
         self.assertTrue(Path(paths.context, "pr.json").is_file())
@@ -238,6 +238,24 @@ class ReviewDataTests(EnvTestCase):
         maintenance.housekeeping(self.svc)  # space again
         self.assertTrue(Path(paths.out, "pr.json").is_file())
         self.assertFalse(Path(paths.context).exists())
+
+    def test_an_unreadable_out_doesnt_stop_housekeeping(self):
+        first, _ = self.run_job()
+        later = self.rerun()
+        self.expire(first, later)
+        # out/ can't take the copy (a permission error, say): that job keeps its context, the other one goes on.
+        real = maintenance.tempfile.mkstemp
+
+        def mkstemp(dir, **kwargs):
+            if dir == pipeline.job_paths(self.state, first).out:
+                raise PermissionError(13, "Permission denied", dir)
+            return real(dir=dir, **kwargs)
+        with mock.patch.object(maintenance.tempfile, "mkstemp", side_effect=mkstemp):
+            maintenance.housekeeping(self.svc)
+        self.assertTrue(Path(pipeline.job_paths(self.state, first).context).exists())
+        self.assertFalse(Path(pipeline.job_paths(self.state, first).worktree).exists())
+        self.assertTrue(Path(pipeline.job_paths(self.state, later).out, "pr.json").is_file())
+        self.assertFalse(Path(pipeline.job_paths(self.state, later).context).exists())
 
     def test_triage_and_export(self):
         job_id, _ = self.run_job()

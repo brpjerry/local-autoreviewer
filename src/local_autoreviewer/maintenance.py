@@ -3,7 +3,9 @@
 
 import json
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from . import db, pipeline, review
@@ -19,19 +21,27 @@ def due(conn, now):
 
 
 def _keep_pr_json(paths):
-    """Copy a job's pr.json from its context to out/, unless out/ has one already. The copy is written beside
-    it and renamed into place, so out/pr.json is whole or absent. Returns whether the context can go: False if
-    the copy failed, so a later housekeeping tries again."""
+    """Copy a job's pr.json from its context to out/, unless out/ has one already. The copy is written to a
+    file of its own beside it (two housekeepings at once can't share one) and renamed into place, so
+    out/pr.json is whole or absent. Returns whether the context can go: False if anything failed, so a later
+    housekeeping tries again, and the rest of this one goes on."""
     source, kept = Path(paths.context, "pr.json"), Path(paths.out, "pr.json")
-    if kept.exists() or not source.is_file():  # kept already, or a job that stopped before writing one
-        return True
-    partial = kept.with_name(".pr.json.partial")
+    partial = None
     try:
-        shutil.copyfile(source, partial)
+        if kept.exists() or not source.is_file():  # kept already, or a job that stopped before writing one
+            return True
+        handle, name = tempfile.mkstemp(dir=paths.out, prefix=".pr.json.", suffix=".partial")
+        partial = Path(name)
+        with os.fdopen(handle, "wb") as target, source.open("rb") as original:
+            shutil.copyfileobj(original, target)
         partial.replace(kept)
         return True
     except OSError as exc:
-        partial.unlink(missing_ok=True)
+        if partial is not None:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass  # a stray .partial file; the context stays either way
         log.warning("cannot keep %s (%s); keeping the job's context until it can be", source, exc)
         return False
 
