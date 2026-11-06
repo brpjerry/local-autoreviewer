@@ -387,6 +387,7 @@ def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running"))
             _settle_round(conn, svc, job["id"], "cancelled", reason, {})
     if cancelled:
         log.info("job %s -> cancelled: %s", job["id"], reason)
+        _unblock_resolution(conn, svc, job["id"])  # as _finish does for a job that ends without posting
     return bool(cancelled)
 
 
@@ -1076,7 +1077,8 @@ def _resolve_after_post(conn, svc, job):
     already, and an error reaching run_job would requeue it and post the review again. Nor does it resolve
     anything once the PR has moved on from the reviewed commit (a post confirmed by recovery after a push,
     say): its verdicts are no longer the latest, and the next round's post decides."""
-    if not job["followup_of"]:
+    if not job["followup_of"]:  # a full review of the commit: a posted follow-up of it decides
+        _unblock_resolution(conn, svc, job["id"])
         return
     try:
         current = db.get_job(conn, job["id"])
@@ -1086,6 +1088,9 @@ def _resolve_after_post(conn, svc, job):
         resolve_fixed_threads(conn, svc, current)
     except Outcome:
         return
+    except GitHubError as exc:  # can't tell whether the PR moved on: the next post sweeps again
+        log.warning("job %s: could not check the PR before resolving the threads of fixed findings (%s); they stay "
+                    "open", job["id"], exc)
     except Exception:
         log.exception("job %s: could not resolve the threads of fixed findings; they stay open", job["id"])
 
@@ -1122,8 +1127,10 @@ def resolve_fixed_threads(conn, svc, job):
     if _siblings(conn, job, db.ACTIVE):
         return 0
     pr = (job["repo"], job["number"])
-    unrecorded = {(row["head_sha"], row["base_ref"]) for row in conn.execute(
-        "SELECT head_sha, base_ref FROM jobs WHERE repo=? AND number=? AND status='posted' AND review_recorded=0", pr)}
+    # A commit whose answers aren't all in yet: a posted review not recorded, or a review of it still to finish.
+    unsettled = {(row["head_sha"], row["base_ref"]) for row in conn.execute(
+        "SELECT head_sha, base_ref FROM jobs WHERE repo=? AND number=? AND ((status='posted' AND review_recorded=0)"
+        f" OR (post=1 AND status IN ({','.join('?' * len(db.ACTIVE))})))", (*pr, *db.ACTIVE))}
     latest = {}  # finding id: (the commit that answered it last, the answers there)
     for finding_id, status, head, base in conn.execute(
             "SELECT r.finding_id, r.status, j.head_sha, j.base_ref FROM resolutions r JOIN jobs j ON j.id=r.job_id"
@@ -1131,7 +1138,7 @@ def resolve_fixed_threads(conn, svc, job):
         at, answers = latest.get(finding_id, (None, []))
         latest[finding_id] = (at, answers + [status]) if at == (head, base) else ((head, base), [status])
     closed = {finding_id for finding_id, (at, answers) in latest.items()
-              if at not in unrecorded and set(answers) <= set(RESOLVED_STATUSES)}
+              if at not in unsettled and set(answers) <= set(RESOLVED_STATUSES)}
     headings = {}
     for row in conn.execute("SELECT f.id, f.title, j.review_id FROM findings f JOIN jobs j ON j.id=f.job_id"
                             " WHERE j.repo=? AND j.number=? AND j.review_id IS NOT NULL AND f.duplicate_of IS NULL"

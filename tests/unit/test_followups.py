@@ -635,6 +635,57 @@ class FollowupTests(EnvTestCase):
             conn.close()
         self.assertEqual(self.github.resolved, {self.thread_of(finding["title"])})
 
+    def test_a_full_review_posting_last_lets_the_threads_go(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT title FROM findings WHERE job_id=? AND kind='finding'", first)
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        conn = self.svc.connect()
+        with db.transaction(conn):  # a full review of head_b by the other reviewer, still running
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="codex",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="running")
+        conn.close()
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), service={"combine_wait": "0s"}))
+        self.review_at(head_b)
+        self.assertEqual(self.github.resolved, set())
+        conn = self.svc.connect()
+        try:
+            with db.transaction(conn):
+                db.update_job(conn, other, status="posted", review_recorded=1)
+            pipeline._resolve_after_post(conn, self.svc, db.get_job(conn, other))  # as post() does
+        finally:
+            conn.close()
+        self.assertEqual(self.github.resolved, {self.thread_of(finding["title"])})
+
+    def test_an_older_commit_still_being_reviewed_holds_its_findings(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT title FROM findings WHERE job_id=? AND kind='finding'", first)
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        conn = self.svc.connect()
+        with db.transaction(conn):  # Codex's review of head_b: accepted by GitHub, not yet confirmed here
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="codex",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="posting")
+        conn.close()
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), service={"combine_wait": "0s"}))
+        self.review_at(head_b)  # Claude: fixed
+        self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))  # a later commit's follow-up
+        self.assertNotIn(self.thread_of(finding["title"]), self.github.resolved)
+
+    def test_a_github_blip_before_resolving_is_a_warning(self):
+        from unittest import mock
+        from local_autoreviewer.github import GitHubError
+        self.review_at(self.head_a)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        conn = self.svc.connect()
+        try:
+            with mock.patch.object(self.github, "pr_view", side_effect=GitHubError("HTTP 502")), \
+                    self.assertLogs("local_autoreviewer.pipeline", "WARNING") as logs:
+                pipeline._resolve_after_post(conn, self.svc, db.get_job(conn, second))
+        finally:
+            conn.close()
+        self.assertEqual([line.split(":", 1)[0] for line in logs.output], ["WARNING"])  # no traceback
+
     def test_a_post_recovered_after_a_push_resolves_nothing(self):
         from unittest import mock
         from local_autoreviewer.github import GitHubError
