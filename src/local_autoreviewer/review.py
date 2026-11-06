@@ -301,13 +301,12 @@ def _proposed_changes(edits, by=""):
         lines.append(f"_{dropped} proposed change{'s' if dropped > 1 else ''} didn't match the file and "
                      f"{'were' if dropped > 1 else 'was'} left out._")
     for edit in shown:
-        span = f"{edit['start_line']}" if edit["start_line"] == edit["end_line"] else \
-            f"{edit['start_line']}–{edit['end_line']}"
-        where = clean(f"{edit['file']}:{span}", 300)
+        where = clean(suggestions.edit_where(edit), 300)
         note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
-        # Shortened to the usual length only when the inline suggestion has it whole; otherwise the body is
-        # its one copy, so only a huge one is cut.
-        diff = suggestions.shown_diff(edit, shorten=bool(edit.get("inline"))).replace("<!--", "<!\u200b--")
+        # Shortened to the usual length when the inline suggestion has it whole, or when the review is too long
+        # (see _compacted); otherwise the body is its one copy, so only a huge one is cut.
+        shorten = bool(edit.get("inline") or edit.get("shorten"))
+        diff = suggestions.shown_diff(edit, shorten=shorten).replace("<!--", "<!\u200b--")
         lines += [f"<details><summary>{what} to <code>{where}</code>{note}</summary>", "", diff, "",
                   "</details>"]
     return lines
@@ -430,6 +429,12 @@ def merge(members, duplicates=None, *, unchecked=""):
                 jobs = sorted({m["job_id"], *(r[0] for r in others)}, key=order.get)
                 entry["reviewers"] = list(dict.fromkeys(agent_of[job_id] for job_id in jobs))
                 if key in ("findings", "nits"):
+                    # One inline suggestion per item: a review saved by 0.6.0 or earlier may mark several.
+                    # Only the post is changed; the review as recorded stays as it was.
+                    edits = entry.get("edits") or []
+                    first = next((n for n, edit in enumerate(edits)
+                                  if edit.get("inline") and edit.get("anchor") != "dropped"), None)
+                    entry["edits"] = [{**edit, "inline": n == first} for n, edit in enumerate(edits)]
                     entry["alternatives"] = _alternatives_of(item, [
                         (reviews[job_id][other_key][other_position], agent_of[job_id])
                         for job_id, other_key, other_position in others])
@@ -507,14 +512,56 @@ def _footer(merged, sha, kind=""):
             *(marker(m["job_id"], sha, m["agent"]) for m in members)]
 
 
-def _fit(body, footer, *, shorter=None):
-    """Keep the body within GitHub's limit: first the shorter version, if given, then a cut."""
-    if len(body) > MAX_BODY and shorter is not None:
-        body = shorter
-    if len(body) > MAX_BODY:
-        tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
-        body = body[:MAX_BODY - len(tail) - 100] + tail
-    return body
+def _compacted(merged):
+    """merged with every proposed change marked to be shortened in the body, alternatives' too: a long
+    review's first saving."""
+    def short(edits):
+        return [{**edit, "shorten": True} for edit in edits or []]
+
+    def item(entry):
+        return {**entry, "edits": short(entry.get("edits")),
+                "alternatives": [{**other, "edits": short(other["edits"])} for other in entry.get("alternatives") or []]}
+    return {**merged, "findings": [item(f) for f in merged["findings"]], "nits": [item(n) for n in merged["nits"]]}
+
+
+# Where a block of the body starts: a numbered finding, a heading, a bold label, a list item, the nits.
+_BLOCK_RE = re.compile(r"^(?:\d+\. \*\*|#### |\*\*\S|- |<details>)", re.MULTILINE)
+_LABEL_RE = re.compile(r"\s*(?:\*\*\w+\*\*|#### [^\n]*)\s*")  # a block that is only a label or heading
+
+
+def _fit(parts, merged):
+    """The body within GitHub's limit. parts(merged) gives its lines, its nits' lines and its footer. The
+    first of these that fits: the review as is; with every proposed change shortened in the body (an inline
+    suggestion still has its edit whole); that without its nits; and that cut before the first block that
+    doesn't fit. A block starts at one of the renderer's own lines (a numbered finding, a heading, a list item;
+    see _BLOCK_RE) and runs to the next, so the cut never lands inside a diff, a list item or a model's text.
+    A finding's proposed changes (each a <details> of its own) are blocks too: a finding too long even then
+    keeps its title, detail and suggestion, and loses only the diffs that don't fit."""
+    compact = _compacted(merged)
+    for candidate, nits in ((merged, True), (compact, True), (compact, False)):
+        lines, nit_lines, footer = parts(candidate)
+        if not nits and nit_lines:
+            nit_lines = ["_Nits omitted: review too long._", ""]
+        body = "\n".join(lines + nit_lines + footer)
+        if len(body) <= MAX_BODY:
+            return body
+    tail = "\n\n_Review truncated to GitHub's size limit._\n\n" + "\n".join(footer)
+    chunks = lines + nit_lines
+    text = "\n".join(chunks)
+    limit = MAX_BODY - len(tail) - 100
+    starts, offset = [], 0
+    for chunk in chunks:  # only where a line of the renderer's starts: not inside a test gap's own lines
+        block = chunk.lstrip("\n")
+        start = offset + len(chunk) - len(block)
+        if start > limit:
+            break
+        if _BLOCK_RE.match(block) or block.lstrip(" ").startswith("<details><summary>"):
+            starts.append(start)
+        offset += len(chunk) + 1
+    # A severity label or heading left with nothing under it goes too.
+    while len(starts) > 1 and _LABEL_RE.fullmatch(text[starts[-2]:starts[-1]]):
+        starts.pop()
+    return text[:starts[-1] if starts else limit].rstrip() + tail
 
 
 def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
@@ -523,6 +570,11 @@ def render(review, *, repo, number, sha, base_ref, agent, model, job_id):
 
 def render_round(merged, *, repo, number, sha, base_ref):
     """A review, or several reviews of one commit merged (see merge()): then each item says who found it."""
+    return _fit(lambda candidate: _round_parts(candidate, repo=repo, number=number, sha=sha, base_ref=base_ref),
+                merged)
+
+
+def _round_parts(merged, *, repo, number, sha, base_ref):
     attribute = len(merged["members"]) > 1
     commit_url = f"https://github.com/{repo}/pull/{number}/commits/{sha}"
     head = [
@@ -549,9 +601,7 @@ def render_round(merged, *, repo, number, sha, base_ref):
         findings += ["No significant issues found.", ""]
     extras = _extras(merged, attribute)
     nit_lines = _nits(merged, [(n, item) for n, item in numbered if item["severity"] == "nit"], repo, sha, attribute)
-    footer = _footer(merged, sha)
-    return _fit("\n".join(head + findings + extras + nit_lines + footer), footer,
-                shorter="\n".join(head + findings + extras + ["_Nits omitted: review too long._", ""] + footer))
+    return head + findings + extras, nit_lines, _footer(merged, sha)
 
 
 def _extras(merged, attribute):
@@ -592,6 +642,11 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
     findings are new findings, with test gaps, questions and nits as in a review. previous: the finding rows
     checked, with the agent that raised each and, in also_found_by, the agents whose duplicates of it were
     merged into it."""
+    return _fit(lambda candidate: _followup_parts(candidate, previous, repo=repo, number=number, sha=sha,
+                                                  previous_sha=previous_sha), merged)
+
+
+def _followup_parts(merged, previous, *, repo, number, sha, previous_sha):
     attribute = len(merged["members"]) > 1
     commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
     before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
@@ -643,10 +698,7 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
     else:
         lines += [none_found, ""]
     lines += _extras(merged, attribute)
-    nit_lines = _nits(merged, [], repo, sha, attribute)
-    footer = _footer(merged, sha, "follow-up")
-    return _fit("\n".join(lines + nit_lines + footer), footer,
-                shorter="\n".join(lines + (["_Nits omitted: review too long._", ""] if nit_lines else []) + footer))
+    return lines, _nits(merged, [], repo, sha, attribute), _footer(merged, sha, "follow-up")
 
 
 def render_skipped(*, reason, sha, job_id, agent):
