@@ -626,10 +626,14 @@ class FollowupTests(EnvTestCase):
             db.update_job(conn, other, status="running")
         conn.close()
         self.svc = self.services(make_config(self.tmp, agents=("claude",), service={"combine_wait": "0s"}))
-        self.review_at(head_b)
+        second, _ = self.review_at(head_b)
         self.assertEqual(self.github.resolved, set())  # waits for Codex
         conn = self.svc.connect()
         try:
+            from unittest import mock
+            with mock.patch.object(self.github, "pr_view") as pr_view:
+                pipeline._resolve_after_post(conn, self.svc, db.get_job(conn, second))
+            pr_view.assert_not_called()  # Codex still active: the sweep would wait, so GitHub isn't asked
             pipeline._finish(conn, self.svc, other, "failed", "agent failed 3 times")  # Codex never posts
         finally:
             conn.close()

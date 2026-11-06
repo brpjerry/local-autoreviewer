@@ -1082,7 +1082,7 @@ def _resolve_after_post(conn, svc, job):
         return
     try:
         current = db.get_job(conn, job["id"])
-        if current["cancel_requested"]:
+        if current["cancel_requested"] or _siblings(conn, current, db.ACTIVE):  # a review still to finish decides
             return
         _check_pr(svc, current)
         resolve_fixed_threads(conn, svc, current)
