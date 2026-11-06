@@ -17,6 +17,7 @@ $agent_note
 - Start with pr.diff, then read the surrounding code you need to judge each change: callers, definitions, tests, config.
 - Only report problems in code this PR adds or changes, or problems the PR makes reachable. Don't review untouched legacy code.
 - Be concrete. Every finding needs a failure scenario: which input or state leads to which wrong result. Leave out speculative findings you can't support from the code.
+- Treat what the description and commit messages say about the code as claims to check, not facts: what causes a bug, what a change fixes, what was measured, what never happens. Check each against the code. If a finding rests on one you can't confirm there, say so in its `detail`, or ask about it in `questions`.
 
 ## Trivial PRs
 
@@ -38,6 +39,7 @@ There won't be a second review round, so find everything now rather than the fir
    - **Concurrency:** what else runs at the same time (background workers, timers, other processes or users) and what it sees in the middle of this change.
    - **Checks and conditions:** whether each check actually tests what its purpose needs, no more and no less.
    - **Failure part-way through:** what state an error, timeout or interrupt leaves behind, and whether a rerun recovers.
+   - **What it needs to run:** a library feature or minimum version, a platform, a system service or a hardware capability the change starts to rely on. Whether every platform and version the project supports has it, and what happens where it doesn't.
 3. Check your own proposed edits the same way: does each fix the problem everywhere it occurs, and could it cause a new one?
 
 Report every problem this turns up, minor ones included.
@@ -48,13 +50,15 @@ Report every problem this turns up, minor ones included.
 2. **Security:** injection, unsafe deserialization, path traversal, secrets in code or logs, missing authz checks, unsafe defaults.
 3. **Design:** whether the change fits the existing architecture, unnecessary complexity, duplication of existing helpers, API shape.
 4. **Performance:** only where it plausibly matters (hot paths, N+1, unbounded growth).
-5. **Tests:** behaviour that changed but has no test. Tests that don't actually assert the behaviour.
+5. **Tests:** behaviour that changed but has no test. Tests that don't actually assert the behaviour. Before reporting a missing test, read the tests of that behaviour, with their fixtures and helpers, to make sure none covers it. Report a gap only where a regression is plausible and the test is worth its cost: a change of a line or two rarely justifies a new harness, a device or a run on another platform.
 6. **Readability and docs:** misleading names, missing or stale docs and comments for non-obvious behaviour.
 7. **Nits:** at most 15 minor style points. Skip anything a formatter or linter would catch.
 
 ## Proposed changes
 
 Propose the exact fix for every finding, and for nits where it's simple, in `edits`, so it can be applied with one click:
+- Before writing a fix, find every path that sets, clears or reads the state it changes (other overloads, callers, event handlers, error paths), and make sure the fix covers each one. Then check what the fix does on each path: an error that now stops a caller that used to carry on, an option that another setting overrides, a step moved ahead of the check that guards it.
+- If whether a fix works depends on something the code doesn't show (how a library or device behaves at runtime, a measurement), say so in `suggestion` and name what to check.
 - Each edit replaces lines `start_line` to `end_line` (inclusive, numbered as in the PR's version of the file in `$worktree`) with `replacement`: the complete new text of those lines, with the file's own indentation, and no line numbers or diff markers. An empty `replacement` deletes the lines. To insert lines, replace a neighbouring line with itself plus the new ones.
 - `current` is the text those lines have now, copied exactly from the file. It anchors the edit: an edit whose `current` isn't in the file near the given lines is left out. Read the lines again just before writing an edit, rather than relying on line numbers from memory or from the diff.
 - Keep each edit to one contiguous range and as small as the fix allows; use several edits when a fix touches several places. Edits within the lines the PR's diff shows become one-click suggestions on the PR; others are shown as a diff in the review.
