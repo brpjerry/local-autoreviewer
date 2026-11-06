@@ -417,6 +417,19 @@ class FollowupTests(EnvTestCase):
             status = pipeline.run_job(self.svc, job_id, token)
         self.assertEqual(status, "cancelled")  # "superseded" when the canceller records why, as the worker does
         self.assertEqual(len(self.agent_log("claude")), calls)  # the reviewer never started
+        # Cancelled before the listing: no GitHub calls for it at all.
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            again = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="claude",
+                                  model="opus", source="manual", not_before=0, now=self.clock(),
+                                  rerun=db.next_rerun(conn, REPO, 1, head_b, "main", "claude"))
+            db.update_job(conn, again, status="running", started_at=self.clock())
+        conn.close()
+        early = pipeline.CancelToken()
+        early.cancel("shutdown")
+        with mock.patch.object(pipeline, "_author_comments") as listing:
+            pipeline.run_job(self.svc, again, early)
+        listing.assert_not_called()
 
     def decline_first_finding(self):
         """A first review whose one finding the author declines in its thread, and the follow-up that marks it."""

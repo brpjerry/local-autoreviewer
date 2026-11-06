@@ -565,10 +565,12 @@ def _run(conn, svc, job, cancel):
             svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
         raise Outcome("skipped", reason)
 
+    if cancel():
+        return _cancelled(conn, svc, job, cancel)
     if previous:  # what the author said about the findings since, such as which ones they won't fix
         Path(paths.context, "author-comments.json").write_text(json.dumps(_author_comments(svc, job, pr), indent=2))
-    if cancel():  # after the listing calls too: a push or close may have come during them
-        return _cancelled(conn, svc, job, cancel)
+        if cancel():  # and after its listing calls: a push or close may have come during them
+            return _cancelled(conn, svc, job, cancel)
 
     session_id = agent.new_session_id()
     unit = scope_unit(job["id"])
