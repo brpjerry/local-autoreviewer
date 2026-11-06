@@ -3,7 +3,9 @@
 
 import json
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from . import db, pipeline, review
@@ -18,6 +20,32 @@ def due(conn, now):
     return last is None or now - int(last) >= INTERVAL
 
 
+def _keep_pr_json(paths):
+    """Copy a job's pr.json from its context to out/, unless out/ has one already. The copy is written to a
+    file of its own beside it (two housekeepings at once can't share one) and renamed into place, so
+    out/pr.json is whole or absent. Returns whether the context can go: False if anything failed, so a later
+    housekeeping tries again, and the rest of this one goes on."""
+    source, kept = Path(paths.context, "pr.json"), Path(paths.out, "pr.json")
+    partial = None
+    try:
+        if kept.exists() or not source.is_file():  # kept already, or a job that stopped before writing one
+            return True
+        handle, name = tempfile.mkstemp(dir=paths.out, prefix=".pr.json.", suffix=".partial")
+        partial = Path(name)
+        with os.fdopen(handle, "wb") as target, source.open("rb") as original:
+            shutil.copyfileobj(original, target)
+        partial.replace(kept)
+        return True
+    except OSError as exc:
+        if partial is not None:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass  # a stray .partial file; the context stays either way
+        log.warning("cannot keep %s (%s); keeping the job's context until it can be", source, exc)
+        return False
+
+
 def housekeeping(svc):
     conn = svc.connect()
     now = svc.now()
@@ -28,15 +56,18 @@ def housekeeping(svc):
             f"AND status NOT IN ({','.join('?' * len(db.ACTIVE))})", (cutoff, *db.ACTIVE)).fetchall()
         removed = 0
         for row in rows:
-            # The checkout and context go; out/ (the agent's output and the review) is kept for analysis.
+            # The checkout and context go; out/ (the agent's output and the review) is kept for analysis, with
+            # the PR's title and description as reviewed (pr.json), which tools/replay uses.
             paths = job_paths(svc.state, row["id"])
             if not (Path(paths.worktree).exists() or Path(paths.context).exists()):
                 continue
+            context_can_go = _keep_pr_json(paths)
             mirror = svc.git.mirror_path(svc.state, row["repo"])
             if Path(paths.worktree).exists() and mirror.exists():
                 svc.git.remove_worktree(mirror, paths.worktree)
             shutil.rmtree(paths.worktree, ignore_errors=True)
-            shutil.rmtree(paths.context, ignore_errors=True)
+            if context_can_go:
+                shutil.rmtree(paths.context, ignore_errors=True)
             removed += 1
         _remove_stale_locks(conn, svc)
         recorded = record_saved_reviews(conn, svc)
