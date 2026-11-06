@@ -102,6 +102,8 @@ def _finish(conn, svc, job_id, status, reason, **fields):
         _settle_round(conn, svc, job_id, status, reason, fields)
     level = logging.WARNING if status in ("failed", "blocked") else logging.INFO
     log.log(level, "job %s -> %s: %s", job_id, status, reason)
+    if final and status != "posted":
+        _unblock_resolution(conn, svc, job_id)
     return status
 
 
@@ -1071,13 +1073,36 @@ def post(conn, svc, job):
 
 def _resolve_after_post(conn, svc, job):
     """For a posted follow-up: resolve_fixed_threads, best effort. Nothing may escape it: the job is posted
-    already, and an error reaching run_job would requeue it and post the review again."""
+    already, and an error reaching run_job would requeue it and post the review again. Nor does it resolve
+    anything once the PR has moved on from the reviewed commit (a post confirmed by recovery after a push,
+    say): its verdicts are no longer the latest, and the next round's post decides."""
     if not job["followup_of"]:
         return
     try:
-        resolve_fixed_threads(conn, svc, db.get_job(conn, job["id"]))
+        current = db.get_job(conn, job["id"])
+        if current["cancel_requested"]:
+            return
+        _check_pr(svc, current)
+        resolve_fixed_threads(conn, svc, current)
+    except Outcome:
+        return
     except Exception:
         log.exception("job %s: could not resolve the threads of fixed findings; they stay open", job["id"])
+
+
+def _unblock_resolution(conn, svc, job_id):
+    """A review that ended without posting no longer holds back resolve_fixed_threads, which waits while a
+    review of the commit is active: let a posted follow-up of that commit sweep now. Never raises: it runs in
+    _finish."""
+    try:
+        job = db.get_job(conn, job_id)
+        if not job or not job["post"]:
+            return
+        posted = [row for row in _siblings(conn, job, ("posted",)) if row["followup_of"]]
+        if posted:
+            _resolve_after_post(conn, svc, posted[0])  # the sweep covers the whole PR
+    except Exception:
+        log.exception("job %s: could not let the threads of fixed findings be resolved", job_id)
 
 
 RESOLVED_STATUSES = ("fixed", "obsolete")  # a previous finding's thread is resolved when every answer is one
@@ -1086,32 +1111,35 @@ _THREAD_TITLE_RE = re.compile(r"^\*\*\d+\. (.*?)\*\* \(local-autoreviewer", re.D
 
 
 def resolve_fixed_threads(conn, svc, job):
-    """After a follow-up round is posted, resolve the review threads of the previous findings that every
-    reviewer of the round found fixed or obsolete, so their stale suggestions collapse on the PR. The round is
-    every posted follow-up of this commit (posted together or apart); while one is still to finish, nothing is
-    resolved, and its own post decides. A finding's threads are the inline comments its own round posted for
-    it: in that round's review, under the heading comment_label gave it. A heading two findings share is
-    resolved only when both are done. Best effort: if GitHub fails, the threads stay open. Returns how many
-    were resolved."""
-    siblings = _siblings(conn, job, (*db.ACTIVE, "posted"))
-    if any(row["status"] in db.ACTIVE for row in siblings):
+    """After a follow-up of the PR is posted, resolve the open review threads of every finding of the PR that
+    is closed, so stale suggestions collapse. A finding is closed when the latest commit that answered it has
+    every posted reviewer's answers recorded, and all of them fixed or obsolete: the rule by which
+    previous_round stops asking about it. Each post sweeps the whole PR, so a thread an earlier post couldn't
+    resolve is resolved by a later one. While a review of this commit is still to finish, nothing is resolved;
+    its post, its end (_finish) or the next round decides. A finding's threads are those its own round posted:
+    in that round's review, under the heading comment_label gave it. A heading findings share is resolved once
+    all of them are closed. Best effort: if GitHub fails, the threads stay open. Returns how many were resolved."""
+    if _siblings(conn, job, db.ACTIVE):
         return 0
-    jobs = sorted({job["id"], *(row["id"] for row in _members(conn, job)),
-                   *(row["id"] for row in siblings if row["followup_of"] == job["followup_of"])})
-    answers = {}
-    for finding_id, status in conn.execute(
-            f"SELECT finding_id, status FROM resolutions WHERE job_id IN ({','.join('?' * len(jobs))})", jobs):
-        answers.setdefault(finding_id, []).append(status)
-    done = {finding_id for finding_id, statuses in answers.items()
-            if len(statuses) == len(jobs) and set(statuses) <= set(RESOLVED_STATUSES)}
-    if not done:
-        return 0
+    pr = (job["repo"], job["number"])
+    unrecorded = {(row["head_sha"], row["base_ref"]) for row in conn.execute(
+        "SELECT head_sha, base_ref FROM jobs WHERE repo=? AND number=? AND status='posted' AND review_recorded=0", pr)}
+    latest = {}  # finding id: (the commit that answered it last, the answers there)
+    for finding_id, status, head, base in conn.execute(
+            "SELECT r.finding_id, r.status, j.head_sha, j.base_ref FROM resolutions r JOIN jobs j ON j.id=r.job_id"
+            " WHERE j.repo=? AND j.number=? AND j.status='posted' ORDER BY j.id", pr):
+        at, answers = latest.get(finding_id, (None, []))
+        latest[finding_id] = (at, answers + [status]) if at == (head, base) else ((head, base), [status])
+    closed = {finding_id for finding_id, (at, answers) in latest.items()
+              if at not in unrecorded and set(answers) <= set(RESOLVED_STATUSES)}
     headings = {}
     for row in conn.execute("SELECT f.id, f.title, j.review_id FROM findings f JOIN jobs j ON j.id=f.job_id"
                             " WHERE j.repo=? AND j.number=? AND j.review_id IS NOT NULL AND f.duplicate_of IS NULL"
-                            " AND f.kind IN ('finding', 'regression')", (job["repo"], job["number"])):
+                            " AND f.kind IN ('finding', 'regression')", pr):
         headings.setdefault((row["review_id"], review.clean(row["title"], 300)), set()).add(row["id"])
-    wanted = {key for key, finding_ids in headings.items() if finding_ids & done and finding_ids <= done}
+    wanted = {key for key, finding_ids in headings.items() if finding_ids <= closed}
+    if not wanted:
+        return 0
     resolved = 0
     try:
         for thread in svc.github.review_threads(job["repo"], job["number"]):

@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 os.environ["LOCAL_AUTOREVIEWER_SHARE"] = str(ROOT)
 
 from local_autoreviewer import config as config_mod, pipeline  # noqa: E402
-from local_autoreviewer.github import MARKER_PREFIX  # noqa: E402
+from local_autoreviewer.github import MARKER_PREFIX, GitHubError  # noqa: E402
 from local_autoreviewer.gitops import Git  # noqa: E402
 from local_autoreviewer.runner import DirectRunner  # noqa: E402
 
@@ -97,6 +97,7 @@ class FakeGitHub:
         self.fail = None  # an exception for those listings to raise
         self.resolved = set()  # ids of resolved review threads (a thread's id: "T" + its first comment's id)
         self.resolve_calls = []  # every resolve_thread call, in order
+        self.fail_resolve_after = None  # resolve_thread raises once this many calls have succeeded
         self.fail_threads = None  # an exception for the thread calls to raise
 
     def now(self):
@@ -173,6 +174,8 @@ class FakeGitHub:
     def resolve_thread(self, thread_id):
         if self.fail_threads is not None:
             raise self.fail_threads
+        if self.fail_resolve_after is not None and len(self.resolve_calls) >= self.fail_resolve_after:
+            raise GitHubError("HTTP 502")
         self.resolve_calls.append(thread_id)
         self.resolved.add(thread_id)
 

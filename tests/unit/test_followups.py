@@ -506,9 +506,11 @@ class FollowupTests(EnvTestCase):
         self.github.resolved.clear()
         conn = self.svc.connect()
         with db.transaction(conn):  # as if a second reviewer of the round had said partly fixed
-            other = db.insert_job(conn, repo=REPO, number=1, head_sha="c" * 40, base_ref="main", agent="codex",
+            head_b = db.get_job(conn, second)["head_sha"]
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="codex",
                                   model="", source="poll", not_before=0, now=self.clock())
-            db.update_job(conn, other, posted_with=second, status="posted")
+            db.update_job(conn, other, posted_with=second, status="posted", review_recorded=1,
+                          review_kind="followup", followup_of=self.head_a)
             conn.execute("INSERT INTO resolutions (job_id, finding_id, status) VALUES (?, ?, 'partly_fixed')",
                          (other, finding["id"]))
         try:
@@ -587,6 +589,7 @@ class FollowupTests(EnvTestCase):
                 db.update_job(conn, other, status="posted", followup_of=self.head_a, review_kind="followup")
             self.assertEqual(pipeline.resolve_fixed_threads(conn, self.svc, db.get_job(conn, other)), 0)
             with db.transaction(conn):  # once they are: only partly fixed
+                db.update_job(conn, other, review_recorded=1)
                 conn.execute("INSERT INTO resolutions (job_id, finding_id, status) VALUES (?, ?, 'partly_fixed')",
                              (other, finding["id"]))
             self.assertEqual(pipeline.resolve_fixed_threads(conn, self.svc, db.get_job(conn, other)), 0)
@@ -608,6 +611,72 @@ class FollowupTests(EnvTestCase):
         # The follow-up finds the first fixed and the second not (fake: only the first previous finding is fixed).
         self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
         self.assertEqual(self.github.resolved, set())
+        # The next one finds the second fixed too: now the shared heading's thread goes.
+        self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED + "\n"}))
+        self.assertIn(self.thread_of(finding["title"]), self.github.resolved)
+
+    def test_a_sibling_that_ends_without_posting_lets_the_threads_go(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT title FROM findings WHERE job_id=? AND kind='finding'", first)
+        head_b = self.remote.push_pr(1, {"src/calc.py": FIXED})
+        conn = self.svc.connect()
+        with db.transaction(conn):  # the other reviewer of head_b, still running
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha=head_b, base_ref="main", agent="codex",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, status="running")
+        conn.close()
+        self.svc = self.services(make_config(self.tmp, agents=("claude",), service={"combine_wait": "0s"}))
+        self.review_at(head_b)
+        self.assertEqual(self.github.resolved, set())  # waits for Codex
+        conn = self.svc.connect()
+        try:
+            pipeline._finish(conn, self.svc, other, "failed", "agent failed 3 times")  # Codex never posts
+        finally:
+            conn.close()
+        self.assertEqual(self.github.resolved, {self.thread_of(finding["title"])})
+
+    def test_a_post_recovered_after_a_push_resolves_nothing(self):
+        from unittest import mock
+        from local_autoreviewer.github import GitHubError
+        self.review_at(self.head_a)
+        real = self.github.post_review
+
+        def accepted_then_timed_out(*args, **kwargs):
+            real(*args, **kwargs)
+            raise GitHubError("gh api timed out")
+        with mock.patch.object(self.github, "post_review", side_effect=accepted_then_timed_out):
+            second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.github.set_pr(1, self.remote.push_pr(1, {"src/calc.py": "def divide(a, b):\n    return a / b\n"}))
+        conn = self.svc.connect()
+        try:
+            self.assertEqual(pipeline.recover_post(conn, self.svc, db.get_job(conn, second)), "posted")
+        finally:
+            conn.close()
+        self.assertEqual(self.github.resolved, set())  # its "fixed" may not hold at the new head
+
+    def test_a_title_over_several_lines_is_matched(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            conn.execute("UPDATE findings SET title=? WHERE id=?", ("Division by zero\nis unhandled", finding["id"]))
+        conn.close()
+        root = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        root["body"] = root["body"].replace(finding["title"], "Division by zero\nis unhandled")
+        self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(self.github.resolved, {f"T{root['id']}"})
+
+    def test_a_failure_partway_keeps_what_was_resolved(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT title FROM findings WHERE job_id=? AND kind='finding'", first)
+        root = next(c for c in self.github.review_comments[(REPO, 1)] if finding["title"] in c["body"])
+        self.github.review_comments[(REPO, 1)].append(dict(root, id=root["id"] + 1000))  # a second thread
+        self.github.fail_resolve_after = 1
+        with self.assertLogs("local_autoreviewer.pipeline", "WARNING") as logs:
+            _, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(status, "posted")
+        self.assertEqual(len(self.github.resolved), 1)
+        self.assertTrue(any("GitHubError: HTTP 502" in line and "they stay open" in line for line in logs.output))
 
     def test_every_open_thread_of_a_finding_is_resolved_once(self):
         first, _ = self.review_at(self.head_a)
