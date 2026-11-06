@@ -485,6 +485,50 @@ class FollowupTests(EnvTestCase):
         self.assertTrue(saved["review"]["new_code"])
         self.assertEqual(saved["review"]["test_gaps"], ["No test for the new code."])
 
+    def thread_of(self, title):
+        (comment,) = [c for c in self.github.review_comments[(REPO, 1)] if title in c["body"].split("\n", 1)[0]]
+        return f"T{comment['id']}"
+
+    def test_a_fixed_findings_thread_is_resolved(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT title FROM findings WHERE job_id=? AND kind='finding'", first)
+        fixed, nit = self.thread_of(finding["title"]), self.thread_of("Add a docstring.")
+        self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        # Fixed: its thread is resolved. The nit isn't asked about, and the follow-up's own regression is new.
+        self.assertEqual(self.github.resolved, {fixed})
+        self.assertNotIn(self.thread_of("The fix dropped the docstring"), self.github.resolved)
+        self.assertNotIn(nit, self.github.resolved)
+
+    def test_a_finding_not_fixed_by_every_reviewer_keeps_its_thread(self):
+        first, _ = self.review_at(self.head_a)
+        (finding,) = self.rows("SELECT id, title FROM findings WHERE job_id=? AND kind='finding'", first)
+        second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.github.resolved.clear()
+        conn = self.svc.connect()
+        with db.transaction(conn):  # as if a second reviewer of the round had said partly fixed
+            other = db.insert_job(conn, repo=REPO, number=1, head_sha="c" * 40, base_ref="main", agent="codex",
+                                  model="", source="poll", not_before=0, now=self.clock())
+            db.update_job(conn, other, posted_with=second, status="posted")
+            conn.execute("INSERT INTO resolutions (job_id, finding_id, status) VALUES (?, ?, 'partly_fixed')",
+                         (other, finding["id"]))
+        try:
+            job = db.get_job(conn, second)
+            self.assertEqual(pipeline.resolve_fixed_threads(conn, self.svc, job), 0)
+            with db.transaction(conn):
+                conn.execute("UPDATE resolutions SET status='obsolete' WHERE job_id=?", (other,))
+            self.assertEqual(pipeline.resolve_fixed_threads(conn, self.svc, job), 1)  # fixed and obsolete both close
+        finally:
+            conn.close()
+        self.assertEqual(self.github.resolved, {self.thread_of(finding["title"])})
+
+    def test_a_github_failure_leaves_the_threads_open(self):
+        from local_autoreviewer.github import GitHubError
+        self.review_at(self.head_a)
+        self.github.fail_threads = GitHubError("HTTP 403: Resource not accessible by personal access token")
+        second, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(status, "posted")
+        self.assertEqual(self.github.resolved, set())
+
     def test_a_saved_followup_is_recorded_as_one(self):
         self.review_at(self.head_a)
         second, _ = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))

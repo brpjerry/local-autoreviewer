@@ -95,6 +95,8 @@ class FakeGitHub:
         self.review_comments = {}
         self.reads = []  # (method, repo, number) for the comment and review listings
         self.fail = None  # an exception for those listings to raise
+        self.resolved = set()  # ids of resolved review threads (a thread's id: "T" + its first comment's id)
+        self.fail_threads = None  # an exception for the thread calls to raise
 
     def now(self):
         return iso(self.clock() if self.clock else 0)
@@ -159,6 +161,18 @@ class FakeGitHub:
                  "line": comment.get("line"), "body": comment["body"], "user": {"login": self.login},
                  "created_at": self.now(), "html_url": f"{url}-comment"})
         return {"id": review_id, "html_url": url}
+
+    def review_threads(self, repo, number):
+        if self.fail_threads is not None:
+            raise self.fail_threads
+        return [{"id": f"T{c['id']}", "resolved": f"T{c['id']}" in self.resolved, "body": c["body"],
+                 "review_id": c.get("pull_request_review_id")}
+                for c in self.review_comments.get((repo, number), []) if not c.get("in_reply_to_id")]
+
+    def resolve_thread(self, thread_id):
+        if self.fail_threads is not None:
+            raise self.fail_threads
+        self.resolved.add(thread_id)
 
     def find_marked_review(self, repo, number, job_id, login):
         needle = f"{MARKER_PREFIX}job={job_id} "

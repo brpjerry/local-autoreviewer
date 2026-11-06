@@ -43,6 +43,21 @@ def gh_env(token, config_dir):
     }
 
 
+THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id isResolved comments(first: 1) { nodes { body pullRequestReview { databaseId } } } }
+      }
+    }
+  }
+}"""
+RESOLVE_MUTATION = """
+mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"""
+
+
 class GitHub:
     def __init__(self, token, config_dir, gh="gh"):
         self.token = token
@@ -111,6 +126,26 @@ class GitHub:
     def list_review_comments(self, repo, number):
         """The PR's inline comments, replies included (in_reply_to_id: the thread's first comment)."""
         return self._list(f"repos/{repo}/pulls/{number}/comments")
+
+    def review_threads(self, repo, number):
+        """The PR's review threads: id, resolved, and the body of the thread's first comment and the id of the
+        review it belongs to (review_id, as REST numbers reviews)."""
+        owner, name = repo.split("/", 1)
+        threads, after = [], None
+        while True:
+            args = ["api", "graphql", "-f", f"query={THREADS_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
+                    "-F", f"number={number}"] + (["-f", f"after={after}"] if after else [])
+            page = self._json(args)["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for node in page["nodes"]:
+                first = (node["comments"]["nodes"] or [{}])[0]
+                threads.append({"id": node["id"], "resolved": bool(node["isResolved"]), "body": first.get("body") or "",
+                                "review_id": (first.get("pullRequestReview") or {}).get("databaseId")})
+            if not page["pageInfo"]["hasNextPage"]:
+                return threads
+            after = page["pageInfo"]["endCursor"]
+
+    def resolve_thread(self, thread_id):
+        self._json(["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"id={thread_id}"])
 
     def find_marked_review(self, repo, number, job_id, login):
         """Find a review we already posted for this job (crash between post and DB update)."""

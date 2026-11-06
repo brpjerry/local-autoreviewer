@@ -15,6 +15,7 @@ from unittest import mock
 from tests.helpers import OWNER, REPO, EnvTestCase, iso, make_config
 from local_autoreviewer import __main__ as cli
 from local_autoreviewer import db, feedback, pipeline, review
+from local_autoreviewer import github as github_mod
 from local_autoreviewer.github import GitHub, GitHubError
 from local_autoreviewer.triggers import poll as poll_mod
 
@@ -504,6 +505,40 @@ class GitHubListingTests(unittest.TestCase):
             github.list_reviews("o/r", 3)
         self.assertEqual(calls, [["api", "--paginate", path, "--jq", ".[] | tojson"] for path in (
             "repos/o/r/issues/3/comments", "repos/o/r/pulls/3/comments", "repos/o/r/pulls/3/reviews")])
+
+
+    def test_review_threads_read_every_page_and_resolve(self):
+        with tempfile.TemporaryDirectory(prefix="lar-gh-") as tmp:
+            github = GitHub("t0ken", Path(tmp))
+        pages = [
+            {"hasNextPage": True, "endCursor": "c1",
+             "nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [
+                 {"body": "**1. Leak** (local-autoreviewer)", "pullRequestReview": {"databaseId": 9}}]}}]},
+            {"hasNextPage": False, "endCursor": None,
+             "nodes": [{"id": "T2", "isResolved": True, "comments": {"nodes": []}}]},
+        ]
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            if "query=" + github_mod.RESOLVE_MUTATION in args:
+                return '{"data": {"resolveReviewThread": {"thread": {"isResolved": true}}}}'
+            page = pages[len(calls) - 1]
+            return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": page["hasNextPage"], "endCursor": page["endCursor"]},
+                "nodes": page["nodes"]}}}}})
+
+        with mock.patch.object(github, "_run", side_effect=run):
+            self.assertEqual(github.review_threads("o/r", 3), [
+                {"id": "T1", "resolved": False, "body": "**1. Leak** (local-autoreviewer)", "review_id": 9},
+                {"id": "T2", "resolved": True, "body": "", "review_id": None}])
+            github.resolve_thread("T1")
+        self.assertIn("-F", calls[0])
+        self.assertIn("number=3", calls[0])
+        self.assertIn("owner=o", calls[0])
+        self.assertNotIn("after=c1", calls[0])
+        self.assertIn("after=c1", calls[1])  # the second page continues from the first's cursor
+        self.assertIn("id=T1", calls[2])
 
 
 if __name__ == "__main__":
