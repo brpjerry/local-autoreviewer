@@ -153,6 +153,39 @@ class RenderTests(unittest.TestCase):
         body = self.render(many)
         self.assertLessEqual(len(body), review.MAX_BODY)
         self.assertIn("<!-- local-autoreviewer job=42", body)
+        self.assertIn("_Review truncated to GitHub's size limit._", body)
+        # Cut before a whole finding: what's left ends with a finding that is complete.
+        kept = body.split("\n\n_Review truncated")[0]
+        self.assertTrue(kept.endswith("x" * 100))
+        self.assertEqual(kept.count("**Name**"), body.count("**Name**"))
+
+    def body_only(self, lines, count):
+        """A finding whose fix is count edits of `lines` lines each, none of them an inline suggestion."""
+        text = "\n".join(f"line {n} " + "y" * 90 for n in range(lines))
+        edits = [{"file": "a.py", "start_line": n + 1, "end_line": n + 1, "replacement": text, "original": ["old"],
+                  "inline": False, "anchor": "exact"} for n in range(count)]
+        return dict(SAMPLE["findings"][0], edits=edits)
+
+    def test_a_long_review_shortens_its_diffs_before_dropping_anything(self):
+        # About 110 kB of diffs in full, each edit under the 20,000-character cap on one.
+        data = dict(SAMPLE, findings=[self.body_only(180, 3)] * 2)
+        body = self.render(data)
+        self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertNotIn("truncated", body)
+        self.assertIn("… 101 more lines", body)  # cut to the usual 80
+        self.assertIn("<summary>Nits (1)</summary>", body)  # the nits stay
+        short = dict(SAMPLE, findings=[self.body_only(180, 1)])  # fits whole: shown whole
+        self.assertNotIn("more lines", self.render(short))
+
+    def test_a_cut_never_leaves_a_block_open(self):
+        data = dict(SAMPLE, findings=[dict(self.body_only(80, 10), detail="z" * 3000)] * 12,
+                    nits=[{"file": "a.py", "line": 1, "text": "n" * 900}] * 15)
+        body = self.render(data)
+        self.assertLessEqual(len(body), review.MAX_BODY)
+        self.assertIn("_Review truncated to GitHub's size limit._", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+        fences = [line for line in body.splitlines() if line.strip().startswith("```")]
+        self.assertEqual(len(fences) % 2, 0)
 
     def test_validate_rejects_garbage(self):
         for data in (None, [], {"summary": ""}, {"summary": "x", "findings": ["no"]}):

@@ -19,6 +19,7 @@ MAX_EDITS = 10  # per finding
 MAX_REPLACEMENT = 20_000  # characters
 MAX_SHOWN_LINES = 80  # per edit that is also an inline suggestion, in the review body; that one is complete
 MAX_BODY_ONLY_LINES = 400  # per edit shown only in the review body, so a few huge ones can't fill it
+MAX_COMMENT = 60_000  # characters of an inline comment; GitHub refuses the whole review past 65,536
 ANCHOR_WINDOW = 30  # lines around a stated range searched for the nearest copy of `current`; beyond, only a unique copy
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -151,8 +152,9 @@ def adjust(severity, delta, readability):
 
 
 def apply(review, *, worktree, hunks, test_paths):
-    """Check every finding's and nit's edits, adjust finding severities, and mark which edits GitHub can
-    show inline. Findings are re-sorted by final severity, so positions match the posted numbering."""
+    """Check every finding's and nit's edits, adjust finding severities, and mark the edit that becomes the
+    item's inline suggestion (see _mark_inline). Findings are re-sorted by final severity, so positions match
+    the posted numbering."""
     findings = []
     for item in review["findings"]:
         edits = [e for e in (check_edit(e, worktree) for e in item["edits"]) if e]
@@ -160,19 +162,25 @@ def apply(review, *, worktree, hunks, test_paths):
         # Readability rates the proposed fix; if none of it can be applied, the review doesn't show it.
         readability = item["readability"] if applied(edits) or not item["edits"] else "same"
         final, notes = adjust(item["severity"], delta, readability)
-        findings.append({**item, "edits": [_mark_inline(e, hunks) for e in edits], "loc_delta": delta,
+        findings.append({**item, "edits": _mark_inline(edits, hunks), "loc_delta": delta,
                          "reviewer_severity": item["severity"], "severity": final, "severity_notes": notes})
     findings.sort(key=lambda f: LEVELS.index(f["severity"]), reverse=True)
-    nits = [{**nit, "edits": [_mark_inline(e, hunks) for e in (check_edit(e, worktree) for e in nit["edits"]) if e]}
+    nits = [{**nit, "edits": _mark_inline([e for e in (check_edit(e, worktree) for e in nit["edits"]) if e], hunks)}
             for nit in review["nits"]]
     return {**review, "findings": findings, "nits": nits}
 
 
-def _mark_inline(edit, hunks):
-    if edit.get("anchor") == "dropped":
-        return {**edit, "inline": False}
-    inline = any(first <= edit["start_line"] and edit["end_line"] <= last for first, last in hunks.get(edit["file"], ()))
-    return {**edit, "inline": inline}
+def _in_diff(edit, hunks):
+    return edit.get("anchor") != "dropped" and any(
+        first <= edit["start_line"] and edit["end_line"] <= last for first, last in hunks.get(edit["file"], ()))
+
+
+def _mark_inline(edits, hunks):
+    """An item's edits, with inline set on the first one within the PR's diff only: it becomes the item's one
+    inline suggestion, so each finding or nit gets one thread to reply in. A suggestion can only replace its
+    own comment's lines, so the item's other edits are shown as diffs (see comments)."""
+    first = next((n for n, edit in enumerate(edits) if _in_diff(edit, hunks)), None)
+    return [{**edit, "inline": n == first} for n, edit in enumerate(edits)]
 
 
 def fence(info, text):
@@ -184,20 +192,44 @@ def fence(info, text):
 
 
 def comments(review, label):
-    """GitHub review comments with a suggested change, one per inline edit. label(index, item) gives
+    """GitHub review comments with a suggested change: one per finding or nit with an inline edit (see
+    _mark_inline), so each has one thread. The rest of the item's fix is shown in the same comment as diffs,
+    unless that would make it too long; the review body has all of it either way. label(index, item) gives
     the heading that ties the comment to its item in the review body."""
     out = []
     items = [(i, f) for i, f in enumerate(review["findings"])] + [(None, n) for n in review["nits"]]
     for index, item in items:
-        for edit in item.get("edits") or []:
-            if not edit.get("inline"):
-                continue
-            comment = {"path": edit["file"], "line": edit["end_line"], "side": "RIGHT",
-                       "body": f"{label(index, item)}\n\n{fence('suggestion', edit['replacement'])}"}
-            if edit["start_line"] < edit["end_line"]:
-                comment.update(start_line=edit["start_line"], start_side="RIGHT")
-            out.append(comment)
+        edits = applied(item.get("edits") or [])
+        inline = next((edit for edit in edits if edit.get("inline")), None)
+        if inline is None:
+            continue
+        body = f"{label(index, item)}\n\n{fence('suggestion', inline['replacement'])}"
+        others = [edit for edit in edits if edit is not inline]
+        if others:
+            rest = _rest_of_fix(others)
+            body += (rest if len(body) + len(rest) <= MAX_COMMENT else
+                     f"\n\n_The fix also changes {_places(len(others))}, shown in the review._")
+        comment = {"path": inline["file"], "line": inline["end_line"], "side": "RIGHT", "body": body}
+        if inline["start_line"] < inline["end_line"]:
+            comment.update(start_line=inline["start_line"], start_side="RIGHT")
+        out.append(comment)
     return out
+
+
+def _places(count):
+    return f"{count} other place{'s' if count > 1 else ''}"
+
+
+def _rest_of_fix(edits):
+    """An item's edits other than its suggestion, as collapsed diffs for its inline comment."""
+    parts = [f"\n\nThe fix also changes {_places(len(edits))}:"]
+    for edit in edits:
+        span = str(edit["start_line"]) if edit["start_line"] == edit["end_line"] else \
+            f"{edit['start_line']}–{edit['end_line']}"
+        where = f"{edit['file']}:{span}".replace("<", "&lt;")
+        diff = shown_diff(edit, shorten=False).replace("<!--", "<!\u200b--")
+        parts.append(f"\n\n<details><summary><code>{where}</code></summary>\n\n{diff}\n\n</details>")
+    return "".join(parts)
 
 
 def shown_diff(edit, *, shorten=True):

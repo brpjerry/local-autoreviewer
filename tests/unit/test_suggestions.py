@@ -182,6 +182,40 @@ class SuggestionTests(unittest.TestCase):
         self.assertIn("```suggestion\nB\nC\n```", found[0]["body"])
         self.assertNotIn("start_line", found[1])  # a one-line suggestion
         self.assertIn("**Nit:** a nit", found[1]["body"])
+        # The rest of the finding's fix is in its comment too, so its one thread has all of it.
+        self.assertIn("The fix also changes 1 other place:\n\n<details><summary><code>src/app.py:9</code></summary>",
+                      found[0]["body"])
+        self.assertIn("-q\n+z", found[0]["body"])
+        self.assertNotIn("other place", found[1]["body"])
+
+    def test_only_the_first_edit_in_the_diff_is_a_suggestion(self):
+        data = {"findings": [self.finding("minor", [edit("tests/test_app.py", 1, 1, "T"), edit("src/app.py", 1, 1, "A"),
+                                                    edit("src/app.py", 3, 3, "C")])],
+                "nits": [{"text": "t", "edits": [edit("src/app.py", 2, 2, "B"), edit("src/app.py", 4, 4, "D")]}]}
+        out = suggestions.apply(data, worktree=self.worktree, hunks={"src/app.py": [(1, 4)]},
+                                test_paths=DEFAULT_TEST_PATHS)
+        self.assertEqual([e["inline"] for e in out["findings"][0]["edits"]], [False, True, False])
+        self.assertEqual([e["inline"] for e in out["nits"][0]["edits"]], [True, False])
+        found = suggestions.comments(out, review.comment_label(out))
+        self.assertEqual([(c["path"], c["line"]) for c in found], [("src/app.py", 1), ("src/app.py", 2)])
+        self.assertIn("```suggestion\nA\n```", found[0]["body"])
+        self.assertIn("The fix also changes 2 other places:", found[0]["body"])
+        # A dropped edit is never the suggestion, and isn't shown as part of the fix.
+        dropped = {"findings": [self.finding("minor", [edit("src/app.py", 1, 1, "X", original=["a"], anchor="dropped",
+                                                            inline=False),
+                                                       edit("src/app.py", 2, 2, "B", original=["b"], inline=True)])],
+                   "nits": []}
+        (comment,) = suggestions.comments(dropped, review.comment_label(dropped))
+        self.assertNotIn("other place", comment["body"])
+
+    def test_a_fix_too_long_for_its_comment_is_left_to_the_review(self):
+        huge = "\n".join("x" * 99 for _ in range(400))
+        data = {"findings": [self.finding("minor", [edit("src/app.py", 1, 1, "A", original=["a"], inline=True)]
+                                          + [edit("src/app.py", 2, 2, huge, original=["b"], inline=False)] * 3)],
+                "nits": []}
+        (comment,) = suggestions.comments(data, review.comment_label(data))
+        self.assertLessEqual(len(comment["body"]), suggestions.MAX_COMMENT)
+        self.assertTrue(comment["body"].endswith("_The fix also changes 3 other places, shown in the review._"))
 
 
 if __name__ == "__main__":
