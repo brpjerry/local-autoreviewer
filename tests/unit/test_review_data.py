@@ -14,6 +14,16 @@ from tests.helpers import REPO, EnvTestCase, make_config
 from local_autoreviewer import __main__ as cli
 from local_autoreviewer import db, maintenance, pipeline, review
 
+
+def load_replay():
+    """tools/replay as a module (it's a script without a .py name)."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("replay_tool", str(Path(__file__).parents[2] / "tools" / "replay"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader("replay_tool", loader))
+    loader.exec_module(module)
+    return module
+
 OLD_REVIEW = {  # the shape written before the calibrated schema: no impact, likelihood or trigger
     "summary": "One problem.",
     "findings": [{"severity": "minor", "category": "tests", "file": "t.py", "line": 4, "title": "Order-dependent test",
@@ -147,11 +157,38 @@ class ReviewDataTests(EnvTestCase):
         with db.transaction(conn):
             db.update_job(conn, job_id, finished_at=self.clock() - self.cfg.service.retain_jobs - 1)
         conn.close()
+        reviewed = json.loads(Path(paths.context, "pr.json").read_text())
         maintenance.housekeeping(self.svc)
         self.assertFalse(Path(paths.worktree).exists())
         self.assertFalse(Path(paths.context).exists())
         self.assertTrue(Path(paths.out, "review.json").is_file())
         self.assertTrue(Path(paths.out, "review.md").is_file())
+        # The PR as reviewed is kept for tools/replay, and the replay finds it there.
+        self.assertEqual(json.loads(Path(paths.out, "pr.json").read_text()), reviewed)
+        self.assertEqual(load_replay().saved_pr(self.state, REPO, 1, self.head)["job_id"], job_id)
+
+    def test_replay_finds_the_description_the_service_reviewed(self):
+        replay = load_replay()
+        first, _ = self.run_job()
+        saved = replay.saved_pr(self.state, REPO, 1, self.head)
+        self.assertEqual((saved["job_id"], saved["head_sha"]), (first, self.head))
+        self.assertIn("title", saved)
+        # The latest job of the commit wins; one of another commit or PR is never used.
+        conn = self.svc.connect()
+        with db.transaction(conn):  # a rerun of the same commit
+            later = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="claude",
+                                  model="opus", source="manual", not_before=0, now=self.clock(),
+                                  rerun=db.next_rerun(conn, REPO, 1, self.head, "main", "claude"))
+            db.update_job(conn, later, status="running", started_at=self.clock())
+        conn.close()
+        pipeline.run_job(self.svc, later, pipeline.CancelToken())
+        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], later)
+        self.assertIsNone(replay.saved_pr(self.state, REPO, 1, "b" * 40))
+        self.assertIsNone(replay.saved_pr(self.state, REPO, 2, self.head))
+        # A garbled copy is skipped for an earlier job's.
+        Path(pipeline.job_paths(self.state, later).context, "pr.json").write_text("{")
+        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], first)
+        self.assertIsNone(replay.saved_pr(self.state / "nowhere", REPO, 1, self.head))  # no service database
 
     def test_triage_and_export(self):
         job_id, _ = self.run_job()

@@ -157,7 +157,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.config/local-autoreviewer/github-token` | Fine-grained token (0600) |
 | `~/.local/state/local-autoreviewer/state.sqlite3` | PR snapshots, events, jobs |
 | `~/.local/state/local-autoreviewer/status.json` | Snapshot written by the worker |
-| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md, and for the job that posted several reviews round.md and the duplicate check's output), kept |
+| `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md, the PR's pr.json once the context goes, and for the job that posted several reviews round.md and the duplicate check's output), kept |
 | `~/.local/state/local-autoreviewer/mirrors/` | One bare mirror per repo |
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |
@@ -190,10 +190,10 @@ tools/live teardown       # back to the installed package (install one at least 
 
 The live worktree is separate from the checkout you edit, so work in progress never runs.
 
-To see how a prompt change would have reviewed an earlier commit, replay it. Git data comes from the service's local mirror, the review runs in a scratch state directory and posts nothing, and only the PR's metadata is read from GitHub (the agents still use their normal online connections):
+To see how a prompt change would have reviewed an earlier commit, replay it. Git data comes from the service's local mirror, the review runs in a scratch state directory and posts nothing, and only the PR's metadata is read from GitHub (the agents still use their normal online connections). The title and description are the ones the service reviewed that commit with, where it kept them, because a description updated later can describe the fixes the review prompted; `--live-description` uses the current ones:
 
 ```sh
-tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent claude|codex] [--prompts <dir with review.md and review.schema.json>] [--json]
+tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent claude|codex] [--prompts <dir with review.md and review.schema.json>] [--json] [--live-description]
 ```
 
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).

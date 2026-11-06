@@ -18,6 +18,16 @@ def due(conn, now):
     return last is None or now - int(last) >= INTERVAL
 
 
+def _keep_pr_json(paths):
+    """Copy a job's pr.json from its context to out/, unless out/ has one already."""
+    kept = Path(paths.out, "pr.json")
+    try:
+        if not kept.exists():
+            shutil.copyfile(Path(paths.context, "pr.json"), kept)
+    except OSError:  # no context, or no pr.json in it (a job that stopped before writing one)
+        pass
+
+
 def housekeeping(svc):
     conn = svc.connect()
     now = svc.now()
@@ -28,10 +38,12 @@ def housekeeping(svc):
             f"AND status NOT IN ({','.join('?' * len(db.ACTIVE))})", (cutoff, *db.ACTIVE)).fetchall()
         removed = 0
         for row in rows:
-            # The checkout and context go; out/ (the agent's output and the review) is kept for analysis.
+            # The checkout and context go; out/ (the agent's output and the review) is kept for analysis, with
+            # the PR's title and description as reviewed (pr.json), which tools/replay uses.
             paths = job_paths(svc.state, row["id"])
             if not (Path(paths.worktree).exists() or Path(paths.context).exists()):
                 continue
+            _keep_pr_json(paths)
             mirror = svc.git.mirror_path(svc.state, row["repo"])
             if Path(paths.worktree).exists() and mirror.exists():
                 svc.git.remove_worktree(mirror, paths.worktree)
