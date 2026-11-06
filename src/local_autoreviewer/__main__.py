@@ -249,7 +249,7 @@ def cmd_status(args):
 
 FINDING_COLUMNS = ("f.*, j.repo, j.number, j.head_sha, j.base_ref, j.agent, j.model, j.effort, j.prompt_version, "
                    "j.source, j.status AS job_status, j.created_at AS job_created_at, j.review_url, j.usage_json, "
-                   "j.review_kind, j.followup_of, j.trivial, j.posted_with, (SELECT json_group_array(json_object('job_id', r.job_id, 'status', "
+                   "j.review_kind, j.followup_of, j.trivial, j.new_code, j.posted_with, (SELECT json_group_array(json_object('job_id', r.job_id, 'status', "
                    "r.status, 'detail', r.detail)) FROM resolutions r WHERE r.finding_id=f.id) AS resolutions")
 
 

@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
@@ -397,11 +397,17 @@ def _cancelled(conn, svc, job, cancel):
     return _finish(conn, svc, job["id"], status, current["reason"] or reason)
 
 
+MAX_RAISED = 150  # items of earlier rounds a follow-up is shown, so it doesn't raise them again
+MAX_RAISED_TEXT = 500
+
+
 @dataclass
 class PreviousRound:
-    """The round of reviews a follow-up checks: its head, and the issues still open after it."""
+    """The round of reviews a follow-up checks: its head, and the issues still open after it. raised: what
+    the PR's earlier rounds raised that the follow-up isn't asked about (see previous_round)."""
     head_sha: str
     findings: list  # finding rows with the reviewing agent
+    raised: list = field(default_factory=list)
 
     def for_agent(self):
         """The findings as the follow-up agent sees them (previous-findings.json)."""
@@ -412,6 +418,18 @@ class PreviousRound:
                  "proposed_edits": [{k: e[k] for k in ("file", "start_line", "end_line", "replacement")}
                                     for e in suggestions.applied(json.loads(f["edits"] or "[]"))]}
                 for f in self.findings]
+
+    def raised_for_agent(self):
+        """The earlier rounds' other items as the follow-up agent sees them (already-raised.json)."""
+        out = []
+        for f in self.raised[-MAX_RAISED:]:  # the latest, if there are more: they're about the newest code
+            item = {"kind": "finding" if f["kind"] in ("finding", "regression") else f["kind"], "reviewer": f["agent"],
+                    "file": f["file"], "line": f["line"], "raised_at": f["raised_at"],
+                    "text": f["title"][:MAX_RAISED_TEXT]}
+            if f["disposition"]:  # a finding the author triaged: their decision and why
+                item.update(decision=f["disposition"], note=(f["note"] or "")[:MAX_RAISED_TEXT])
+            out.append(item)
+        return out
 
 
 def previous_round(conn, job, base_contains=lambda base_sha: False):
@@ -447,7 +465,12 @@ def previous_round(conn, job, base_contains=lambda base_sha: False):
     # duplicate merged into another finding when the reviews were posted: that one stands for it.
     findings = _finding_rows(conn, f"f.id IN ({','.join('?' * len(ids))}) AND f.duplicate_of IS NULL"
                                    " AND (f.disposition IS NULL OR f.disposition='fixed')", sorted(ids)) if ids else []
-    return PreviousRound(row["head_sha"], findings)
+    # Raised by any earlier round and not asked about: nits, test gaps and questions, and findings the author
+    # triaged away. A follow-up that reviews the whole PR is told of them, so it doesn't post them again.
+    raised = _finding_rows(conn, f"f.job_id IN (SELECT id FROM jobs WHERE {scope}) AND f.duplicate_of IS NULL AND"
+                                 " (f.kind IN ('nit', 'test_gap', 'question') OR (f.kind IN ('finding', 'regression')"
+                                 " AND f.disposition IS NOT NULL AND f.disposition!='fixed'))", (*args, db.FOREGROUND))
+    return PreviousRound(row["head_sha"], findings, raised)
 
 
 def _finding_rows(conn, where, params):
@@ -500,11 +523,11 @@ def _run(conn, svc, job, cancel):
         if previous:
             since_bytes, since_files = svc.git.write_followup_context(
                 mirror, start, job["head_sha"], paths.context, exclude=repo_cfg.diff_exclude,
-                previous=previous.for_agent())
+                previous=previous.for_agent(), raised=previous.raised_for_agent())
             if since_bytes > repo_cfg.max_diff_bytes or since_files > repo_cfg.max_changed_files:
                 log.info("job %s: the changes since %s are too large for a follow-up; doing a full review", job["id"],
                          previous.head_sha[:12])
-                for name in ("since-review.diff", "previous-findings.json"):
+                for name in ("since-review.diff", "previous-findings.json", "already-raised.json"):
                     Path(paths.context, name).unlink(missing_ok=True)
                 previous = None
     if removed:
@@ -696,6 +719,7 @@ def _saved_review(svc, job):
     structured = review.validate(data)
     if isinstance(data.get("resolutions"), list):  # a follow-up's statuses of the previous findings
         structured["resolutions"] = data["resolutions"]
+        structured["new_code"] = data.get("new_code") is True
     return {"job_id": job["id"], "agent": job["agent"], "model": job["model"], "review": structured}
 
 

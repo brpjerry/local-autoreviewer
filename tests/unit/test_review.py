@@ -171,6 +171,7 @@ class RenderTests(unittest.TestCase):
             if node.get("type") == "array":
                 check(node["items"])
         check(schema)
+        check(review.followup_schema())  # built from it, with properties of its own
 
     def test_prompt_substitution(self):
         prompt = review.build_prompt(repo="o/r", number=5, title="T\nx", author="me", base_ref="main",

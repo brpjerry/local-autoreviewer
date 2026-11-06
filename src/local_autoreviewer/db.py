@@ -96,6 +96,10 @@ MIGRATIONS = [
         UNIQUE (repo, source, github_id));
     CREATE INDEX feedback_pr ON feedback (repo, number);
     """,
+    # 7: a follow-up that found new code in the changes since the previous review reviewed the whole PR.
+    """
+    ALTER TABLE jobs ADD COLUMN new_code INTEGER NOT NULL DEFAULT 0;
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -215,7 +219,8 @@ def record_review(conn, job_id, review, *, effort=None, prompt_version=None, fol
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     conn.executemany("INSERT INTO resolutions (job_id, finding_id, status, detail) VALUES (?, ?, ?, ?)",
                      [(job_id, r["finding"], r["status"], r["detail"]) for r in review.get("resolutions") or []])
-    known = {"effort": effort, "prompt_version": prompt_version, "trivial": int(bool(review.get("trivial")))}
+    known = {"effort": effort, "prompt_version": prompt_version, "trivial": int(bool(review.get("trivial"))),
+             "new_code": int(bool(review.get("new_code")))}
     if followup_of:
         known.update(review_kind="followup", followup_of=followup_of)
     update_job(conn, job_id, summary=review["summary"], review_recorded=1,
