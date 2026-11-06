@@ -3,6 +3,7 @@
 """Replay a review of an earlier commit of a PR, optionally with other prompts, to compare prompt changes.
 
   tools/replay owner/repo#N COMMIT [--base-sha SHA] [--agent claude|codex] [--prompts DIR] [--json]
+               [--live-description]
 
 COMMIT and the base commit must still be in the service's mirror of the repository. It keeps open PRs' current
 heads and bases and the commits of unexpired job checkouts; housekeeping drops a closed PR's refs. The review
@@ -12,7 +13,7 @@ prompts/).
 
 Only the PR's author and base branch, and its title and description, are read from GitHub. A description is
 often updated after the commit was reviewed, and can then describe the fixes the review prompted. So the
-title and description are taken from the service's own review of COMMIT where it kept them (the job's
+title and description are taken from the service's first review of COMMIT that kept them (the job's
 pr.json), unless --live-description is given; the replay says which it used.
 
 Codex runs with the reviews' own login (the live CODEX_HOME), and a plain run includes it when the repo's
@@ -72,16 +73,27 @@ def hold_codex(live_state):
     return handle
 
 
+def described(pr, saved, head, *, live=False):
+    """The PR as the replay gives it to the pipeline: with saved's title and description if there is one (the
+    author and base branch stay GitHub's), and a line saying which description it has."""
+    if saved:
+        return ({**pr, "title": saved.get("title") or "", "body": saved.get("body") or ""},
+                f"as the service reviewed {head[:12]} (job {saved['job_id']})")
+    why = "as asked" if live else f"the service kept none for {head[:12]}"
+    return pr, f"the PR's current ones ({why}); they may describe later changes"
+
+
 def saved_pr(live_state, repo, number, head):
-    """The PR's pr.json as the service reviewed head, with the job it came from in job_id: from the latest job
-    of that commit that kept one (in its context, or the copy housekeeping keeps in out/), or None."""
+    """The PR's pr.json as the service reviewed head, with the job it came from in job_id: from the first job
+    of that commit that kept one (in its context, or the copy housekeeping keeps in out/), or None. The first:
+    a later rerun may have read a description edited since."""
     database = live_state / "state.sqlite3"
     if not database.exists():
         return None
     conn = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     try:
         jobs = [row[0] for row in conn.execute(
-            "SELECT id FROM jobs WHERE repo=? AND number=? AND head_sha=? ORDER BY id DESC", (repo, number, head))]
+            "SELECT id FROM jobs WHERE repo=? AND number=? AND head_sha=? ORDER BY id", (repo, number, head))]
     finally:
         conn.close()
     for job_id in jobs:
@@ -130,14 +142,9 @@ def main():
     base_sha = git("-C", str(mirror), "rev-parse", "--verify", f"{base}^{{commit}}")
     token = read_token(paths.token_file())
     pr = GitHub(token, live_state / "gh").pr_view(repo, number)
-    saved = None if args.live_description else saved_pr(live_state, repo_cfg.name, number, head)
-    if saved:
-        pr = {**pr, "title": saved.get("title") or "", "body": saved.get("body") or ""}
-        print(f"title and description: as the service reviewed {head[:12]} (job {saved['job_id']})", file=sys.stderr)
-    else:
-        why = "as asked" if args.live_description else f"the service kept none for {head[:12]}"
-        print(f"title and description: the PR's current ones ({why}); they may describe later changes",
-              file=sys.stderr)
+    pr, source = described(pr, None if args.live_description else saved_pr(live_state, repo_cfg.name, number, head),
+                           head, live=args.live_description)
+    print(f"title and description: {source}", file=sys.stderr)
 
     scratch = Path(tempfile.mkdtemp(prefix="local-autoreviewer-replay-"))
     print(f"scratch directory (remove it when done): {scratch}", file=sys.stderr, flush=True)

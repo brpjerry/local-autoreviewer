@@ -19,13 +19,21 @@ def due(conn, now):
 
 
 def _keep_pr_json(paths):
-    """Copy a job's pr.json from its context to out/, unless out/ has one already."""
-    kept = Path(paths.out, "pr.json")
+    """Copy a job's pr.json from its context to out/, unless out/ has one already. The copy is written beside
+    it and renamed into place, so out/pr.json is whole or absent. Returns whether the context can go: False if
+    the copy failed, so a later housekeeping tries again."""
+    source, kept = Path(paths.context, "pr.json"), Path(paths.out, "pr.json")
+    if kept.exists() or not source.is_file():  # kept already, or a job that stopped before writing one
+        return True
+    partial = kept.with_name(".pr.json.partial")
     try:
-        if not kept.exists():
-            shutil.copyfile(Path(paths.context, "pr.json"), kept)
-    except OSError:  # no context, or no pr.json in it (a job that stopped before writing one)
-        pass
+        shutil.copyfile(source, partial)
+        partial.replace(kept)
+        return True
+    except OSError as exc:
+        partial.unlink(missing_ok=True)
+        log.warning("cannot keep %s (%s); keeping the job's context until it can be", source, exc)
+        return False
 
 
 def housekeeping(svc):
@@ -43,12 +51,13 @@ def housekeeping(svc):
             paths = job_paths(svc.state, row["id"])
             if not (Path(paths.worktree).exists() or Path(paths.context).exists()):
                 continue
-            _keep_pr_json(paths)
+            context_can_go = _keep_pr_json(paths)
             mirror = svc.git.mirror_path(svc.state, row["repo"])
             if Path(paths.worktree).exists() and mirror.exists():
                 svc.git.remove_worktree(mirror, paths.worktree)
             shutil.rmtree(paths.worktree, ignore_errors=True)
-            shutil.rmtree(paths.context, ignore_errors=True)
+            if context_can_go:
+                shutil.rmtree(paths.context, ignore_errors=True)
             removed += 1
         _remove_stale_locks(conn, svc)
         recorded = record_saved_reviews(conn, svc)

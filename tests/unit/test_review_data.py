@@ -167,28 +167,77 @@ class ReviewDataTests(EnvTestCase):
         self.assertEqual(json.loads(Path(paths.out, "pr.json").read_text()), reviewed)
         self.assertEqual(load_replay().saved_pr(self.state, REPO, 1, self.head)["job_id"], job_id)
 
+    def rerun(self):
+        """A second job of the same commit, run to the end."""
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="claude",
+                                   model="opus", source="manual", not_before=0, now=self.clock(),
+                                   rerun=db.next_rerun(conn, REPO, 1, self.head, "main", "claude"))
+            db.update_job(conn, job_id, status="running", started_at=self.clock())
+        conn.close()
+        pipeline.run_job(self.svc, job_id, pipeline.CancelToken())
+        return job_id
+
+    def expire(self, *job_ids):
+        conn = self.svc.connect()
+        with db.transaction(conn):
+            for job_id in job_ids:
+                db.update_job(conn, job_id, finished_at=self.clock() - self.cfg.service.retain_jobs - 1)
+        conn.close()
+
     def test_replay_finds_the_description_the_service_reviewed(self):
         replay = load_replay()
         first, _ = self.run_job()
         saved = replay.saved_pr(self.state, REPO, 1, self.head)
         self.assertEqual((saved["job_id"], saved["head_sha"]), (first, self.head))
         self.assertIn("title", saved)
-        # The latest job of the commit wins; one of another commit or PR is never used.
-        conn = self.svc.connect()
-        with db.transaction(conn):  # a rerun of the same commit
-            later = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main", agent="claude",
-                                  model="opus", source="manual", not_before=0, now=self.clock(),
-                                  rerun=db.next_rerun(conn, REPO, 1, self.head, "main", "claude"))
-            db.update_job(conn, later, status="running", started_at=self.clock())
-        conn.close()
-        pipeline.run_job(self.svc, later, pipeline.CancelToken())
-        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], later)
+        # The first job of the commit wins: a rerun may have read a description edited since.
+        later = self.rerun()
+        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], first)
         self.assertIsNone(replay.saved_pr(self.state, REPO, 1, "b" * 40))
         self.assertIsNone(replay.saved_pr(self.state, REPO, 2, self.head))
-        # A garbled copy is skipped for an earlier job's.
-        Path(pipeline.job_paths(self.state, later).context, "pr.json").write_text("{")
-        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], first)
+        # A garbled copy is skipped for the next job's.
+        Path(pipeline.job_paths(self.state, first).context, "pr.json").write_text("{")
+        self.assertEqual(replay.saved_pr(self.state, REPO, 1, self.head)["job_id"], later)
         self.assertIsNone(replay.saved_pr(self.state / "nowhere", REPO, 1, self.head))  # no service database
+
+    def test_replay_gives_the_pipeline_the_saved_description(self):
+        replay = load_replay()
+        live = {"title": "Now", "body": "Edited since", "author": {"login": "me"}, "baseRefName": "main"}
+        saved = {"title": "Then", "body": "As reviewed", "job_id": 7, "author": "someone", "base_ref": "dev"}
+        pr, source = replay.described(live, saved, "c" * 40)
+        self.assertEqual(pr, {**live, "title": "Then", "body": "As reviewed"})  # GitHub's author and base stay
+        self.assertEqual(source, f"as the service reviewed {'c' * 12} (job 7)")
+        self.assertEqual(replay.described(live, None, "c" * 40, live=True),
+                         (live, "the PR's current ones (as asked); they may describe later changes"))
+        self.assertIn("the service kept none", replay.described(live, None, "c" * 40)[1])
+
+    def test_expiry_keeps_an_existing_copy_and_goes_on_without_one(self):
+        first, _ = self.run_job()
+        out = Path(pipeline.job_paths(self.state, first).out, "pr.json")
+        out.write_text('{"kept": "before"}')
+        later = self.rerun()
+        Path(pipeline.job_paths(self.state, later).context, "pr.json").unlink()  # stopped before writing one
+        self.expire(first, later)
+        maintenance.housekeeping(self.svc)
+        self.assertEqual(out.read_text(), '{"kept": "before"}')
+        for job_id in (first, later):
+            self.assertFalse(Path(pipeline.job_paths(self.state, job_id).context).exists())
+        self.assertFalse(Path(pipeline.job_paths(self.state, later).out, "pr.json").exists())
+
+    def test_a_failed_copy_keeps_the_context_for_next_time(self):
+        job_id, _ = self.run_job()
+        paths = pipeline.job_paths(self.state, job_id)
+        self.expire(job_id)
+        with mock.patch.object(maintenance.shutil, "copyfile", side_effect=OSError("No space left on device")):
+            maintenance.housekeeping(self.svc)
+        self.assertFalse(Path(paths.worktree).exists())  # the checkout, the large part, still goes
+        self.assertTrue(Path(paths.context, "pr.json").is_file())
+        self.assertEqual(sorted(p.name for p in Path(paths.out).iterdir() if "pr.json" in p.name), [])
+        maintenance.housekeeping(self.svc)  # space again
+        self.assertTrue(Path(paths.out, "pr.json").is_file())
+        self.assertFalse(Path(paths.context).exists())
 
     def test_triage_and_export(self):
         job_id, _ = self.run_job()

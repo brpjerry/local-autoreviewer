@@ -13,9 +13,10 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# Everything the package or its check() needs; nothing else is shipped in the source archive.
+# Everything the package or its check() needs; nothing else is shipped in the source archive. tools/replay is
+# only for check(): its tests load it. The package doesn't install it.
 INCLUDE = ("bin/", "src/", "prompts/", "systemd/", "tests/", "docs/", "config.example.toml",
-           "README.md", "LICENSE")
+           "README.md", "LICENSE", "tools/replay")
 
 
 def _git(*args):
