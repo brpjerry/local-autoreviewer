@@ -1070,7 +1070,7 @@ class WorkerTests(EnvTestCase):
         self.fail(f"timed out; jobs: {jobs}")
 
     def hold(self, name, content):
-        """Take a hold as tools/live or tools/replay would; the caller closes the handle to end it."""
+        """Take a hold as tools/live would; the caller closes the handle to end it."""
         (self.state / "holds").mkdir(exist_ok=True)
         handle = open(self.state / "holds" / f"{name}.lock", "w")
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -1081,7 +1081,7 @@ class WorkerTests(EnvTestCase):
     def test_held_agents(self):
         from local_autoreviewer.worker import held_agents
         self.assertEqual(held_agents(self.state), set())
-        codex = self.hold("replay-1", "codex\n")
+        codex = self.hold("operator-1", "codex\n")
         (self.state / "holds" / "stale.lock").write_text("claude\n")  # its owner exited without removing it
         self.assertEqual(held_agents(self.state), {"codex"})
         everything = self.hold("tools-live", "")
@@ -1139,37 +1139,44 @@ class WorkerTests(EnvTestCase):
         for thread, _token, _agent in list(worker.threads.values()):
             thread.join(30)
 
-    def test_codex_reviewers_take_turns(self):
-        """They share one login: one Codex review runs at a time, the oldest due first. Claude's run together."""
+    def test_codex_reviewers_run_side_by_side(self):
+        """Like Claude's: they share the reviews' one Codex login, which concurrent processes can share."""
         further = {"codex-sol": {"model": "gpt-6.1-sol"}, "claude-sonnet": {"model": "sonnet"}}
         svc = self.services(make_config(self.tmp, agents=("claude", "claude-sonnet", "codex-sol", "codex"),
                                         further=further))
         self.enqueue(svc)
         worker = Worker(lambda c: svc, None)
         try:
-            hold = self.hold("replay-1", "codex\n")  # a type's hold holds all its reviewers
+            worker.claim(svc)
+            self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
+                             ["claude", "claude-sonnet", "codex", "codex-sol"])
+        finally:
+            self.join_jobs(worker)
+
+    def test_a_types_hold_holds_all_its_reviewers(self):
+        further = {"codex-sol": {"model": "gpt-6.1-sol"}, "claude-sonnet": {"model": "sonnet"}}
+        svc = self.services(make_config(self.tmp, agents=("claude", "claude-sonnet", "codex-sol", "codex"),
+                                        further=further))
+        self.enqueue(svc)
+        worker = Worker(lambda c: svc, None)
+        try:
+            hold = self.hold("operator-1", "codex\n")
             worker.claim(svc)
             self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()), ["claude", "claude-sonnet"])
             hold.close()
-            worker.claim(svc)  # the repo lists codex-sol first, so its job is the older of the two
-            self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
-                             ["claude", "claude-sonnet", "codex-sol"])
-            worker.claim(svc)  # codex waits while codex-sol runs, even with its review not yet started
-            self.assertEqual(len(worker.threads), 3)
-            self.join_jobs(worker)
-            worker.reap()
             worker.claim(svc)
-            self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+            self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
+                             ["claude", "claude-sonnet", "codex", "codex-sol"])
         finally:
             self.join_jobs(worker)
 
     def test_one_held_codex_reviewer_leaves_the_others_free(self):
         svc = self.services(make_config(self.tmp, agents=("codex-sol", "codex"),
                                         further={"codex-sol": {"model": "gpt-6.1-sol"}}))
-        self.enqueue(svc)  # codex-sol's job is the older
+        self.enqueue(svc)
         worker = Worker(lambda c: svc, None)
         try:
-            hold = self.hold("replay-1", "codex-sol\n")
+            hold = self.hold("operator-1", "codex-sol\n")
             worker.claim(svc)
             hold.close()
             self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])

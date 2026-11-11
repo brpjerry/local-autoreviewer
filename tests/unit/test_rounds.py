@@ -275,13 +275,17 @@ class RoundTests(EnvTestCase):
     def test_a_push_during_the_check_posts_nothing(self):
         svc, (claude, codex) = self.queue(make_config(self.tmp, codex="dupsleep"))
         self.run_job(svc, claude)
-        token, thread, result = self.start_in_thread(svc, codex)
-        conn = svc.connect()
-        with db.transaction(conn):
-            events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
-        conn.close()
-        token.cancel("superseded by abc")
-        thread.join(20)
+        with self.assertLogs("local_autoreviewer.pipeline", "INFO") as logs:
+            token, thread, result = self.start_in_thread(svc, codex)
+            conn = svc.connect()
+            with db.transaction(conn):
+                events.stop_jobs(conn, REPO, 1, "superseded", "superseded by abc")
+            conn.close()
+            token.cancel("superseded by abc")
+            thread.join(20)
+        # An expected end, so not a warning.
+        self.assertIn(f"INFO:local_autoreviewer.pipeline:job {codex}: duplicate check: it was cancelled", logs.output)
+        self.assertEqual([line for line in logs.output if not line.startswith("INFO:")], [])
         self.assertEqual(result["s"], "superseded")
         self.assertEqual(self.job(svc, claude)["status"], "superseded")
         self.assertEqual(self.github.posted, [])

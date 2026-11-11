@@ -789,7 +789,10 @@ def _check_duplicates(conn, svc, job, others, agent, cancel, *, title):
         if run.cancelled or run.timed_out or result.error_kind:
             why = ("it was cancelled" if run.cancelled else "it timed out" if run.timed_out
                    else "it hit a usage limit" if result.error_kind == "rate_limit" else "it failed")
-            log.warning("job %s: duplicate check: %s %s", job["id"], why, result.error or "")
+            if run.cancelled:  # the job's cancel: a new push, `cancel` or a stop; the job's outcome says which
+                log.info("job %s: duplicate check: it was cancelled", job["id"])
+            else:
+                log.warning("job %s: duplicate check: %s %s", job["id"], why, result.error or "")
             return {**record, "unchecked": f"the check {why.removeprefix('it ')}"}
         sets = combine.groups(result.review, members)
         record.update(duplicates=[[list(repeat), list(kept)] for repeat, kept in combine.duplicates(members, sets).items()],

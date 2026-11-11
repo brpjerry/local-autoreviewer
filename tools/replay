@@ -16,15 +16,12 @@ often updated after the commit was reviewed, and can then describe the fixes the
 title and description are taken from the service's first review of COMMIT that kept them (the job's
 pr.json), unless --live-description is given; the replay says which it used.
 
-Codex runs with the reviews' own login (the live CODEX_HOME), and a plain run includes it when the repo's
-config does. So a replay that includes a Codex reviewer (codex, codex-sol, ...) refuses to start while the
-service is running one, and holds off the service's Codex reviews until it exits (pass --agent claude to
-leave them alone).
+Codex runs with the reviews' own login: the replay links the live CODEX_HOME rather than copying it, so it
+can run while the service reviews (Codex processes sharing one auth.json take turns refreshing it; a copy
+would race it).
 """
 
 import argparse
-import atexit
-import fcntl
 import json
 import os
 import signal
@@ -58,20 +55,6 @@ class ReplayGitHub:
 
 
 ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/")}
-
-
-def hold_codex(live_state):
-    """Keep the service from starting a Codex review while this replay may use the shared login (a hold;
-    see worker.held_agents). It lasts until the process exits."""
-    holds = live_state / "holds"
-    holds.mkdir(exist_ok=True)
-    path = holds / f"replay-{os.getpid()}.lock"
-    handle = open(path, "w")
-    fcntl.flock(handle, fcntl.LOCK_EX)
-    handle.write("codex\n")
-    handle.flush()
-    atexit.register(lambda: (path.unlink(missing_ok=True), handle.close()))
-    return handle
 
 
 def described(pr, saved, head, *, live=False):
@@ -177,26 +160,6 @@ def main():
         secrets=lambda: [token, *leakscan.collect_secrets(auth_files(live_state))])
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
-    # A shared CODEX_HOME races the service's token refreshes (see above). The hold names the type, so it
-    # holds every Codex reviewer.
-    if any(config_mod.agent_type(agent) == "codex" for agent in agents):
-        hold = hold_codex(live_state)  # first, so the worker can't start one after the check below  # noqa: F841
-        try:
-            live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=rw", uri=True,
-                                   timeout=30, isolation_level=None)
-            try:  # in a write transaction, changing no rows: a claim begun before the hold is counted
-                live.execute("BEGIN IMMEDIATE")
-                busy = live.execute("SELECT COUNT(*) FROM jobs WHERE (agent='codex' OR agent LIKE 'codex-%')"
-                                    " AND status='running'").fetchone()[0]
-                live.execute("ROLLBACK")
-            finally:
-                live.close()
-        except sqlite3.Error as exc:
-            if (live_state / "state.sqlite3").exists():  # locked or unwritable: don't assume the service is idle
-                sys.exit(f"tools/replay: cannot check whether the service is running a Codex review: {exc}")
-            busy = 0  # no service database yet
-        if busy:
-            sys.exit("tools/replay: the service is running a Codex review; wait for it or pass --agent claude")
     reviews = {}
     for agent in agents:
         conn = svc.connect()
