@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.helpers import OWNER, REPO, EnvTestCase, make_config
+from tests.helpers import OWNER, REPO, EnvTestCase, agent_command, make_config
 from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
 from local_autoreviewer.github import GitHubError
@@ -1049,8 +1049,8 @@ class WorkerTests(EnvTestCase):
         thread.start()
         return worker, thread, svc
 
-    def enqueue(self, svc):
-        event = events.PrEvent(repo=REPO, number=2, action="opened", head_sha=self.head, base_ref="main",
+    def enqueue(self, svc, number=2, head=None):
+        event = events.PrEvent(repo=REPO, number=number, action="opened", head_sha=head or self.head, base_ref="main",
                                is_draft=False, author=OWNER, source="poll", head_changed_at=self.clock())
         conn = svc.connect()
         with db.transaction(conn):
@@ -1151,6 +1151,36 @@ class WorkerTests(EnvTestCase):
             self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
                              ["claude", "claude-sonnet", "codex", "codex-sol"])
         finally:
+            self.join_jobs(worker)
+
+    def test_each_reviewer_works_through_its_own_backlog(self):
+        """One review at a time per reviewer, and a reviewer that finishes starts its next review while another
+        Codex reviewer is still busy."""
+        sleeper, _ = agent_command(self.tmp, "codex", "sleep")
+        svc = self.services(make_config(self.tmp, agents=("codex", "codex-sol"),
+                                        further={"codex-sol": {"model": "gpt-6.1-sol", "command": sleeper}}))
+        head = self.remote.open_pr(3, {"src/other.py": "x = 1\n"})
+        self.github.set_pr(3, head)
+        self.enqueue(svc)
+        self.enqueue(svc, number=3, head=head)
+        conn = svc.connect()
+        job = {(r["agent"], r["number"]): r["id"] for r in conn.execute("SELECT id, agent, number FROM jobs")}
+        conn.close()
+        worker = Worker(lambda c: svc, None)
+
+        def running():
+            return sorted((agent, job_id) for job_id, (_t, _c, agent) in worker.threads.items())
+        try:
+            worker.claim(svc)
+            worker.claim(svc)  # each reviewer is busy, so this starts nothing
+            self.assertEqual(running(), [("codex", job["codex", 2]), ("codex-sol", job["codex-sol", 2])])
+            worker.threads[job["codex", 2]][0].join(30)  # codex finishes; codex-sol sleeps on
+            worker.reap()
+            worker.claim(svc)
+            self.assertEqual(running(), [("codex", job["codex", 3]), ("codex-sol", job["codex-sol", 2])])
+        finally:
+            for _thread, token, _agent in worker.threads.values():
+                token.cancel("the test is over")
             self.join_jobs(worker)
 
     def test_a_types_hold_holds_all_its_reviewers(self):
