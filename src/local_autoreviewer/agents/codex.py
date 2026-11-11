@@ -43,14 +43,13 @@ def _latest_comments(text, limit):
 
 class CodexAgent:
     name = "codex"
-    # The reviewers of this type share one login (CODEX_HOME below), and two Codex processes refreshing
-    # its token at once can race. So the worker runs one Codex review at a time (see Worker.claim).
-    one_at_a_time = True
 
     def __init__(self, cfg, state_dir):
         self.cfg = cfg
-        # Separate from ~/.codex: the global AGENTS.md there loads even with
-        # --ignore-user-config, and sharing auth.json would race token refreshes.
+        # Separate from ~/.codex, because the global AGENTS.md there loads even with --ignore-user-config.
+        # Every Codex reviewer shares this home's own login, and its reviews run side by side: processes
+        # sharing one auth.json take turns refreshing it (Codex keeps an auth.lock beside it). A copy of
+        # an auth.json in a second home would race the original for the rotating refresh token.
         self.home = Path(state_dir) / "codex-home"
 
     def env(self):

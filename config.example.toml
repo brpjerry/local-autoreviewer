@@ -38,7 +38,7 @@ mode = "shell"             # "inline": no shell tool; the diff and changed files
 # memory_max = "3G"
 
 # More reviewers: any number of either type, named claude-<name> or codex-<name>, each with the keys
-# above. List them in a repo's (or [defaults]) agents. Codex reviewers share one login and run one at a time.
+# above. List them in a repo's (or [defaults]) agents. All reviewers run side by side.
 # [agents.codex-sol]
 # model = "gpt-6.1-sol"
 # effort = "xhigh"

@@ -77,8 +77,6 @@ class ArgvTests(unittest.TestCase):
         argv = sonnet.invocation(unit="u", paths=PATHS, prompt="p", session_id="sid").argv
         self.assertEqual(argv[0], "claude")
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
-        self.assertTrue(codex.one_at_a_time)
-        self.assertFalse(claude.one_at_a_time)
 
     def test_codex_inline_mode_disables_shell(self):
         _, codex = agents(mode="inline")
