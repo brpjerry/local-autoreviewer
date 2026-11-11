@@ -189,7 +189,8 @@ class Worker:
             svc = self.make_services(self.watcher.get())
             self.reap()
             self.sync_cancels(svc)
-            self.run_guarded(svc, self.release_orphaned_foreground, self.recover_posts, self.post_waiting)
+            self.run_guarded(svc, self.release_orphaned_foreground, pipeline.cancel_unconfigured, self.recover_posts,
+                             self.post_waiting)
             if self.upgrade_pending():
                 if not self.threads:
                     log.info("package version changed to %s; exiting to restart on new code", paths.read_version())

@@ -194,7 +194,7 @@ The live worktree is separate from the checkout you edit, so work in progress ne
 To see how a prompt change would have reviewed an earlier commit, replay it. Git data comes from the service's local mirror, the review runs in a scratch state directory and posts nothing, and only the PR's metadata is read from GitHub (the agents still use their normal online connections). The title and description are the ones the service reviewed that commit with, where it kept them, because a description updated later can describe the fixes the review prompted; `--live-description` uses the current ones:
 
 ```sh
-tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent claude|codex] [--prompts <dir with review.md and review.schema.json>] [--json] [--live-description]
+tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent AGENT] [--prompts <dir with review.md and review.schema.json>] [--json] [--live-description]
 ```
 
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).

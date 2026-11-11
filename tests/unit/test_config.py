@@ -67,6 +67,7 @@ class ConfigTests(unittest.TestCase):
             {"agents": {"codex-": {}}},
             {"agents": {"codex_sol": {}}},
             {"agents": {"Codex-Sol": {}}},
+            {"agents": {"codex\n": {}}},  # $ would match before the newline
             {"agents": {"codex-sol": "gpt-6.1-sol"}},
             {"agents": {"codex-sol": {"tools": "Bash"}}},
             {"agents": {"claude-sonnet": {"mode": "inline"}}},

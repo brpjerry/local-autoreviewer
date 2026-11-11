@@ -138,6 +138,10 @@ def main():
     repo_cfg = cfg.repo(repo)
     if repo_cfg is None:
         sys.exit(f"tools/replay: {repo} is not in the config")
+    agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
+    unknown = [agent for agent in agents if agent not in cfg.agents]
+    if unknown:
+        sys.exit(f"tools/replay: unknown agent(s) {', '.join(unknown)}; configured: {', '.join(cfg.agents)}")
     mirror = Git("https://github.com", {}).mirror_path(live_state, repo)
     head = git("-C", str(mirror), "rev-parse", "--verify", f"{args.head}^{{commit}}")
     base = args.base_sha or f"refs/autoreview/pr/{number}/base"
@@ -173,10 +177,6 @@ def main():
         secrets=lambda: [token, *leakscan.collect_secrets(auth_files(live_state))])
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
-    agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
-    unknown = [agent for agent in agents if agent not in cfg.agents]
-    if unknown:
-        sys.exit(f"tools/replay: unknown agent(s) {', '.join(unknown)}; configured: {', '.join(cfg.agents)}")
     # A shared CODEX_HOME races the service's token refreshes (see above). The hold names the type, so it
     # holds every Codex reviewer.
     if any(config_mod.agent_type(agent) == "codex" for agent in agents):

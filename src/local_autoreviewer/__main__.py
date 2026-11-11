@@ -131,8 +131,8 @@ def cmd_review(args):
     cfg = load_config()
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
-    svc = build_services(cfg)
     agents = _agents_arg(cfg, args.agent) or list(repo_cfg.agents)
+    svc = build_services(cfg)
     locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
     owned = []  # job ids whose rows committed (a rolled-back id may be reused by another process)
     worst = 0

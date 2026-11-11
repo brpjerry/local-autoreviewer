@@ -1100,6 +1100,31 @@ def _resolve_after_post(conn, svc, job):
         log.exception("job %s: could not resolve the threads of fixed findings; they stay open", job["id"])
 
 
+def cancel_unconfigured(svc):
+    """Cancel the queued reviews of agents no longer in the config, such as a further reviewer whose table
+    was removed. The worker never claims them, and while they're queued, their commit's other reviews wait
+    out combine_wait and its fixed findings' threads aren't resolved. Foreground jobs are left to their
+    `review`, and running, waiting or posting ones finish as they are."""
+    conn = svc.connect()
+    try:
+        marks = ",".join("?" * len(svc.config.agents))
+        rows = conn.execute("SELECT id, agent FROM jobs WHERE status='queued' AND source!=?"
+                            f" AND agent NOT IN ({marks})", (db.FOREGROUND, *svc.config.agents)).fetchall()
+        for row in rows:
+            reason = f"agent {row['agent']} is no longer configured"
+            with db.transaction(conn):  # only if still queued: a poll may have superseded it meanwhile
+                cancelled = conn.execute(
+                    "UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status='queued'",
+                    (reason, svc.now(), row["id"])).rowcount
+                if cancelled:
+                    _settle_round(conn, svc, row["id"], "cancelled", reason, {})
+            if cancelled:
+                log.info("job %s -> cancelled: %s", row["id"], reason)
+                _unblock_resolution(conn, svc, row["id"])
+    finally:
+        conn.close()
+
+
 def _unblock_resolution(conn, svc, job_id):
     """A review that ended without posting no longer holds back resolve_fixed_threads, which waits while a
     review of the commit is active: let a posted follow-up of that commit sweep now. Never raises: it runs in
