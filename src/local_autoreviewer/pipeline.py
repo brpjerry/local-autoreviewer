@@ -19,7 +19,7 @@ from string import Template
 from . import combine, db, events, feedback, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
-from .config import AGENTS
+from .config import AGENTS, agent_type
 from .github import GitHubError
 from .gitops import GitError, ShaMismatch
 
@@ -515,6 +515,8 @@ def _run(conn, svc, job, cancel):
     repo_cfg = cfg.repo(job["repo"])
     if repo_cfg is None:
         raise Outcome("cancelled", "repo is no longer configured")
+    if job["agent"] not in cfg.agents:  # a further reviewer, such as codex-sol, removed from the config
+        raise Outcome("cancelled", f"agent {job['agent']} is no longer configured")
     agent = make_agent(cfg.agents[job["agent"]], svc.state)
     paths = job_paths(svc.state, job["id"])
     for directory in (paths.root, paths.out):
@@ -683,8 +685,11 @@ def due(conn, svc, job):
 
 
 def _display_order(rows):
-    return sorted(rows, key=lambda row: (AGENTS.index(row["agent"]) if row["agent"] in AGENTS else len(AGENTS),
-                                         row["id"]))
+    """Claude's reviews first, then Codex's; a type's own reviewer before its further ones (codex, codex-sol)."""
+    def key(row):
+        kind = agent_type(row["agent"])
+        return AGENTS.index(kind) if kind in AGENTS else len(AGENTS), row["agent"], row["id"]
+    return sorted(rows, key=key)
 
 
 def _wait(conn, svc, job, pending):

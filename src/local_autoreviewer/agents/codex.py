@@ -43,6 +43,9 @@ def _latest_comments(text, limit):
 
 class CodexAgent:
     name = "codex"
+    # The reviewers of this type share one login (CODEX_HOME below), and two Codex processes refreshing
+    # its token at once can race. So the worker runs one Codex review at a time (see Worker.claim).
+    one_at_a_time = True
 
     def __init__(self, cfg, state_dir):
         self.cfg = cfg

@@ -44,6 +44,42 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(config.ConfigError):
                 config.parse(data)
 
+    def test_further_reviewers(self):
+        cfg = config.parse({
+            "defaults": {"agents": ["codex", "codex-sol", "claude-sonnet"]},
+            "agents": {"codex": {"model": "gpt-6-astra"},
+                       "codex-sol": {"model": "gpt-6.1-sol", "effort": "xhigh", "mode": "inline"},
+                       "claude-sonnet": {"model": "sonnet"}},
+            "repo": [{"name": "a/b"}, {"name": "a/c", "agents": ["claude"]}],
+        })
+        self.assertEqual(list(cfg.agents), ["claude", "codex", "codex-sol", "claude-sonnet"])
+        sol = cfg.agents["codex-sol"]
+        self.assertEqual((sol.type, sol.command, sol.model, sol.effort, sol.mode),
+                         ("codex", "codex", "gpt-6.1-sol", "xhigh", "inline"))
+        sonnet = cfg.agents["claude-sonnet"]
+        self.assertEqual((sonnet.type, sonnet.command, sonnet.model), ("claude", "claude", "sonnet"))
+        self.assertEqual(cfg.repo("a/b").agents, ("codex", "codex-sol", "claude-sonnet"))
+        self.assertEqual(cfg.repo("a/c").agents, ("claude",))
+
+    def test_further_reviewer_errors(self):
+        bad = [
+            {"agents": {"gemini-pro": {}}},
+            {"agents": {"codex-": {}}},
+            {"agents": {"codex_sol": {}}},
+            {"agents": {"Codex-Sol": {}}},
+            {"agents": {"codex-sol": "gpt-6.1-sol"}},
+            {"agents": {"codex-sol": {"tools": "Bash"}}},
+            {"agents": {"claude-sonnet": {"mode": "inline"}}},
+            {"defaults": {"agents": ["codex-sol"]}},  # never defined
+            {"repo": [{"name": "a/b", "agents": ["claude-haiku"]}]},
+            {"agents": {"codex-sol": {}}, "defaults": {"agents": ["codex-sol", "codex-sol"]}},
+        ]
+        for data in bad:
+            with self.subTest(data=data), self.assertRaises(config.ConfigError):
+                config.parse(data)
+        with self.assertRaisesRegex(config.ConfigError, r"add an \[agents\.codex-sol\] table"):
+            config.parse({"defaults": {"agents": ["codex-sol"]}})
+
     def test_durations(self):
         self.assertEqual(config.parse_duration("90s", "k"), 90)
         self.assertEqual(config.parse_duration("2h", "k"), 7200)

@@ -17,6 +17,12 @@ SEVERITIES = ("blocker", "major", "minor")  # what a reviewer reports; a modifie
 LIKELIHOODS = ("common", "occasional", "rare")
 READABILITY = ("better", "same", "worse")
 AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def agent_label(agent):
+    """An agent's display name: "Codex" for codex, "Codex sol" for a further reviewer named codex-sol."""
+    kind, _, rest = agent.partition("-")
+    return f"{AGENT_NAMES.get(kind, kind)} {rest}" if rest else AGENT_NAMES.get(kind, kind)
 _MENTION_RE = re.compile(r"(?<![\w`/.@])@(?=[A-Za-z0-9][A-Za-z0-9-]*)")
 _HTML_COMMENT_RE = re.compile(r"<!--|-->")
 _IMAGE_RE = re.compile(r"!\[")
@@ -328,7 +334,7 @@ def _alternatives(item):
 
 def reviewer_names(agents):
     """Reviewers' display names: "Claude Code", "Claude Code and Codex"."""
-    names = [AGENT_NAMES.get(agent, agent) for agent in dict.fromkeys(agents)]
+    names = [agent_label(agent) for agent in dict.fromkeys(agents)]
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
@@ -481,7 +487,7 @@ def _by(item, attribute):
 def _heading(kind, members):
     def reviewer(member):
         model = f" ({clean(member['model'], 80)})" if member["model"] else ""
-        return AGENT_NAMES.get(member["agent"], member["agent"]) + model
+        return agent_label(member["agent"]) + model
     return f"### {kind} · {' and '.join(reviewer(m) for m in members)}"
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Long-running worker: claims queued jobs, runs at most one per agent, honours cancels."""
+"""Long-running worker: claims queued jobs, runs at most one per agent (one per Codex login), honours cancels."""
 
 import fcntl
 import json
@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db, paths, pipeline
+from .agents import ADAPTERS
+from .config import agent_type
 
 log = logging.getLogger(__name__)
 TICK = 2.0
@@ -21,8 +23,9 @@ STATUS_EVERY = 10.0
 def held_agents(state):
     """Agents the worker must not start new reviews for: the union of live holds. A hold is a file in
     state/holds that its owner keeps locked (tools/live while it deploys, tools/replay while it runs
-    Codex); its content names the agents, or is "all" (also if empty). A file whose owner has exited is
-    no longer locked and doesn't count. Owners remove their own files.
+    Codex); its content names the agents, or is "all" (also if empty). A type's name holds all its
+    reviewers: "codex" holds codex-sol too. A file whose owner has exited is no longer locked and doesn't
+    count. Owners remove their own files.
 
     The worker checks holds inside the write transaction that claims a queued review, and an owner
     waiting for the worker to go idle counts running jobs inside a write transaction of its own, after
@@ -223,32 +226,51 @@ class Worker:
         for row in rows:
             self.threads[row["id"]][1].cancel(row["reason"] or "cancelled")
 
-    def claim(self, svc):
+    def claim_groups(self, svc):
+        """The agents that may start a review now, in groups that each start at most one: an agent on its
+        own, or all the free reviewers of a type whose reviews run one at a time (Codex: one login)."""
         busy = {agent for (_t, _c, agent) in self.threads.values()}
-        free = [agent for agent in svc.config.agents if agent not in busy]
-        if not free:
+        serial_busy = {agent_type(agent) for agent in busy if ADAPTERS[agent_type(agent)].one_at_a_time}
+        groups = {}
+        for agent in svc.config.agents:
+            kind = agent_type(agent)
+            if agent in busy or kind in serial_busy:
+                continue
+            groups.setdefault(kind if ADAPTERS[kind].one_at_a_time else agent, []).append(agent)
+        return list(groups.values())
+
+    def _capped(self, conn, svc, agent, day):
+        if db.started_since(conn, agent, day) < svc.config.service.max_reviews_per_day:
+            return False
+        if (agent, day) not in self.cap_logged:
+            log.warning("%s: daily cap of %d reviews reached; waiting until tomorrow",
+                        agent, svc.config.service.max_reviews_per_day)
+            self.cap_logged.add((agent, day))
+        return True
+
+    def claim(self, svc):
+        groups = self.claim_groups(svc)
+        if not groups:
             return
         now = svc.now()
         day = start_of_local_day(now)
         conn = svc.connect()
         try:
-            for agent in free:
+            for group in groups:
                 with db.transaction(conn):
                     held = held_agents(svc.state)  # under the write lock: see held_agents
-                    if agent in held or "all" in held:
+                    ready = [agent for agent in group if not {agent, agent_type(agent), "all"} & held
+                             and not self._capped(conn, svc, agent, day)]
+                    if not ready:
                         continue
-                    started = db.started_since(conn, agent, day)
-                    if started >= svc.config.service.max_reviews_per_day:
-                        if (agent, day) not in self.cap_logged:
-                            log.warning("%s: daily cap of %d reviews reached; waiting until tomorrow",
-                                        agent, svc.config.service.max_reviews_per_day)
-                            self.cap_logged.add((agent, day))
-                        continue
+                    # The group's oldest due review, so one reviewer's backlog doesn't hold up another's.
                     job = conn.execute(
-                        "SELECT * FROM jobs WHERE status='queued' AND agent=? AND not_before<=? AND source!=? "
-                        "ORDER BY not_before, id LIMIT 1", (agent, now, db.FOREGROUND)).fetchone()
+                        f"SELECT * FROM jobs WHERE status='queued' AND agent IN ({','.join('?' * len(ready))})"
+                        " AND not_before<=? AND source!=? ORDER BY not_before, id LIMIT 1",
+                        (*ready, now, db.FOREGROUND)).fetchone()
                     if job is None:
                         continue
+                    agent = job["agent"]
                     db.update_job(conn, job["id"], status="running", started_at=now, cancel_requested=0)
                 token = pipeline.CancelToken()
                 thread = threading.Thread(target=self._run_job, args=(svc, job["id"], token),

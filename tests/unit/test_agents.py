@@ -59,6 +59,27 @@ class ArgvTests(unittest.TestCase):
         self.assertNotIn("danger-full-access", " ".join(argv))
         self.assertEqual(argv[-1], "-")
 
+    def test_further_reviewers_run_their_types_locked_flags(self):
+        cfg = config.parse({"agents": {"codex-sol": {"model": "gpt-6.1-sol", "effort": "xhigh"},
+                                       "claude-sonnet": {"model": "sonnet"}}})
+        claude, codex = agents()
+        sol = make_agent(cfg.agents["codex-sol"], STATE)
+        sonnet = make_agent(cfg.agents["claude-sonnet"], STATE)
+        self.assertIs(type(sol), type(codex))
+        self.assertIs(type(sonnet), type(claude))
+        self.assertEqual(sol.home, codex.home)  # every Codex reviewer uses the reviews' one login
+        self.assertEqual(sol._locked_flags(), codex._locked_flags())
+        self.assertEqual(sonnet._locked_flags(PATHS), claude._locked_flags(PATHS))
+        argv = sol.invocation(unit="u", paths=PATHS, prompt="p", session_id=None).argv
+        self.assertEqual(argv[:2], ["codex", "exec"])
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-6.1-sol")
+        self.assertIn('model_reasoning_effort="xhigh"', argv)
+        argv = sonnet.invocation(unit="u", paths=PATHS, prompt="p", session_id="sid").argv
+        self.assertEqual(argv[0], "claude")
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
+        self.assertTrue(codex.one_at_a_time)
+        self.assertFalse(claude.one_at_a_time)
+
     def test_codex_inline_mode_disables_shell(self):
         _, codex = agents(mode="inline")
         argv = codex._locked_flags()

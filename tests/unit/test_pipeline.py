@@ -1132,6 +1132,29 @@ class WorkerTests(EnvTestCase):
         self.addCleanup(conn.close)
         self.assertEqual([r["status"] for r in conn.execute("SELECT status FROM jobs")], ["queued"])
 
+    def test_codex_reviewers_take_turns(self):
+        """They share one login: one Codex review runs at a time, the oldest due first. Claude's run together."""
+        further = {"codex-sol": {"model": "gpt-6.1-sol"}, "claude-sonnet": {"model": "sonnet"}}
+        svc = self.services(make_config(self.tmp, agents=("claude", "claude-sonnet", "codex-sol", "codex"),
+                                        further=further))
+        self.enqueue(svc)
+        worker = Worker(lambda c: svc, None)
+        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
+        hold = self.hold("replay-1", "codex\n")  # a type's hold holds all its reviewers
+        worker.claim(svc)
+        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()), ["claude", "claude-sonnet"])
+        hold.close()
+        worker.claim(svc)  # the repo lists codex-sol first, so its job is the older of the two
+        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
+                         ["claude", "claude-sonnet", "codex-sol"])
+        worker.claim(svc)  # codex waits while codex-sol runs, even with its review not yet started
+        self.assertEqual(len(worker.threads), 3)
+        for thread, _token, _agent in worker.threads.values():
+            thread.join(30)
+        worker.reap()
+        worker.claim(svc)
+        self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+
     def test_worker_reviews_with_both_agents(self):
         worker, thread, svc = self.start(self.cfg)
         try:

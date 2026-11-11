@@ -8,4 +8,5 @@ ADAPTERS = {"claude": ClaudeAgent, "codex": CodexAgent}
 
 
 def make_agent(cfg, state_dir):
-    return ADAPTERS[cfg.name](cfg, state_dir)
+    """The adapter for an agent's type: every reviewer of a type gets that type's locked flags."""
+    return ADAPTERS[cfg.type](cfg, state_dir)

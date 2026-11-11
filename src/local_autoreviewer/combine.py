@@ -38,7 +38,7 @@ def worth_checking(members):
 
 
 def _shown(member, key, item):
-    reviewer = review.AGENT_NAMES.get(member["agent"], member["agent"])
+    reviewer = review.agent_label(member["agent"])
     if key in ("test_gaps", "questions"):
         return {"reviewer": reviewer, "kind": key[:-1], "text": item}
     if key == "nits":
