@@ -1132,6 +1132,56 @@ class WorkerTests(EnvTestCase):
         self.addCleanup(conn.close)
         self.assertEqual([r["status"] for r in conn.execute("SELECT status FROM jobs")], ["queued"])
 
+    def test_codex_reviewers_take_turns(self):
+        """They share one login: one Codex review runs at a time, the oldest due first. Claude's run together."""
+        further = {"codex-sol": {"model": "gpt-6.1-sol"}, "claude-sonnet": {"model": "sonnet"}}
+        svc = self.services(make_config(self.tmp, agents=("claude", "claude-sonnet", "codex-sol", "codex"),
+                                        further=further))
+        self.enqueue(svc)
+        worker = Worker(lambda c: svc, None)
+        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
+        hold = self.hold("replay-1", "codex\n")  # a type's hold holds all its reviewers
+        worker.claim(svc)
+        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()), ["claude", "claude-sonnet"])
+        hold.close()
+        worker.claim(svc)  # the repo lists codex-sol first, so its job is the older of the two
+        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
+                         ["claude", "claude-sonnet", "codex-sol"])
+        worker.claim(svc)  # codex waits while codex-sol runs, even with its review not yet started
+        self.assertEqual(len(worker.threads), 3)
+        for thread, _token, _agent in worker.threads.values():
+            thread.join(30)
+        worker.reap()
+        worker.claim(svc)
+        self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+
+    def test_one_held_codex_reviewer_leaves_the_others_free(self):
+        svc = self.services(make_config(self.tmp, agents=("codex-sol", "codex"),
+                                        further={"codex-sol": {"model": "gpt-6.1-sol"}}))
+        self.enqueue(svc)  # codex-sol's job is the older
+        worker = Worker(lambda c: svc, None)
+        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
+        hold = self.hold("replay-1", "codex-sol\n")
+        worker.claim(svc)
+        hold.close()
+        self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+
+    def test_a_removed_reviewers_queued_reviews_are_cancelled(self):
+        """Even while paused: left queued, they would hold up their commits' other reviews."""
+        further = {"codex-sol": {"model": "gpt-6.1-sol"}}
+        codex, sol = self.enqueue(self.services(make_config(self.tmp, agents=("codex", "codex-sol"),
+                                                            further=further)))
+        # codex-sol's table and listing are removed.
+        worker, thread, svc = self.start(make_config(self.tmp, agents=("codex",), service={"paused": True}))
+        try:
+            jobs = self.wait_for(svc, lambda js: any(j["status"] == "cancelled" for j in js))
+        finally:
+            worker.stop.set()
+            thread.join(30)
+        jobs = {j["id"]: (j["status"], j["reason"]) for j in jobs}
+        self.assertEqual(jobs[sol], ("cancelled", "agent codex-sol is no longer configured"))
+        self.assertEqual(jobs[codex][0], "queued")
+
     def test_worker_reviews_with_both_agents(self):
         worker, thread, svc = self.start(self.cfg)
         try:

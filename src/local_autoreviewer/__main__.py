@@ -119,12 +119,20 @@ def _repo_cfg(cfg, repo):
     return repo_cfg
 
 
+def _agents_arg(cfg, agents):
+    """The --agent values, checked against the configured agents (claude, codex and any further reviewers)."""
+    for agent in agents or ():
+        if agent not in cfg.agents:
+            raise CliError(f"unknown agent {agent!r}; configured: {', '.join(cfg.agents)}")
+    return list(dict.fromkeys(agents)) if agents else None
+
+
 def cmd_review(args):
     cfg = load_config()
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
+    agents = _agents_arg(cfg, args.agent) or list(repo_cfg.agents)
     svc = build_services(cfg)
-    agents = args.agent or list(repo_cfg.agents)
     locks = {}  # job_id -> held lock file; while it is held the worker leaves the job alone
     owned = []  # job ids whose rows committed (a rolled-back id may be reused by another process)
     worst = 0
@@ -195,6 +203,7 @@ def cmd_enqueue(args):
     cfg = load_config()
     repo, number = parse_ref(args.ref)
     repo_cfg = _repo_cfg(cfg, repo)
+    agents = _agents_arg(cfg, args.agent)
     svc = build_services(cfg)
     # Like a poll, fetch and ingest under the poll lock: a poll applying an older snapshot
     # after this commits would otherwise supersede the newer job queued here.
@@ -205,7 +214,7 @@ def cmd_enqueue(args):
         event = events.PrEvent(repo=repo_cfg.name, number=number, action="opened", head_sha=pr["headRefOid"],
                                base_ref=pr["baseRefName"], is_draft=pr["isDraft"],
                                author=(pr.get("author") or {}).get("login", ""), source="manual",
-                               force=args.force, agents=tuple(args.agent) if args.agent else None)
+                               force=args.force, agents=tuple(agents) if agents else None)
         conn = svc.connect()
         try:
             with db.transaction(conn):
@@ -385,6 +394,9 @@ def _job_and_agent(job_id):
         raise CliError(f"no job {job_id}")
     if not job["session_id"]:
         raise CliError(f"job {job_id} has no agent session (status {job['status']})")
+    if job["agent"] not in cfg.agents:
+        raise CliError(f"job {job_id}'s agent {job['agent']} is no longer configured; add [agents.{job['agent']}] "
+                       "back to use its session")
     return cfg, state, job, make_agent(cfg.agents[job["agent"]], state)
 
 
@@ -499,6 +511,8 @@ def cmd_doctor(args):
             report(False, f"{name}: command {agent_cfg.command!r} not found")
             continue
         ok, message = make_agent(agent_cfg, state).doctor()
+        if name != agent_cfg.type:  # a further reviewer: its login is its type's, so name the model it runs
+            message = f"{name} ({agent_cfg.model or 'default model'}): {message}"
         report(ok, message)
     try:
         proc = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True,
@@ -533,13 +547,15 @@ def build_parser():
 
     p = sub.add_parser("review", help="review one PR now, in the foreground")
     p.add_argument("ref", help="owner/repo#N or PR URL")
-    p.add_argument("--agent", action="append", choices=config_mod.AGENTS)
+    p.add_argument("--agent", action="append",
+                   help="agent to run, such as claude, codex or codex-sol; repeatable (default: the repo's)")
     p.add_argument("--post", action="store_true", help="post the review (default: save it locally only)")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("enqueue", help="queue a review for the worker (any author)")
     p.add_argument("ref")
-    p.add_argument("--agent", action="append", choices=config_mod.AGENTS)
+    p.add_argument("--agent", action="append",
+                   help="agent to run, such as claude, codex or codex-sol; repeatable (default: the repo's)")
     p.add_argument("--force", action="store_true", help="review again even if this head was reviewed")
     p.set_defaults(func=cmd_enqueue)
 

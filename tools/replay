@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Replay a review of an earlier commit of a PR, optionally with other prompts, to compare prompt changes.
 
-  tools/replay owner/repo#N COMMIT [--base-sha SHA] [--agent claude|codex] [--prompts DIR] [--json]
+  tools/replay owner/repo#N COMMIT [--base-sha SHA] [--agent AGENT] [--prompts DIR] [--json]
                [--live-description]
 
 COMMIT and the base commit must still be in the service's mirror of the repository. It keeps open PRs' current
@@ -17,8 +17,9 @@ title and description are taken from the service's first review of COMMIT that k
 pr.json), unless --live-description is given; the replay says which it used.
 
 Codex runs with the reviews' own login (the live CODEX_HOME), and a plain run includes it when the repo's
-config does. So a replay that includes Codex refuses to start while the service is running a Codex review,
-and holds off the service's Codex reviews until it exits (pass --agent claude to leave them alone).
+config does. So a replay that includes a Codex reviewer (codex, codex-sol, ...) refuses to start while the
+service is running one, and holds off the service's Codex reviews until it exits (pass --agent claude to
+leave them alone).
 """
 
 import argparse
@@ -118,8 +119,9 @@ def main():
     parser.add_argument("ref", help="owner/repo#N")
     parser.add_argument("head", help="the PR commit to review")
     parser.add_argument("--base-sha", help="the base commit (default: the one the service last fetched)")
-    parser.add_argument("--agent", action="append", choices=config_mod.AGENTS,
-                        help="agent to run; repeatable (default: the repo's configured agents)")
+    parser.add_argument("--agent", action="append",
+                        help="agent to run, such as claude, codex or codex-sol; repeatable "
+                             "(default: the repo's configured agents)")
     parser.add_argument("--prompts", type=Path, help="directory with review.md and review.schema.json")
     parser.add_argument("--json", action="store_true", help="print the structured reviews")
     parser.add_argument("--live-description", action="store_true",
@@ -136,6 +138,10 @@ def main():
     repo_cfg = cfg.repo(repo)
     if repo_cfg is None:
         sys.exit(f"tools/replay: {repo} is not in the config")
+    agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
+    unknown = [agent for agent in agents if agent not in cfg.agents]
+    if unknown:
+        sys.exit(f"tools/replay: unknown agent(s) {', '.join(unknown)}; configured: {', '.join(cfg.agents)}")
     mirror = Git("https://github.com", {}).mirror_path(live_state, repo)
     head = git("-C", str(mirror), "rev-parse", "--verify", f"{args.head}^{{commit}}")
     base = args.base_sha or f"refs/autoreview/pr/{number}/base"
@@ -171,15 +177,17 @@ def main():
         secrets=lambda: [token, *leakscan.collect_secrets(auth_files(live_state))])
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
-    agents = list(dict.fromkeys(args.agent or repo_cfg.agents))  # a repeat would hit the jobs' UNIQUE key
-    if "codex" in agents:  # a shared CODEX_HOME races the service's token refreshes (see above)
+    # A shared CODEX_HOME races the service's token refreshes (see above). The hold names the type, so it
+    # holds every Codex reviewer.
+    if any(config_mod.agent_type(agent) == "codex" for agent in agents):
         hold = hold_codex(live_state)  # first, so the worker can't start one after the check below  # noqa: F841
         try:
             live = sqlite3.connect(f"{(live_state / 'state.sqlite3').resolve().as_uri()}?mode=rw", uri=True,
                                    timeout=30, isolation_level=None)
             try:  # in a write transaction, changing no rows: a claim begun before the hold is counted
                 live.execute("BEGIN IMMEDIATE")
-                busy = live.execute("SELECT COUNT(*) FROM jobs WHERE agent='codex' AND status='running'").fetchone()[0]
+                busy = live.execute("SELECT COUNT(*) FROM jobs WHERE (agent='codex' OR agent LIKE 'codex-%')"
+                                    " AND status='running'").fetchone()[0]
                 live.execute("ROLLBACK")
             finally:
                 live.close()

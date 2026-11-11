@@ -13,6 +13,7 @@ worker → fetch PR head → checkout (agent files removed) → claude -p / code
 For each update to one of your open PRs on a configured repo, every enabled agent reviews it (Claude Code and Codex by default), and the reviews are posted together as one.
 - **Format:** a `COMMENT` review pinned to the reviewed commit.
 - **One post:** a finished review waits for the other agent's review of the same commit: for as long as that one runs, and for up to `combine_wait` (30 minutes) while it waits its turn. The agent that finishes last then checks both reviews for duplicates: an issue both reported appears once, credited to both, and every item says which reviewer found it. Where the other reviewer proposed a different fix for it, that fix is shown under it too, in the review body only, so two one-click suggestions never compete for the same lines. A proposed change that isn't also a one-click suggestion is shown up to 400 lines; one that is may be shortened to 80 in the body. A review too long for GitHub shortens every change to 80 lines first, then leaves out its nits, and only then is cut, before the first finding, heading or list item that doesn't fit. A review is posted on its own when the other one failed or comes later than that, and with `combine_wait = "0s"`. If the duplicate check fails, both reviews are posted in full, with a note.
+- **More reviewers:** besides `claude` and `codex`, you can add any number of reviewers of either type, each with its own model and effort. Add an `[agents.codex-sol]` table with `model = "gpt-6.1-sol"`, then list `"codex-sol"` in `agents`. The part of the name before the first dash is the reviewer's type, and the type alone picks the CLI and its locked flags. All the reviews of a commit are posted as one, and each is named in it ("Codex sol"). Codex reviewers share the review login, so they run one at a time, oldest review first. Claude reviewers run side by side. Each reviewer has its own daily cap.
 - **Trivial PRs:** a reviewer may judge a PR trivial (it only changes strings, comments or docs, bumps a version or renames something) and end the review early, after checking the change itself. The review says so.
 - **Coverage:** correctness, security, design, performance, missing tests and readability. Findings are ranked Blocker / Major / Minor, and nits are collapsed.
 - **Fixes:** each finding comes with the exact proposed change. Each finding or nit with a change within the PR's diff gets one inline comment, so one thread to reply in: that first change is a GitHub suggested change, which you apply with **Commit suggestion**, and the rest of its fix is shown in the same comment as diffs (a suggestion can only replace its own comment's lines). The review body shows every change as a diff too. Each change carries the text it replaces, so one whose line numbers are a little off is moved to where that text is, and one whose text isn't in the file is left out rather than applied to the wrong lines.
@@ -86,7 +87,7 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | Command | What it does |
 | --- | --- |
 | `local-autoreviewer status` | Recent jobs, their state and review links (`--json` for scripts) |
-| `local-autoreviewer enqueue owner/repo#N [--agent codex] [--force]` | Queue a review; with `--force`, review the same commit again |
+| `local-autoreviewer enqueue owner/repo#N [--agent codex-sol] [--force]` | Queue a review; with `--force`, review the same commit again |
 | `local-autoreviewer review owner/repo#N [--post]` | Review now, in the foreground (see below) |
 | `local-autoreviewer resume <job>` | Continue the review's agent session interactively, in its checkout |
 | `local-autoreviewer ask <job> "why is X a problem?"` | Send one follow-up question to the review session |
@@ -193,7 +194,7 @@ The live worktree is separate from the checkout you edit, so work in progress ne
 To see how a prompt change would have reviewed an earlier commit, replay it. Git data comes from the service's local mirror, the review runs in a scratch state directory and posts nothing, and only the PR's metadata is read from GitHub (the agents still use their normal online connections). The title and description are the ones the service reviewed that commit with, where it kept them, because a description updated later can describe the fixes the review prompted; `--live-description` uses the current ones:
 
 ```sh
-tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent claude|codex] [--prompts <dir with review.md and review.schema.json>] [--json] [--live-description]
+tools/replay owner/repo#N <commit> [--base-sha SHA] [--agent AGENT] [--prompts <dir with review.md and review.schema.json>] [--json] [--live-description]
 ```
 
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).

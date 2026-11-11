@@ -13,7 +13,10 @@ from pathlib import Path
 
 from .suggestions import DEFAULT_TEST_PATHS
 
-AGENTS = ("claude", "codex")
+AGENTS = ("claude", "codex")  # the agent types: each has a fixed adapter in agents/
+# An agent is one of the types, or a further reviewer of a type named "<type>-<name>" (e.g. "codex-sol"),
+# with its own model and effort. Its type alone picks the adapter, so the locked flags still apply.
+_AGENT_NAME_RE = re.compile(r"(claude|codex)(-[a-z0-9]+)*")  # fullmatch
 TOKEN_OWNER = "@token-owner"
 _REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$")
@@ -23,6 +26,11 @@ _MEMORY_RE = re.compile(r"^\d+[KMG]$")
 
 class ConfigError(ValueError):
     pass
+
+
+def agent_type(name):
+    """The type of an agent, by its name: "codex" for "codex" and "codex-sol"."""
+    return name.split("-", 1)[0]
 
 
 def parse_duration(value, key):
@@ -43,6 +51,10 @@ class AgentConfig:
     memory_max: str = "3G"
     tasks_max: int = 512
     mode: str = "shell"  # codex only: "shell" | "inline"
+
+    @property
+    def type(self):
+        return agent_type(self.name)
 
 
 @dataclass(frozen=True)
@@ -127,14 +139,15 @@ def _str_list(value, key):
     return tuple(value)
 
 
-def _repo_settings(table, base, where):
+def _repo_settings(table, base, where, agents_defined):
     _check_keys(table, _REPO_KEYS, where)
     merged = dict(base)
     merged.update(table)
     agents = _str_list(merged["agents"], f"{where}.agents")
     for agent in agents:
-        if agent not in AGENTS:
-            raise ConfigError(f"{where}.agents: unknown agent {agent!r}")
+        if agent not in agents_defined:
+            hint = f" (add an [agents.{agent}] table)" if _AGENT_NAME_RE.fullmatch(agent) else ""
+            raise ConfigError(f"{where}.agents: unknown agent {agent!r}{hint}")
     if len(set(agents)) != len(agents):
         raise ConfigError(f"{where}.agents: duplicate agent")
     authors = tuple(a.lower() for a in _str_list(merged["authors"], f"{where}.authors"))
@@ -154,7 +167,7 @@ def _repo_settings(table, base, where):
 def _agent(name, table):
     where = f"agents.{name}"
     _check_keys(table, _AGENT_KEYS, where)
-    values = {"command": name}
+    values = {"command": agent_type(name)}
     values.update(table)
     for key in ("command", "model", "effort", "memory_max", "mode"):
         if key in values:
@@ -165,7 +178,7 @@ def _agent(name, table):
         raise ConfigError(f"{where}.memory_max: expected e.g. '3G' or '512M'")
     if values.get("mode", "shell") not in ("shell", "inline"):
         raise ConfigError(f"{where}.mode: expected 'shell' or 'inline'")
-    if name != "codex" and values.get("mode", "shell") != "shell":
+    if agent_type(name) != "codex" and values.get("mode", "shell") != "shell":
         raise ConfigError(f"{where}.mode: only codex supports 'inline'")
     return AgentConfig(name=name, **values)
 
@@ -188,11 +201,20 @@ def parse(data, path=None):
         raise ConfigError("service.bootstrap: expected 'baseline' or 'review'")
 
     agents_table = data.get("agents", {})
-    _check_keys(agents_table, set(AGENTS), "agents")
-    agents = {name: _agent(name, agents_table.get(name, {})) for name in AGENTS}
+    if not isinstance(agents_table, dict):
+        raise ConfigError("agents: use [agents.<name>] tables")
+    for name in agents_table:
+        if not _AGENT_NAME_RE.fullmatch(name):
+            raise ConfigError(f"agents: unknown agent {name!r}: expected claude, codex, or a further reviewer "
+                              "named claude-<name> or codex-<name>")
+        if not isinstance(agents_table[name], dict):
+            raise ConfigError(f"agents.{name}: expected a table")
+    # claude and codex always exist; further reviewers follow in the order the config lists them.
+    agents = {name: _agent(name, agents_table.get(name, {}))
+              for name in dict.fromkeys([*AGENTS, *agents_table])}
 
     # Validate [defaults] on its own so errors there are reported even with no repos.
-    _repo_settings(data.get("defaults", {}), _DEFAULTS, "defaults")
+    _repo_settings(data.get("defaults", {}), _DEFAULTS, "defaults", agents)
     base = {**_DEFAULTS, **data.get("defaults", {})}
     repos = {}
     repo_tables = data.get("repo", [])
@@ -207,7 +229,7 @@ def parse(data, path=None):
             raise ConfigError(f"{where}.name: expected 'owner/repo', got {name!r}")
         if name.lower() in repos:
             raise ConfigError(f"{where}.name: duplicate repo {name}")
-        settings = _repo_settings({k: v for k, v in table.items() if k != "name"}, base, where)
+        settings = _repo_settings({k: v for k, v in table.items() if k != "name"}, base, where, agents)
         repos[name.lower()] = RepoConfig(name=name, **settings)
     return Config(service=service, agents=agents, repos=repos, path=path)
 

@@ -70,6 +70,23 @@ class RoundTests(EnvTestCase):
     def checks(self, agent):
         return [call for call in self.agent_log(agent) if "Your only job is to find the duplicates" in call["prompt"]]
 
+    def test_two_reviewers_of_one_type_are_posted_as_one(self):
+        cfg = make_config(self.tmp, agents=("codex", "codex-sol"), further={"codex-sol": {"model": "gpt-6.1-sol"}})
+        svc, (sol, codex) = self.queue(cfg, agents=("codex-sol", "codex"))  # sol's job first: shown second anyway
+        self.assertEqual(self.run_job(svc, sol), "waiting")
+        self.assertIn("waiting to post it with Codex's review", self.job(svc, sol)["reason"])
+        self.assertEqual(self.run_job(svc, codex), "posted")
+
+        (posted,) = self.github.posted
+        body = posted["body"]
+        self.assertIn("### Automated review · Codex and Codex sol (gpt-6.1-sol)", body)
+        self.assertLess(body.index("**Codex:** Adds a divide helper"), body.index("**Codex sol:** Adds a divide helper"))
+        self.assertIn("_(Codex and Codex sol; correctness, impact 6/10, common)_", body)
+        for job_id, agent in ((sol, "codex-sol"), (codex, "codex")):
+            self.assertIn(review.marker(job_id, self.head, agent), body)
+        self.assertIn("· Codex and Codex sol</sub>", body)
+        self.assertEqual(self.job(svc, sol)["model"], "gpt-6.1-sol")
+
     def test_both_reviews_are_posted_as_one(self):
         svc, (claude, codex) = self.queue()
         self.assertEqual(self.run_job(svc, claude), "waiting")

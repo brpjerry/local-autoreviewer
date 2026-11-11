@@ -19,7 +19,7 @@ from string import Template
 from . import combine, db, events, feedback, leakscan, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
-from .config import AGENTS
+from .config import AGENTS, agent_type
 from .github import GitHubError
 from .gitops import GitError, ShaMismatch
 
@@ -515,6 +515,8 @@ def _run(conn, svc, job, cancel):
     repo_cfg = cfg.repo(job["repo"])
     if repo_cfg is None:
         raise Outcome("cancelled", "repo is no longer configured")
+    if job["agent"] not in cfg.agents:  # a further reviewer, such as codex-sol, removed from the config
+        raise Outcome("cancelled", f"agent {job['agent']} is no longer configured")
     agent = make_agent(cfg.agents[job["agent"]], svc.state)
     paths = job_paths(svc.state, job["id"])
     for directory in (paths.root, paths.out):
@@ -683,8 +685,11 @@ def due(conn, svc, job):
 
 
 def _display_order(rows):
-    return sorted(rows, key=lambda row: (AGENTS.index(row["agent"]) if row["agent"] in AGENTS else len(AGENTS),
-                                         row["id"]))
+    """Claude's reviews first, then Codex's; a type's own reviewer before its further ones (codex, codex-sol)."""
+    def key(row):
+        kind = agent_type(row["agent"])
+        return AGENTS.index(kind) if kind in AGENTS else len(AGENTS), row["agent"], row["id"]
+    return sorted(rows, key=key)
 
 
 def _wait(conn, svc, job, pending):
@@ -1093,6 +1098,31 @@ def _resolve_after_post(conn, svc, job):
                     "open", job["id"], exc)
     except Exception:
         log.exception("job %s: could not resolve the threads of fixed findings; they stay open", job["id"])
+
+
+def cancel_unconfigured(svc):
+    """Cancel the queued reviews of agents no longer in the config, such as a further reviewer whose table
+    was removed. The worker never claims them, and while they're queued, their commit's other reviews wait
+    out combine_wait and its fixed findings' threads aren't resolved. Foreground jobs are left to their
+    `review`, and running, waiting or posting ones finish as they are."""
+    conn = svc.connect()
+    try:
+        marks = ",".join("?" * len(svc.config.agents))
+        rows = conn.execute("SELECT id, agent FROM jobs WHERE status='queued' AND source!=?"
+                            f" AND agent NOT IN ({marks})", (db.FOREGROUND, *svc.config.agents)).fetchall()
+        for row in rows:
+            reason = f"agent {row['agent']} is no longer configured"
+            with db.transaction(conn):  # only if still queued: a poll may have superseded it meanwhile
+                cancelled = conn.execute(
+                    "UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status='queued'",
+                    (reason, svc.now(), row["id"])).rowcount
+                if cancelled:
+                    _settle_round(conn, svc, row["id"], "cancelled", reason, {})
+            if cancelled:
+                log.info("job %s -> cancelled: %s", row["id"], reason)
+                _unblock_resolution(conn, svc, row["id"])
+    finally:
+        conn.close()
 
 
 def _unblock_resolution(conn, svc, job_id):

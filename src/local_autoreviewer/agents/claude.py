@@ -23,6 +23,7 @@ QUIET_ENV = {
 
 class ClaudeAgent:
     name = "claude"
+    one_at_a_time = False  # Claude Code runs concurrent sessions on one login
 
     def __init__(self, cfg, state_dir):
         self.cfg = cfg
