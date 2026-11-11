@@ -1132,6 +1132,13 @@ class WorkerTests(EnvTestCase):
         self.addCleanup(conn.close)
         self.assertEqual([r["status"] for r in conn.execute("SELECT status FROM jobs")], ["queued"])
 
+    @staticmethod
+    def join_jobs(worker):
+        """Wait for the job threads a test's claims started. In the test itself, not in a cleanup: tearDown,
+        which deletes the state directory those jobs write to, runs before cleanups do."""
+        for thread, _token, _agent in list(worker.threads.values()):
+            thread.join(30)
+
     def test_codex_reviewers_take_turns(self):
         """They share one login: one Codex review runs at a time, the oldest due first. Claude's run together."""
         further = {"codex-sol": {"model": "gpt-6.1-sol"}, "claude-sonnet": {"model": "sonnet"}}
@@ -1139,32 +1146,35 @@ class WorkerTests(EnvTestCase):
                                         further=further))
         self.enqueue(svc)
         worker = Worker(lambda c: svc, None)
-        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
-        hold = self.hold("replay-1", "codex\n")  # a type's hold holds all its reviewers
-        worker.claim(svc)
-        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()), ["claude", "claude-sonnet"])
-        hold.close()
-        worker.claim(svc)  # the repo lists codex-sol first, so its job is the older of the two
-        self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
-                         ["claude", "claude-sonnet", "codex-sol"])
-        worker.claim(svc)  # codex waits while codex-sol runs, even with its review not yet started
-        self.assertEqual(len(worker.threads), 3)
-        for thread, _token, _agent in worker.threads.values():
-            thread.join(30)
-        worker.reap()
-        worker.claim(svc)
-        self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+        try:
+            hold = self.hold("replay-1", "codex\n")  # a type's hold holds all its reviewers
+            worker.claim(svc)
+            self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()), ["claude", "claude-sonnet"])
+            hold.close()
+            worker.claim(svc)  # the repo lists codex-sol first, so its job is the older of the two
+            self.assertEqual(sorted(agent for _t, _c, agent in worker.threads.values()),
+                             ["claude", "claude-sonnet", "codex-sol"])
+            worker.claim(svc)  # codex waits while codex-sol runs, even with its review not yet started
+            self.assertEqual(len(worker.threads), 3)
+            self.join_jobs(worker)
+            worker.reap()
+            worker.claim(svc)
+            self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+        finally:
+            self.join_jobs(worker)
 
     def test_one_held_codex_reviewer_leaves_the_others_free(self):
         svc = self.services(make_config(self.tmp, agents=("codex-sol", "codex"),
                                         further={"codex-sol": {"model": "gpt-6.1-sol"}}))
         self.enqueue(svc)  # codex-sol's job is the older
         worker = Worker(lambda c: svc, None)
-        self.addCleanup(lambda: [thread.join(30) for thread, _token, _agent in worker.threads.values()])
-        hold = self.hold("replay-1", "codex-sol\n")
-        worker.claim(svc)
-        hold.close()
-        self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+        try:
+            hold = self.hold("replay-1", "codex-sol\n")
+            worker.claim(svc)
+            hold.close()
+            self.assertEqual([agent for _t, _c, agent in worker.threads.values()], ["codex"])
+        finally:
+            self.join_jobs(worker)
 
     def test_a_removed_reviewers_queued_reviews_are_cancelled(self):
         """Even while paused: left queued, they would hold up their commits' other reviews."""
