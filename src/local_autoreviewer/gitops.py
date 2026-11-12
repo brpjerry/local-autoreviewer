@@ -10,8 +10,9 @@ from pathlib import Path
 
 # A PR's own agent configuration must never load: hooks, settings, MCP servers or
 # instructions. Matched case-insensitively against every path component.
-AGENT_FILES = {"claude.md", "claude.local.md", "agents.md", "agents.override.md", ".mcp.json"}
-AGENT_DIRS = {".claude", ".codex", ".agents"}
+AGENT_FILES = {"claude.md", "claude.local.md", "agents.md", "agents.override.md", ".mcp.json", "opencode.json",
+               "opencode.jsonc"}
+AGENT_DIRS = {".claude", ".codex", ".agents", ".opencode"}
 PROJECT_DOCS = ("CLAUDE.md", "AGENTS.md")
 
 HARDENING = [

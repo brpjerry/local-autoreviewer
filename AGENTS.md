@@ -1,13 +1,13 @@
 # local-autoreviewer — notes for contributors and coding agents
 
-`local-autoreviewer` reviews its operator's own GitHub PRs with local `claude -p` and `codex exec` sessions. It runs as systemd user units and ships as an Arch package. `README.md` describes the behaviour and the security model. `docs/agent-cli-notes.md` records verified facts about the agent CLIs that the code depends on.
+`local-autoreviewer` reviews its operator's own GitHub PRs with local `claude -p`, `codex exec` and `opencode run` sessions. It runs as systemd user units and ships as an Arch package. `README.md` describes the behaviour and the security model. `docs/agent-cli-notes.md` records verified facts about the agent CLIs that the code depends on.
 
 ## Rules
 
-- Use only the standard library at runtime, Python ≥ 3.11. The package depends only on `python`, `git`, `github-cli` and `systemd`. Discuss any new runtime dependency first.
+- Use only the standard library at runtime, Python ≥ 3.11. The package depends only on `python`, `git`, `github-cli` and `systemd`; the agent CLIs are optional dependencies. Discuss any new runtime dependency first.
 - Tests use stdlib `unittest`: `python3 -m unittest discover -s tests -t .` (`pytest` works too). They must stay offline and fast, because they also run in the package's `check()`. Use the fakes in `tests/helpers.py` and `tests/fakes/fake_agent.py`, never a real agent or the GitHub API. The real-CLI test in `tests/integration/` is opt-in.
 - Never weaken the agent invocation. The locked parts are:
-  - the flags in `agents/claude.py` and `agents/codex.py` (`_locked_flags`, `DISABLED_FEATURES`);
+  - the flags in `agents/claude.py`, `agents/codex.py` and `agents/opencode.py` (`_locked_flags`, `DISABLED_FEATURES`), and opencode's locked config and environment (`locked_config`, `permissions`, `LOCKED_ENV`, its own home);
   - the environment allowlist in `agents/base.py`;
   - the agent-file removal and git hardening in `gitops.py`.
 

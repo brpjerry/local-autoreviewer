@@ -3,8 +3,9 @@
 
 from .claude import ClaudeAgent
 from .codex import CodexAgent
+from .opencode import OpenCodeAgent
 
-ADAPTERS = {"claude": ClaudeAgent, "codex": CodexAgent}
+ADAPTERS = {"claude": ClaudeAgent, "codex": CodexAgent, "opencode": OpenCodeAgent}
 
 
 def make_agent(cfg, state_dir):

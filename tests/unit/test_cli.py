@@ -17,7 +17,7 @@ class CliTests(unittest.TestCase):
         cfg = config.parse({"agents": {"codex-sol": {"model": "gpt-6.1-sol"}}})
         self.assertEqual(cli._agents_arg(cfg, ["codex-sol", "claude", "codex-sol"]), ["codex-sol", "claude"])
         self.assertIsNone(cli._agents_arg(cfg, None))
-        with self.assertRaisesRegex(cli.CliError, "unknown agent 'codex-terra'; configured: claude, codex, codex-sol"):
+        with self.assertRaisesRegex(cli.CliError, "unknown agent 'codex-terra'; configured: claude, codex, opencode, codex-sol"):
             cli._agents_arg(cfg, ["codex-terra"])
 
     def test_version_reads_the_packaged_version_file(self):

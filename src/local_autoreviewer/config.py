@@ -13,10 +13,10 @@ from pathlib import Path
 
 from .suggestions import DEFAULT_TEST_PATHS
 
-AGENTS = ("claude", "codex")  # the agent types: each has a fixed adapter in agents/
+AGENTS = ("claude", "codex", "opencode")  # the agent types: each has a fixed adapter in agents/
 # An agent is one of the types, or a further reviewer of a type named "<type>-<name>" (e.g. "codex-sol"),
 # with its own model and effort. Its type alone picks the adapter, so the locked flags still apply.
-_AGENT_NAME_RE = re.compile(r"(claude|codex)(-[a-z0-9]+)*")  # fullmatch
+_AGENT_NAME_RE = re.compile(rf"({'|'.join(AGENTS)})(-[a-z0-9]+)*")  # fullmatch
 TOKEN_OWNER = "@token-owner"
 _REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$")
@@ -205,11 +205,11 @@ def parse(data, path=None):
         raise ConfigError("agents: use [agents.<name>] tables")
     for name in agents_table:
         if not _AGENT_NAME_RE.fullmatch(name):
-            raise ConfigError(f"agents: unknown agent {name!r}: expected claude, codex, or a further reviewer "
-                              "named claude-<name> or codex-<name>")
+            raise ConfigError(f"agents: unknown agent {name!r}: expected {', '.join(AGENTS)}, or a further "
+                              "reviewer named <type>-<name>, such as codex-sol")
         if not isinstance(agents_table[name], dict):
             raise ConfigError(f"agents.{name}: expected a table")
-    # claude and codex always exist; further reviewers follow in the order the config lists them.
+    # Every type's own agent always exists; further reviewers follow in the order the config lists them.
     agents = {name: _agent(name, agents_table.get(name, {}))
               for name in dict.fromkeys([*AGENTS, *agents_table])}
 

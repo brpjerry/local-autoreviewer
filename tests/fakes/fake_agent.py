@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Stand-in for `claude` and `codex` in tests.
+"""Stand-in for `claude`, `codex` and `opencode` in tests.
 
 Invoked through a wrapper script: fake_agent.py --mode MODE --log FILE -- <real agent argv...>
 It records its argv, environment keys and cwd, then behaves according to MODE.
@@ -67,7 +67,7 @@ def anchored(review, offset):
 
 def duplicates(prompt):
     """A duplicate check's answer: items of the same kind with the same title or text are duplicates."""
-    items = json.loads(prompt.split("```json\n", 1)[1].rsplit("\n```", 1)[0])
+    items = json.loads(prompt.split("```json\n", 1)[1].split("\n```", 1)[0])  # the first block: the items
     sets = {}
     for item in items:
         sets.setdefault((item["kind"], item.get("title") or item["text"]), []).append(item["id"])
@@ -88,6 +88,7 @@ def main():
         handle.write(json.dumps({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd(),
                                  "prompt": prompt, "pid": os.getpid()}) + "\n")
     codex = "exec" in argv
+    opencode = argv[:1] == ["run"]
     review = dict(REVIEW)
     if "This is a follow-up." in prompt:
         review = followup(Path(os.getcwd()).parent / "context", new_code=mode == "newcode")
@@ -113,6 +114,22 @@ def main():
     review = anchored(review, 1 if mode == "offby1" else 0)
     if mode == "badjson":
         review = {"nope": True}
+    if opencode:  # `opencode run --format json` events; the review is the final message's text
+        session = value_after(argv, "--session") or "ses_fake123"
+        print(json.dumps({"type": "step_start", "sessionID": session, "part": {"type": "step-start"}}))
+        if mode == "ratelimit":
+            print(json.dumps({"type": "error", "sessionID": session,
+                              "error": {"type": "provider.rate-limit", "message": "Rate limit exceeded"}}))
+            return 1
+        text = json.dumps(review)
+        if mode == "prose":  # some models wrap the object in a sentence and a code fence
+            text = f"Here is the review.\n\n```json\n{json.dumps(review, indent=2)}\n```"
+        print(json.dumps({"type": "text", "sessionID": session, "part": {"type": "text", "text": text}}))
+        print(json.dumps({"type": "step_finish", "sessionID": session,
+                          "part": {"reason": "length" if mode == "cutoff" else "stop", "cost": 0.0,
+                                   "tokens": {"input": 10, "output": 5, "reasoning": 2,
+                                              "cache": {"read": 4, "write": 0}}}}))
+        return 0
     if codex:
         print(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
         if mode == "ratelimit":

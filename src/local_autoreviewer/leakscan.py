@@ -8,6 +8,8 @@ could quote a secret. The scan reports pattern names only, never the match.
 import base64
 import json
 import re
+import sqlite3
+from pathlib import Path
 
 PATTERNS = {
     "github-token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}"),
@@ -45,24 +47,70 @@ def scan(text, secrets=()):
 _SECRET_KEY_RE = re.compile(r"token|secret|key|password|authorization", re.IGNORECASE)
 
 
+def collect_secrets_from(value):
+    """Credential-looking strings in parsed JSON, as collect_secrets finds them in files."""
+    found = []
+
+    def walk(item, key=""):
+        if isinstance(item, dict):
+            for k, v in item.items():
+                walk(v, k)
+        elif isinstance(item, list):
+            for v in item:
+                walk(v, key)
+        elif isinstance(item, str) and len(item) >= 16 and _SECRET_KEY_RE.search(key):
+            found.append(item)
+
+    walk(value)
+    return found
+
+
 def collect_secrets(json_files):
     """Best-effort: credential-looking string values from local auth files (kept in memory only)."""
     found = []
-
-    def walk(value, key=""):
-        if isinstance(value, dict):
-            for k, v in value.items():
-                walk(v, k)
-        elif isinstance(value, list):
-            for v in value:
-                walk(v, key)
-        elif isinstance(value, str) and len(value) >= 16 and _SECRET_KEY_RE.search(key):
-            found.append(value)
-
     for path in json_files:
         try:
             with open(path) as handle:
-                walk(json.load(handle))
+                found.extend(collect_secrets_from(json.load(handle)))
         except (OSError, ValueError):
             continue
+    return found
+
+
+# opencode keeps logins in its SQLite database: API keys and OAuth tokens in credential.value (JSON, or
+# the bare secret), account tokens in columns of their own.
+_DB_QUERIES = ("SELECT value FROM credential", "SELECT access_token, refresh_token FROM account",
+               "SELECT access_token, refresh_token FROM control_account")
+
+
+def collect_db_secrets(databases):
+    """Best-effort: the credentials in opencode databases, read without writing to them (kept in memory only)."""
+    found = []
+    for path in databases:
+        if not Path(path).is_file():
+            continue
+        try:
+            conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            continue
+        try:
+            for query in _DB_QUERIES:
+                try:
+                    rows = conn.execute(query).fetchall()
+                except sqlite3.Error:  # an older or newer schema without this table or column
+                    continue
+                for row in rows:
+                    for value in row:
+                        if not isinstance(value, str):
+                            continue
+                        try:
+                            parsed = json.loads(value)
+                        except ValueError:
+                            parsed = None
+                        if isinstance(parsed, (dict, list)):
+                            found.extend(collect_secrets_from(parsed))
+                        elif len(value) >= 16:
+                            found.append(value)
+        finally:
+            conn.close()
     return found

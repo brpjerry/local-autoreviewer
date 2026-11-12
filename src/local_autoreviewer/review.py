@@ -16,7 +16,7 @@ MAX_NITS = 15
 SEVERITIES = ("blocker", "major", "minor")  # what a reviewer reports; a modifier can also make a finding a nit
 LIKELIHOODS = ("common", "occasional", "rare")
 READABILITY = ("better", "same", "worse")
-AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+AGENT_NAMES = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode"}
 
 
 def agent_label(agent):

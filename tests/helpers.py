@@ -196,16 +196,18 @@ def agent_command(tmp, name, mode):
     return str(script), log
 
 
-def make_config(tmp, *, claude="ok", codex="ok", repo_extra=None, service=None, agents=("claude", "codex"),
-                further=None):
+def make_config(tmp, *, claude="ok", codex="ok", opencode="ok", repo_extra=None, service=None,
+                agents=("claude", "codex"), further=None):
     """further: more reviewers, {"codex-sol": {"model": ...}}, each running its type's fake agent."""
     claude_cmd, _ = agent_command(tmp, "claude", claude)
     codex_cmd, _ = agent_command(tmp, "codex", codex)
-    commands = {"claude": claude_cmd, "codex": codex_cmd}
+    opencode_cmd, _ = agent_command(tmp, "opencode", opencode)
+    commands = {"claude": claude_cmd, "codex": codex_cmd, "opencode": opencode_cmd}
     data = {
         "service": {"settle": "0s", "review_timeout": "30s", **(service or {})},
         "defaults": {"agents": list(agents)},
         "agents": {"claude": {"command": claude_cmd, "model": "opus"}, "codex": {"command": codex_cmd},
+                   "opencode": {"command": opencode_cmd, "model": "opencode/test-free"},
                    **{name: {"command": commands[config_mod.agent_type(name)], **table}
                       for name, table in (further or {}).items()}},
         "repo": [{"name": REPO, **(repo_extra or {})}],

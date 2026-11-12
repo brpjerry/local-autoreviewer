@@ -1,19 +1,21 @@
 # local-autoreviewer
 
-`local-autoreviewer` reviews your own GitHub pull requests automatically with **local** [Claude Code](https://docs.claude.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) sessions, and posts each review back to the PR. It uses the `claude` and `codex` logins you already have on the machine, so reviews draw on those subscriptions rather than on API keys.
+`local-autoreviewer` reviews your own GitHub pull requests automatically with **local** [Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) and [OpenCode](https://opencode.ai) sessions, and posts each review back to the PR. Claude uses the `claude` login you already have on the machine, and Codex and OpenCode log in once for reviews, so reviews draw on those subscriptions rather than on API keys. OpenCode's free models need no login at all.
 
 It needs no inbound connectivity: a systemd timer polls GitHub every 2 minutes, so it works behind NAT on a home server or workstation.
 
 ```text
 poll.timer → poll → events → ingest (your PRs, no drafts, dedupe, settle, supersede) → job queue
-worker → fetch PR head → checkout (agent files removed) → claude -p / codex exec (limited scope) → render → token scan
+worker → fetch PR head → checkout (agent files removed) → claude -p / codex exec / opencode run (limited scope)
+       → render → token scan
        → wait for the other agent's review → duplicate check → one post
 ```
 
 For each update to one of your open PRs on a configured repo, every enabled agent reviews it (Claude Code and Codex by default), and the reviews are posted together as one.
 - **Format:** a `COMMENT` review pinned to the reviewed commit.
 - **One post:** a finished review waits for the other agent's review of the same commit: for as long as that one runs, and for up to `combine_wait` (30 minutes) while it waits its turn. The agent that finishes last then checks both reviews for duplicates: an issue both reported appears once, credited to both, and every item says which reviewer found it. Where the other reviewer proposed a different fix for it, that fix is shown under it too, in the review body only, so two one-click suggestions never compete for the same lines. A proposed change that isn't also a one-click suggestion is shown up to 400 lines; one that is may be shortened to 80 in the body. A review too long for GitHub shortens every change to 80 lines first, then leaves out its nits, and only then is cut, before the first finding, heading or list item that doesn't fit. A review is posted on its own when the other one failed or comes later than that, and with `combine_wait = "0s"`. If the duplicate check fails, both reviews are posted in full, with a note.
-- **More reviewers:** besides `claude` and `codex`, you can add any number of reviewers of either type, each with its own model and effort. Add an `[agents.codex-sol]` table with `model = "gpt-6.1-sol"`, then list `"codex-sol"` in `agents`. The part of the name before the first dash is the reviewer's type, and the type alone picks the CLI and its locked flags. All the reviews of a commit are posted as one, and each is named in it ("Codex sol"). Every reviewer runs side by side with the others; Codex reviewers share the reviews' one Codex login. Each reviewer has its own daily cap.
+- **More reviewers:** besides `claude`, `codex` and `opencode`, you can add any number of reviewers of each type, each with its own model and effort. Add an `[agents.codex-sol]` table with `model = "gpt-6.1-sol"`, then list `"codex-sol"` in `agents`. The part of the name before the first dash is the reviewer's type, and the type alone picks the CLI and its locked flags. All the reviews of a commit are posted as one, and each is named in it ("Codex sol"). Every reviewer runs side by side with the others; reviewers of one type share that type's login. Each reviewer has its own daily cap.
+- **OpenCode:** `[agents.opencode]` takes a `model` in OpenCode's `provider/model` form, such as `opencode/deepseek-v4.1-flash-free` (free, no login) or a model of your [OpenCode Go](https://opencode.ai) subscription after `local-autoreviewer opencode-login`. `effort`, if set, is appended as the model's variant (`provider/model#high`). `opencode` has no output-schema flag, so the schema goes in the prompt and the review is the JSON object in the model's final message; one that doesn't parse or validate is retried like any failed review. Free models have a usage limit, which defers reviews like any other.
 - **Trivial PRs:** a reviewer may judge a PR trivial (it only changes strings, comments or docs, bumps a version or renames something) and end the review early, after checking the change itself. The review says so.
 - **Coverage:** correctness, security, design, performance, missing tests and readability. Findings are ranked Blocker / Major / Minor, and nits are collapsed.
 - **Fixes:** each finding comes with the exact proposed change. Each finding or nit with a change within the PR's diff gets one inline comment, so one thread to reply in: that first change is a GitHub suggested change, which you apply with **Commit suggestion**, and the rest of its fix is shown in the same comment as diffs (a suggestion can only replace its own comment's lines). The review body shows every change as a diff too. Each change carries the text it replaces, so one whose line numbers are a little off is moved to where that text is, and one whose text isn't in the file is left out rather than applied to the wrong lines.
@@ -36,9 +38,10 @@ For each update to one of your open PRs on a configured repo, every enabled agen
 - **Agents:** at least one of them, logged in:
   - `claude`: tested with Claude Code 2.1.296. It needs `--restricted` and `--safe-mode`.
   - `codex`: tested with Codex CLI 0.163.0.
+  - `opencode`: tested with OpenCode 2.2.7.
 
   `local-autoreviewer doctor` checks that the installed CLIs support every flag the tool relies on.
-- **Usage terms:** reviews run under your own Claude and ChatGPT subscriptions. Make sure automated use of them is acceptable under the terms that apply to you.
+- **Usage terms:** reviews run under your own Claude, ChatGPT and OpenCode subscriptions. Make sure automated use of them is acceptable under the terms that apply to you. Free OpenCode models can come with other data terms than paid ones; check them before pointing one at private code.
 
 ## Install
 
@@ -65,7 +68,9 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
    ```
    The token is passed only to the `gh` and `git` processes this tool starts. It is never written to `gh`'s own config and never reaches an agent. Reviews are posted as the token's owner.
 2. **Configure.** Copy `config.example.toml` (installed in `/usr/share/doc/local-autoreviewer/`) to `~/.config/local-autoreviewer/config.toml` and list your repos under `[[repo]]`. Check it with `local-autoreviewer config-check`.
-3. **Log Codex in for reviews:** run `local-autoreviewer codex-login`. Reviews use their own `CODEX_HOME`, because a global `~/.codex/AGENTS.md` would otherwise be loaded into every review, even with `--ignore-user-config`. Log in there rather than copying `~/.codex/auth.json`: Codex processes sharing one `auth.json` take turns refreshing it, but a copy races the original for the rotating refresh token.
+3. **Log the agents in for reviews.** For Codex, run `local-autoreviewer codex-login`. Reviews use their own `CODEX_HOME`, because a global `~/.codex/AGENTS.md` would otherwise be loaded into every review, even with `--ignore-user-config`. Log in there rather than copying `~/.codex/auth.json`: Codex processes sharing one `auth.json` take turns refreshing it, but a copy races the original for the rotating refresh token.
+
+   **OpenCode** reviews run in a home of their own (`~/.local/state/local-autoreviewer/opencode-home/`), so your own opencode config, instructions and sessions stay out of them. Free models need no login. For OpenCode Go, run `local-autoreviewer opencode-login` and paste your Go API key when asked. It logs in to the `opencode-go` integration; name another one to log in to it instead.
 
    Claude uses your existing login.
 4. **Check** with `local-autoreviewer doctor`.
@@ -131,8 +136,14 @@ Every review that passes the credential scan is also recorded in the state datab
 
 The known gap is that Codex **can read outside the checkout**. Set `[agents.codex] mode = "inline"` to remove its shell; the diff and changed files are then put in the prompt instead.
 
+**OpenCode** runs `opencode run --standalone --agent review` with a config fixed in code (`OPENCODE_CONFIG_CONTENT`) and a home of its own:
+- its permission rules deny every tool, then allow only `read`, `grep` and `glob`, and reads outside the checkout only in the context directory; so it has no shell, no edits and no web access;
+- skills, plugins, MCP servers and web search are denied by policy too, and language servers, formatters, snapshots, sharing and update checks are off;
+- your opencode config, `AGENTS.md`, instructions and skills are not loaded, nor are the PR's: project config and Claude Code compatibility are switched off, and the global config directory is an empty one of the job's own;
+- `--standalone` runs a private server for the review instead of opencode's background service.
+
 **The checkout:**
-- The PR's own agent files are deleted: `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.codex/`, `.agents/` and `.mcp.json`, case-insensitively, at any depth. The base branch's `CLAUDE.md`/`AGENTS.md` can be passed along as reference text (`project_docs`).
+- The PR's own agent files are deleted: `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.codex/`, `.agents/`, `.opencode/`, `.mcp.json` and `opencode.json(c)`, case-insensitively, at any depth. The base branch's `CLAUDE.md`/`AGENTS.md` can be passed along as reference text (`project_docs`).
 - Symlinks are checked out as plain files.
 - Git runs with hooks, LFS smudge, fsmonitor, external diff and your `~/.gitconfig` disabled.
 - Nothing from the PR is built or installed. The agents are told not to run anything; Claude has no way to.
@@ -143,9 +154,9 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 - A timeout or a newer push stops the scope, which kills the whole process tree.
 
 **Before posting:**
-- The duplicate check runs the agent with the same locked-down flags as its review, in the same checkout.
+- The duplicate check runs the agent with the same locked-down flags and config as its review, in the same checkout.
 - The review is rebuilt from structured output. HTML comments are escaped, @mentions neutralized, embedded images dropped, and the body capped at 65,536 characters.
-- It is scanned for credential patterns (each review, and again the merged post), and for exact, base64, hex and reversed copies of the GitHub token and the local Claude and Codex credentials. A match marks the job `blocked`, and nothing is posted.
+- It is scanned for credential patterns (each review, and again the merged post), and for exact, base64, hex and reversed copies of the GitHub token and the local Claude, Codex and opencode credentials (opencode's are read from its database, yours and the reviews'). A match marks the job `blocked`, and nothing is posted.
 - The PR head is re-checked immediately before posting, so a review of a superseded commit is never posted.
 
 ## Files
@@ -159,6 +170,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md, the PR's pr.json once the context goes, and for the job that posted several reviews round.md and the duplicate check's output), kept |
 | `~/.local/state/local-autoreviewer/mirrors/` | One bare mirror per repo |
 | `~/.local/state/local-autoreviewer/codex-home/` | Codex login and sessions used for reviews |
+| `~/.local/state/local-autoreviewer/opencode-home/` | OpenCode login, sessions and caches used for reviews (its `HOME`) |
 | `~/.claude/projects/<job checkout>/` | Claude sessions (for `resume`) |
 
 Run one worker per state directory. A second worker sharing it could, for example, finish the same interrupted post twice.
@@ -175,7 +187,7 @@ The tests run offline. They use fake agent executables (`tests/fakes/fake_agent.
 The opt-in `tests/integration/test_real_agents.py` runs the real CLIs and uses a little subscription quota:
 
 ```sh
-LOCAL_AUTOREVIEWER_REAL_AGENTS=claude,codex python3 -m unittest tests.integration.test_real_agents
+LOCAL_AUTOREVIEWER_REAL_AGENTS=claude,codex,opencode python3 -m unittest tests.integration.test_real_agents
 ```
 
 To run the service from this repository instead of the installed package, so a change goes live in seconds:

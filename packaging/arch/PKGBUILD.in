@@ -8,7 +8,8 @@ url='https://github.com/brpjerry/local-autoreviewer'
 license=('GPL-3.0-or-later')
 depends=('python' 'git' 'github-cli' 'systemd')
 optdepends=('claude-code: Claude Code reviews'
-            'openai-codex: Codex reviews')
+            'openai-codex: Codex reviews'
+            'opencode: OpenCode reviews')
 source=('local-autoreviewer.tar.gz')
 sha256sums=('@SHA256@')
 

@@ -328,6 +328,29 @@ class LeakScanTests(unittest.TestCase):
             os.unlink(handle.name)
         self.assertEqual(sorted(found), ["x" * 20, "y" * 30])
 
+    def test_collect_db_secrets(self):
+        """opencode's logins, from its database, which is only read."""
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "opencode.db")
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE credential (id TEXT, integration_id TEXT, label TEXT, value TEXT)")
+            conn.execute("CREATE TABLE account (id TEXT, email TEXT, access_token TEXT, refresh_token TEXT)")
+            conn.executemany("INSERT INTO credential VALUES (?, ?, ?, ?)", [
+                ("1", "opencode-go", "Go", json.dumps({"type": "api", "key": "k" * 24, "url": "u" * 30})),
+                ("2", "github", "GitHub", json.dumps({"access": {"accessToken": "a" * 20}, "expires": 1})),
+                ("3", "plain", "Plain", "p" * 18), ("4", "short", "Short", "s" * 5)])
+            conn.execute("INSERT INTO account VALUES ('1', 'me@example.com', ?, ?)", ("t" * 20, "r" * 20))
+            conn.commit()
+            conn.close()
+            before = path.stat().st_mtime_ns
+            found = leakscan.collect_db_secrets([path, Path(tmp, "missing.db")])
+            self.assertEqual(path.stat().st_mtime_ns, before)
+        # No control_account table: an older schema's missing table is skipped.
+        self.assertEqual(sorted(found), ["a" * 20, "k" * 24, "p" * 18, "r" * 20, "t" * 20])
+
 
 if __name__ == "__main__":
     unittest.main()
