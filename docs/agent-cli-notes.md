@@ -1,6 +1,6 @@
 # Agent CLI notes
 
-These notes record what the code relies on in the agent CLIs, as verified on 2026-10-30 against **claude-code 2.1.296**, **openai-codex 0.163.0**, systemd 262 and gh 2.102.1. Re-check them whenever you change flags or bump the tested versions. `local-autoreviewer doctor` checks that the installed CLIs at least advertise every flag used.
+These notes record what the code relies on in the agent CLIs, as verified on 2026-10-30 against **claude-code 2.1.296**, **openai-codex 0.163.0**, systemd 262 and gh 2.102.1, and on 2026-11-11 against **opencode 2.2.7**. Re-check them whenever you change flags or bump the tested versions. `local-autoreviewer doctor` checks that the installed CLIs at least advertise every flag used.
 
 Method: a throwaway repo with planted root and nested `CLAUDE.md` files, an `AGENTS.md`, a `.claude/settings.json` hook that touches a marker file, and a canary file outside the checkout. Every agent ran with an allowlisted environment (`env -i`). `tests/integration/test_real_agents.py` repeats the essentials through the real pipeline.
 
@@ -39,17 +39,20 @@ Verified on 2026-11-11 against **opencode 2.2.7**, with `opencode/deepseek-v4.1-
 
 | Check | Result |
 | --- | --- |
-| Auth | Free models (`opencode/*-free`) run with no login. OpenCode Go is the `opencode-go` integration, logged in with an API key (`opencode auth login opencode-go`, which needs a terminal for the key). Logins live in the home's SQLite database (`credential` table). |
-| Background service | Plain `opencode run` connects to, or starts, a background server under `HOME`. `--standalone` runs a private server for the one run instead. |
+| Auth | Free models (`opencode/*-free`) run with no login. OpenCode Go is the `opencode-go` integration, logged in with an API key (method `key`; `opencode auth login --standalone opencode-go` asks for it and needs a terminal). Logins live in the home's SQLite database: `credential.value` is JSON, `{"type": "key", "key"}` or `{"type": "oauth", "access", "refresh", "expires"}` (the binary's `Credential.Value`). |
+| Models | `opencode models --standalone` prints one bare `provider/model` per line, only those available: without a login, the 12 free ones; `opencode-go/glm-5` was then refused as unavailable. |
+| Background service | Plain `opencode run` connects to, or starts, a background server under `HOME`. `--standalone`, a global flag every subcommand takes, runs a private server for the one command instead. |
+| Concurrency | Two `opencode run --standalone` in one home at once both finished, their runs overlapping. |
+| Resume | `opencode --standalone --session <id>` starts the TUI (it ran until stopped; not tried on a real terminal). The top-level command has no `--agent` (with it, it prints its help and exits 1), so the locked config's `default_agent` selects the review agent. `opencode run --session <id>` continues a session with its context. |
 | Output | `--format json` prints one event per line: `step_start`, `text` (`part.text`), `tool_use`, `step_finish` (`part.reason`: `tool-calls`, `stop`, `length`; `part.tokens`, `part.cost`), and `error` (`error.type`, `error.message`; exit 1). Every event carries `sessionID`. A prompt on stdin works. |
-| Output schema | **No flag.** The schema goes in the prompt; the review is the JSON object in the final message. DeepSeek V4.1 Flash answered three full reviews in the schema; a follow-up and the duplicate check weren't tried against the real CLI (the free tier's limit stopped the duplicate check). |
+| Output schema | **No flag.** The schema goes in the prompt; the review is the JSON object in the final message, which the adapter checks against the schema itself. DeepSeek V4.1 Flash answered three full reviews in the schema; a follow-up and the duplicate check weren't tried against the real CLI (the free tier's limit stopped the duplicate check). |
 | Config sources | `opencode debug config` lists them. With `OPENCODE_CONFIG_DIR` set, it replaces the global config directory, which opencode creates and leaves empty. With `OPENCODE_CONFIG_PROJECT_DISABLE`/`OPENCODE_DISABLE_PROJECT_CONFIG`, the repo's `opencode.json` and `.opencode/` aren't sources; without them, both are. `OPENCODE_CONFIG_CONTENT` comes last. |
 | Instruction files | Not loaded with project config and Claude Code compatibility switched off: a one-word prompt cost 1,461 input tokens with the switches set and 1,480 without them (the 19 are the one-line `AGENTS.md` and `CLAUDE.md`), and no trap word appeared. |
 | Permissions | Rules are `{action, resource, effect}`; the last match wins, after opencode's defaults (which `opencode debug agents` shows). With `deny *` then `allow read/grep/glob`, the model is offered `read`, `grep`, `glob` and `skill` only: no shell, edit, write or fetch tool. No rule is left at `ask`, which would need a person. |
 | Reads outside the checkout | Denied (`Permission denied: external_directory`) for `read`, `grep` and `glob`, also through `context/../outside`. Allowed in the context directory by an `external_directory` rule for `<context>/*`, nested files included. |
 | Skills | Those in the repo's `.opencode/`/`.agents/` and the config directory aren't found; one in the home's `~/.agents/skills/` is found and refused (`Permission denied: skill`), as is the built-in `browser`. |
 | Errors | An unknown or unavailable model: `provider.no-route` "Model unavailable", exit 1. The free tier's limit: `provider.free-limit` "Free usage limit reached", which counts as a usage limit. |
-| Grep and glob | Use the system `ripgrep`, a dependency of the Arch package; nothing is downloaded. |
+| Grep and glob | Use the system `ripgrep`, which Arch's `opencode` package depends on; nothing is downloaded. |
 
 ## systemd: `systemd-run --user --scope`
 

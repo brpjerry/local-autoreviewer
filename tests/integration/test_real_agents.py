@@ -139,16 +139,25 @@ class RealAgentTests(EnvTestCase):
 
     @unittest.skipUnless("opencode" in ENABLED, "opencode not requested")
     def test_two_opencode_reviews_are_posted_as_one(self):
-        """opencode also answers the duplicate check, in its schema, from the prompt alone."""
+        """Two opencode reviewers at once, sharing the reviews' home, as the worker runs them; whichever finishes
+        last answers the duplicate check, in its schema, from the prompt alone."""
+        import threading
         svc = self.svc()
         ids = [self.start_job(svc, agent) for agent in ("opencode", "opencode-again")]
-        statuses = [pipeline.run_job(svc, job_id, pipeline.CancelToken()) for job_id in ids]
-        self.assertEqual(statuses, ["waiting", "posted"])
+        statuses = {}
+        threads = [threading.Thread(target=lambda job_id=job_id: statuses.__setitem__(
+            job_id, pipeline.run_job(svc, job_id, pipeline.CancelToken()))) for job_id in ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(statuses.values()), ["posted", "waiting"])
+        leader = next(job_id for job_id, status in statuses.items() if status == "posted")
         (posted,) = self.github.posted
         print(f"\n--- two opencode reviews (jobs {ids}) ---\n{posted['body']}\n")
         self.assertIn("OpenCode", posted["body"])
         self.assertNotIn("OUTSIDE-CANARY", posted["body"])
-        record = json.loads(Path(pipeline.job_paths(svc.state, ids[1]).out, "round.json").read_text())
+        record = json.loads(Path(pipeline.job_paths(svc.state, leader).out, "round.json").read_text())
         if record["unchecked"] == "the check hit a usage limit":  # a free model's quota, not a failure
             self.skipTest("the duplicate check hit the model's usage limit")
         self.assertEqual(record["unchecked"], "")

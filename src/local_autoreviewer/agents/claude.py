@@ -7,7 +7,7 @@ import uuid
 
 from .. import review
 from ..runner import Invocation
-from .base import AgentResult, agent_env, classify_error, missing_flags, tail
+from .base import AgentResult, agent_env, classify_error, missing_flags, operator_env, tail
 
 TOOLS = "Read,Grep,Glob"
 REQUIRED_FLAGS = ("--restricted", "--safe-mode", "--strict-mcp-config", "--tools", "--permission-prompts",
@@ -84,7 +84,7 @@ class ClaudeAgent:
 
     def resume_interactive(self, *, paths, session_id):
         # A normal interactive session with the operator's own config and tools.
-        return [self.cfg.command, "--resume", session_id], None
+        return [self.cfg.command, "--resume", session_id], operator_env()
 
     def ask(self, *, paths, session_id, question, timeout=900):
         argv = [self.cfg.command, "-p", *self._locked_flags(paths), "--resume", session_id,

@@ -132,7 +132,7 @@ def _repo_cfg(cfg, repo):
 
 
 def _agents_arg(cfg, agents):
-    """The --agent values, checked against the configured agents (claude, codex and any further reviewers)."""
+    """The --agent values, checked against the configured agents (each type's own and any further reviewers)."""
     for agent in agents or ():
         if agent not in cfg.agents:
             raise CliError(f"unknown agent {agent!r}; configured: {', '.join(cfg.agents)}")
@@ -434,10 +434,7 @@ def _ensure_worktree(cfg, job):
 def cmd_resume(args):
     cfg, _state, job, agent = _job_and_agent(args.job)
     job_paths = _ensure_worktree(cfg, job)
-    argv, extra_env = agent.resume_interactive(paths=job_paths, session_id=job["session_id"])
-    env = dict(os.environ)
-    env.pop("GH_TOKEN", None)
-    env.update(extra_env or {})
+    argv, env = agent.resume_interactive(paths=job_paths, session_id=job["session_id"])  # its whole environment
     os.chdir(job_paths.worktree)
     print(f"resuming job {job['id']} ({job['agent']} session {job['session_id']}) in {job_paths.worktree}",
           file=sys.stderr)

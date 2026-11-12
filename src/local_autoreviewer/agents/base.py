@@ -40,6 +40,14 @@ def agent_env(extra=None):
     return env
 
 
+def operator_env(extra=None):
+    """For an interactive session the operator resumes: their own environment, without the GitHub token."""
+    env = dict(os.environ)
+    env.pop("GH_TOKEN", None)
+    env.update(extra or {})
+    return env
+
+
 def classify_error(text):
     return "rate_limit" if _RATE_LIMIT_RE.search(text or "") else "error"
 

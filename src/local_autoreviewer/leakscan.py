@@ -47,8 +47,9 @@ def scan(text, secrets=()):
 _SECRET_KEY_RE = re.compile(r"token|secret|key|password|authorization", re.IGNORECASE)
 
 
-def collect_secrets_from(value):
-    """Credential-looking strings in parsed JSON, as collect_secrets finds them in files."""
+def collect_secrets_from(value, fields=()):
+    """Credential-looking strings in parsed JSON, as collect_secrets finds them in files: under a key that names
+    a secret, or one of fields."""
     found = []
 
     def walk(item, key=""):
@@ -58,7 +59,7 @@ def collect_secrets_from(value):
         elif isinstance(item, list):
             for v in item:
                 walk(v, key)
-        elif isinstance(item, str) and len(item) >= 16 and _SECRET_KEY_RE.search(key):
+        elif isinstance(item, str) and len(item) >= 16 and (_SECRET_KEY_RE.search(key) or key in fields):
             found.append(item)
 
     walk(value)
@@ -77,40 +78,44 @@ def collect_secrets(json_files):
     return found
 
 
-# opencode keeps logins in its SQLite database: API keys and OAuth tokens in credential.value (JSON, or
-# the bare secret), account tokens in columns of their own.
+# opencode keeps logins in its SQLite database. credential.value is JSON: {"type": "key", "key"} for an API key,
+# {"type": "oauth", "access", "refresh", "expires"} for OAuth (opencode 2.2.7's Credential.Value). Accounts keep
+# their tokens in columns of their own.
 _DB_QUERIES = ("SELECT value FROM credential", "SELECT access_token, refresh_token FROM account",
                "SELECT access_token, refresh_token FROM control_account")
+_CREDENTIAL_FIELDS = ("key", "access", "refresh")
 
 
 def collect_db_secrets(databases):
-    """Best-effort: the credentials in opencode databases, read without writing to them (kept in memory only)."""
+    """Best-effort: the credentials in opencode databases, read without writing to them (kept in memory only).
+    A database that is missing or can't be read is skipped, as a missing auth file is."""
     found = []
     for path in databases:
-        if not Path(path).is_file():
-            continue
         try:
-            conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=5)
-        except sqlite3.Error:
+            conn = sqlite3.connect(f"{Path(path).absolute().as_uri()}?mode=ro", uri=True, timeout=5)
+        except (OSError, ValueError, sqlite3.Error):
             continue
         try:
             for query in _DB_QUERIES:
                 try:
                     rows = conn.execute(query).fetchall()
-                except sqlite3.Error:  # an older or newer schema without this table or column
+                except sqlite3.Error:  # missing, unreadable, or a schema without this table or column
                     continue
                 for row in rows:
                     for value in row:
-                        if not isinstance(value, str):
-                            continue
-                        try:
-                            parsed = json.loads(value)
-                        except ValueError:
-                            parsed = None
-                        if isinstance(parsed, (dict, list)):
-                            found.extend(collect_secrets_from(parsed))
-                        elif len(value) >= 16:
-                            found.append(value)
+                        found.extend(_stored_secrets(value))
         finally:
             conn.close()
     return found
+
+
+def _stored_secrets(value):
+    if not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return collect_secrets_from(parsed, _CREDENTIAL_FIELDS)
+    return [value] if len(value) >= 16 else []

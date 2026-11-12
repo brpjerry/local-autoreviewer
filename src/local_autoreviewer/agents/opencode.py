@@ -2,10 +2,12 @@
 """OpenCode adapter: read-only file tools confined to the job, a dedicated home, operator and PR config ignored.
 
 `opencode run` has no output-schema flag, so the prompt carries the schema, and the review is the JSON object in
-the final message. The pipeline validates it as it does every review.
+the final message. The adapter checks that object against the schema itself, as Claude's and Codex's schema
+flags do: review.validate() is lenient on purpose, as it also reads reviews saved in older shapes.
 """
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -56,15 +58,50 @@ def locked_config(context):
 
 
 def output_format(schema):
-    """What the prompt adds, in place of a schema flag."""
+    """What the prompt adds, in place of a schema flag (schema: the parsed JSON Schema)."""
     return ("\n\n## Output format\n\nEnd with your answer as one JSON object that matches this JSON Schema: every "
             "property it requires, and no others. Your final message must be that object alone, with no text and "
-            "no code fence around it.\n\n```json\n" + review.schema_text(schema) + "\n```\n")
+            "no code fence around it.\n\n```json\n" + json.dumps(schema, separators=(",", ":")) + "\n```\n")
+
+
+# The JSON Schema keywords output_errors understands; the shipped schemas use no others (tests check).
+SCHEMA_KEYWORDS = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
+_TYPES = {"object": dict, "array": list, "string": str, "boolean": bool}
+
+
+def output_errors(value, schema, where="$"):
+    """Where value breaks schema, as messages: types, enums, required and unknown properties, items."""
+    kind = schema.get("type")
+    if kind == "integer":
+        valid = type(value) is int or (type(value) is float and value.is_integer())
+    else:
+        valid = kind in _TYPES and type(value) is _TYPES[kind]
+    if not valid:
+        return [f"{where}: expected {kind}"]
+    if "enum" in schema and value not in schema["enum"]:
+        return [f"{where}: not one of {', '.join(map(str, schema['enum']))}"]
+    errors = []
+    if kind == "object":
+        properties = schema.get("properties", {})
+        missing = [key for key in schema.get("required", ()) if key not in value]
+        if missing:
+            errors.append(f"{where}: missing {', '.join(missing)}")
+        if schema.get("additionalProperties") is False:
+            extra = sorted(set(value) - set(properties))
+            if extra:
+                errors.append(f"{where}: unexpected {', '.join(extra)}")
+        for key, item in value.items():
+            if key in properties:
+                errors += output_errors(item, properties[key], f"{where}.{key}")
+    elif kind == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            errors += output_errors(item, schema["items"], f"{where}[{index}]")
+    return errors
 
 
 def read_events(text):
     events = []
-    for line in text.splitlines():
+    for line in text.split("\n"):  # JSON lines: not splitlines(), which also splits at U+2028 inside strings
         try:
             event = json.loads(line)
         except ValueError:
@@ -91,7 +128,8 @@ def final_text(events):
 
 
 def extract_json(text):
-    """The JSON object a final message holds: alone, in a code fence, or after some prose."""
+    """The JSON object a final message holds: alone, in a code fence, or among prose. Among prose, it is the last
+    whole object in it, skipping brace expressions that aren't JSON; the schema check then catches a wrong one."""
     text = text.strip()
     fenced = _FENCE_RE.match(text)
     if fenced:
@@ -99,13 +137,22 @@ def extract_json(text):
     try:
         value = json.loads(text)
     except ValueError:
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end < start:
+        decoder, found, failures, start = json.JSONDecoder(), [], [], text.find("{")
+        while start != -1:
+            try:
+                value, end = decoder.raw_decode(text, start)
+            except ValueError as error:
+                failures.append(error)
+                start = text.find("{", start + 1)
+                continue
+            if isinstance(value, dict):
+                found.append(value)
+            start = text.find("{", end)  # past this object, so none nested in it counts
+        if not found:
+            if failures:
+                raise ValueError(f"its JSON doesn't parse ({failures[0]})") from None
             raise ValueError("it holds no JSON object") from None
-        try:
-            value = json.loads(text[start:end + 1])
-        except ValueError as exc:
-            raise ValueError(f"its JSON doesn't parse ({exc})") from None
+        value = found[-1]
     if not isinstance(value, dict):
         raise ValueError("its JSON isn't an object")
     return value
@@ -144,6 +191,7 @@ class OpenCodeAgent:
         # there, and looks for ~/.claude, ~/.agents and ~/.opencode there. So the operator's own opencode setup
         # never loads, and reviews log in separately (`local-autoreviewer opencode-login`).
         self.home = Path(state_dir) / "opencode-home"
+        self.schemas = {}  # out directory -> the schema its run was asked for, which parse() checks against
 
     def env(self, *, config_dir, context):
         """The environment for a run. config_dir is the global config directory opencode reads, which it creates
@@ -187,8 +235,9 @@ class OpenCodeAgent:
 
     def invocation(self, *, unit, paths, prompt, session_id, schema=None):
         argv = [self.cfg.command, "run", *self._locked_flags(), "--format", "json", *self._model_flags()]
+        self.schemas[str(paths.out)] = parsed = json.loads(review.schema_text(schema))
         return Invocation(argv=argv, cwd=paths.worktree, env=self.job_env(paths),
-                          stdin=(prompt + output_format(schema)).encode(),
+                          stdin=(prompt + output_format(parsed)).encode(),
                           stdout_path=f"{paths.out}/agent.stdout", stderr_path=f"{paths.out}/agent.stderr",
                           unit=unit, memory_max=self.cfg.memory_max, tasks_max=self.cfg.tasks_max)
 
@@ -210,18 +259,26 @@ class OpenCodeAgent:
             result.error_kind, result.error = "error", "opencode's final message was cut off at the output limit"
             return result
         try:
-            result.review = extract_json(final_text(events))
+            answer = extract_json(final_text(events))
         except ValueError as exc:
             result.error_kind, result.error = "error", f"opencode's final message is not the review: {exc}"
+            return result
+        schema = self.schemas.get(str(paths.out)) or json.loads(review.schema_text())
+        errors = output_errors(answer, schema)
+        if errors:
+            shown = "; ".join(errors[:5]) + (f"; and {len(errors) - 5} more" if len(errors) > 5 else "")
+            result.error_kind, result.error = "error", f"opencode's answer doesn't match the schema: {shown}"[:2000]
+            return result
+        result.review = answer
         return result
 
     def resume_interactive(self, *, paths, session_id):
-        # The review's session lives in the reviews' home, so resume there, under the same read-only rules.
-        env = self.job_env(paths)
-        keep = {"HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", *LOCKED_ENV,
-                "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"}
-        return [self.cfg.command, *self._locked_flags(), "--session", session_id], \
-            {key: value for key, value in env.items() if key in keep}
+        """The review's session lives in the reviews' home, so resume there, in the review's environment and
+        under its read-only rules (the TUI takes no --agent; the locked config's default agent is the review's)."""
+        return [self.cfg.command, "--standalone", "--session", session_id], self.interactive_env(paths)
+
+    def interactive_env(self, paths):
+        return {**self.job_env(paths), "TERM": os.environ.get("TERM", "dumb")}
 
     def ask(self, *, paths, session_id, question, timeout=900):
         argv = [self.cfg.command, "run", *self._locked_flags(), "--format", "json", "--session", session_id,
@@ -230,7 +287,10 @@ class OpenCodeAgent:
                               capture_output=True, text=True, timeout=timeout)
         events = read_events(proc.stdout)
         errors = [_error(event) for event in events if event.get("type") == "error"]
-        return proc.returncode, final_text(events) or "; ".join(errors) or proc.stderr or proc.stdout
+        if proc.returncode != 0 or errors:  # the reason, not progress text from before it
+            return proc.returncode or 1, "; ".join(errors) or proc.stderr.strip() or proc.stdout.strip() \
+                or f"exit {proc.returncode}"
+        return 0, final_text(events)
 
     def login_argv(self, integration=None):
         return [self.cfg.command, "auth", "login", "--standalone", integration or "opencode-go"]

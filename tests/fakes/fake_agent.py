@@ -14,6 +14,7 @@ from pathlib import Path
 
 REVIEW = {
     "summary": "Adds a divide helper; one real bug.",
+    "trivial": False,
     "findings": [{"severity": "major", "impact": 6, "likelihood": "common", "trigger": "Any caller passes b=0.",
                   "category": "correctness", "file": "src/calc.py", "line": 2,
                   "title": "Division by zero is unhandled", "detail": "divide(1, 0) raises ZeroDivisionError.",
@@ -98,7 +99,7 @@ def main():
         if mode == "dupfail":
             print("boom: duplicate check crashed", file=sys.stderr)
             return 3
-        review = duplicates(prompt)
+        review = {} if mode == "dupempty" else duplicates(prompt)
         mode = {"dupsleep": "sleep", "dupratelimit": "ratelimit"}.get(mode, "ok")
     if mode == "sleep":
         time.sleep(60)

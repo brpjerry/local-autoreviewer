@@ -144,7 +144,7 @@ class PipelineTests(EnvTestCase):
             conn.close()
             return pipeline.run_job(svc, job_id, pipeline.CancelToken()), self.job(svc, job_id)
         self.assertEqual(run("prose")[0], "posted")  # the object in a code fence, after a sentence
-        for mode, reason in (("cutoff", "cut off"), ("badjson", "ReviewFormatError")):
+        for mode, reason in (("cutoff", "cut off"), ("badjson", "doesn't match the schema: $: missing summary")):
             with self.subTest(mode=mode):
                 status, job = run(mode)
                 self.assertEqual(status, "queued")  # retried
@@ -161,6 +161,15 @@ class PipelineTests(EnvTestCase):
         record = json.loads(Path(pipeline.job_paths(self.state, ids[1]).out, "round.json").read_text())
         self.assertEqual((record["checked_by"], record["unchecked"]), ("opencode", ""))  # it ran the check too
         self.assertTrue(record["duplicates"])
+
+    def test_an_opencode_duplicate_check_outside_its_schema_counts_as_failed(self):
+        """Not as a check that found nothing: the reviews are posted with the note that they weren't checked."""
+        svc, ids = self.queue(make_config(self.tmp, opencode="dupempty"), agents=("codex", "opencode"))
+        pipeline.run_job(svc, ids[0], pipeline.CancelToken())
+        self.assertEqual(pipeline.run_job(svc, ids[1], pipeline.CancelToken()), "posted")
+        record = json.loads(Path(pipeline.job_paths(self.state, ids[1]).out, "round.json").read_text())
+        self.assertEqual(record["unchecked"], "the check failed")
+        self.assertIn("weren't checked for duplicates (the check failed)", self.github.posted[0]["body"])
 
     def test_head_moved_before_post_is_not_posted(self):
         svc, (job_id,) = self.queue()
