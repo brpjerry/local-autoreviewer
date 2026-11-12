@@ -144,9 +144,11 @@ def main():
     if opencode:  # `opencode run --format json` events; the review is the final message's text
         session = value_after(argv, "--session") or "ses_fake123"
         print(json.dumps({"type": "step_start", "sessionID": session, "part": {"type": "step-start"}}))
-        if mode == "ratelimit":
-            print(json.dumps({"type": "error", "sessionID": session,
-                              "error": {"type": "provider.rate-limit", "message": "Rate limit exceeded"}}))
+        if mode in ("ratelimit", "freelimit"):  # a brief throttle; a free tier used up
+            error = ({"type": "provider.rate-limit", "message": "Rate limit exceeded"} if mode == "ratelimit" else
+                     {"type": "provider.free-limit", "message": "Free usage limit reached. Connect a provider or "
+                                                                "subscribe to OpenCode Go to keep going."})
+            print(json.dumps({"type": "error", "sessionID": session, "error": error}))
             return 1
         text = json.dumps(review)
         if mode == "prose":  # some models wrap the object in a sentence and a code fence

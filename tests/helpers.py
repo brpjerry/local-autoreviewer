@@ -240,8 +240,9 @@ class EnvTestCase(unittest.TestCase):
         self.state.mkdir()
         self.cfg = make_config(self.tmp)
         self.plan_limits = {}  # limits_key -> [limits.Limit] or limits.Unavailable: what the plans report
-        limits._readings.clear()  # what earlier tests' reviews noted, such as a usage limit they hit
-        self.addCleanup(limits._readings.clear)
+        for remembered in (limits._readings, limits._hits):  # what earlier tests' reviews left, such as a used-up limit
+            remembered.clear()
+            self.addCleanup(remembered.clear)
 
     def tearDown(self):
         self._tmp.cleanup()

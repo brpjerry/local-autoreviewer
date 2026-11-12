@@ -83,4 +83,4 @@ A small review took about 25 s with Claude Haiku and about 28 s with Codex at lo
 
 ## Not yet verified
 
-- The exact shape of usage-limit errors from each CLI. Parsing is defensive: `api_error_status == 429` or usage-limit wording becomes a 30-minute deferral.
+- The exact shape of usage-limit errors from each CLI. Parsing is defensive: `api_error_status == 429` or usage-limit wording counts as a usage limit. Wording that says the plan is used up ("usage limit", "limit reached", "quota", "free limit") skips the review; anything else, such as "rate limit exceeded", is deferred for 30 minutes. Seen: OpenCode's free tier answers `provider.free-limit` "Free usage limit reached".

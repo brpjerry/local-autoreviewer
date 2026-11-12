@@ -3,11 +3,13 @@
 
 Each agent type reads its own login's limits (the adapters' read_limits). A reading is kept for FRESH seconds
 per login: the usage endpoints are rate limited, and the operator's own tools poll them too. A reading that
-fails counts as unknown, and the review runs; a usage-limit error from the agent still defers it.
+fails counts as unknown, and the review runs. A review whose agent then finds a limit used up is skipped as
+well, and remembered for FRESH seconds for its login and model (see note_used_up).
 """
 
 import logging
 import math
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -76,16 +78,31 @@ def read(agent, now):
         return cached[1]
 
 
-def note_used_up(agent, now):
-    """A review hit one of the plan's usage limits: until the next reading, FRESH seconds on, count the plan as
-    used up, so the agent's next reviews are skipped without starting. A free tier, which reports no limits,
-    is then simply tried again."""
-    key = agent.limits_key()
+# An agent's error that says the plan is used up, as opposed to a brief throttle ("rate limit exceeded", HTTP 429)
+# that a later retry gets past.
+_USED_UP_RE = re.compile(r"usage limit|limit reached|quota|out of (?:credits|usage)|free.?limit|credit balance",
+                         re.IGNORECASE)
+_hits = {}  # (limits_key, model) -> when a review on that login and model found a limit used up
+
+
+def used_up(message):
+    return bool(_USED_UP_RE.search(message or ""))
+
+
+def note_used_up(agent, model, now):
+    """A review found a usage limit used up. For FRESH seconds, the reviews of that login and model are skipped
+    without starting; those on its other models, whose quotas may be their own, aren't, and the login's measured
+    reading stands. After that, a free tier, which reports no limits, is simply tried again."""
     with _guard:
-        lock = _locks.setdefault(key, threading.Lock())
-    with lock:
-        _readings[key] = (now, [Limit("usage", 100.0)])
-    log.info("%s: a review hit a usage limit; its next reviews are skipped for %d minutes", key, FRESH // 60)
+        _hits[(agent.limits_key(), model)] = now
+    log.info("%s: a review on %s found a usage limit used up; its next reviews are skipped for %d minutes",
+             agent.limits_key(), model or "the default model", FRESH // 60)
+
+
+def hit_recently(agent, model, now):
+    with _guard:
+        at = _hits.get((agent.limits_key(), model))
+    return at is not None and now - at < FRESH
 
 
 def describe(limit, now):

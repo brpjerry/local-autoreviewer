@@ -294,7 +294,7 @@ class RoundTests(EnvTestCase):
         """Its review is skipped, so the other reviewer's posts as soon as it is ready, whichever ends first."""
         for order in ((1, 0), (0, 1)):
             with self.subTest(order=order):
-                limits._readings.clear()
+                limits._hits.clear()
                 self.github.posted.clear()
                 svc, jobs = self.queue(make_config(self.tmp, codex="ratelimit"))
                 statuses = {jobs[index]: self.run_job(svc, jobs[index]) for index in order}
@@ -315,7 +315,7 @@ class RoundTests(EnvTestCase):
 
     def test_check_fallbacks(self):
         for mode, note in (("dupratelimit", "the check hit a usage limit"), ("dupsleep", "the check timed out")):
-            limits._readings.clear()
+            limits._hits.clear()
             with self.subTest(mode=mode), mock.patch.object(pipeline, "DUPLICATE_CHECK_TIMEOUT", 1):
                 self.github.posted.clear()
                 svc, (claude, codex) = self.queue(make_config(self.tmp, codex=mode))
@@ -323,9 +323,7 @@ class RoundTests(EnvTestCase):
                 self.assertEqual(self.run_job(svc, codex), "posted")
                 (posted,) = self.github.posted
                 self.assertIn(f"weren't checked for duplicates ({note})", posted["body"])
-                noted = [key for key, (_at, reading) in limits._readings.items()
-                         if isinstance(reading, list) and [limit.name for limit in reading] == ["usage"]]
-                self.assertEqual(len(noted), 1 if mode == "dupratelimit" else 0)  # a used-up plan is remembered
+                self.assertEqual(len(limits._hits), 1 if mode == "dupratelimit" else 0)  # a used-up plan is remembered
                 conn = svc.connect()
                 with db.transaction(conn):  # out of the next subtest's way
                     conn.execute("UPDATE jobs SET status='superseded'")

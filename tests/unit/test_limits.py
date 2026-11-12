@@ -63,6 +63,17 @@ class LimitTests(unittest.TestCase):
         self.assertIsNone(limits.low([Limit("weekly", 90.0, LATER)], "opus", 10, NOW))  # exactly 10% left
         self.assertIn("weekly limit 7% left, resets ", limits.describe(Limit("weekly", 93.0, LATER), NOW))
 
+    def test_used_up_or_throttled(self):
+        """Only an error saying the plan is used up skips the review; a brief throttle is waited out."""
+        for message, used in (("provider.free-limit Free usage limit reached. Connect a provider", True),
+                              ("You've hit your usage limit. Try again later.", True),
+                              ("success: Claude AI usage limit reached|1800003600", True),
+                              ("insufficient_quota", True), ("You're out of credits", True),
+                              ("provider.rate-limit Rate limit exceeded", False),
+                              ("HTTP 429 Too Many Requests", False), ("", False), (None, False)):
+            with self.subTest(message=message):
+                self.assertEqual(limits.used_up(message), used)
+
     def test_epoch(self):
         self.assertEqual(limits.epoch("1970-01-01T00:01:40+00:00"), 100)
         self.assertEqual(limits.epoch(1800003600), 1800003600)

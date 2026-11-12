@@ -149,9 +149,16 @@ class PipelineTests(EnvTestCase):
                 status, job = run(mode)
                 self.assertEqual(status, "queued")  # retried
                 self.assertIn(reason, job["reason"])
-        status, job = run("ratelimit")
+        status, job = run("freelimit")  # the free tier used up: skipped
         self.assertEqual(status, "skipped")
-        self.assertIn("OpenCode hit a usage limit (provider.rate-limit Rate limit exceeded)", job["reason"])
+        self.assertIn("OpenCode found a usage limit used up (provider.free-limit Free usage limit reached.",
+                      job["reason"])
+        self.assertIn("in the last 10 minutes", run("ok")[1]["reason"])  # remembered: the next doesn't start
+        from local_autoreviewer import limits
+        limits._hits.clear()  # ten minutes on
+        status, job = run("ratelimit")  # a brief throttle: waited out, as before, without using an attempt
+        self.assertEqual((status, job["attempts"]), ("queued", 0))
+        self.assertIn("retry: usage limit: provider.rate-limit Rate limit exceeded", job["reason"])
 
     def test_codex_and_opencode_reviews_are_posted_as_one(self):
         svc, ids = self.queue(agents=("codex", "opencode"))
@@ -312,9 +319,10 @@ class PipelineTests(EnvTestCase):
         limits._readings[claude.limits_key()] = (self.clock(), [])
         with self.assertLogs("local_autoreviewer.limits", "INFO") as logs:
             self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
-        self.assertIn("Claude Code hit a usage limit (success: Claude usage limit reached); not reviewed",
+        self.assertIn("Claude Code found a usage limit used up (success: Claude usage limit reached); not reviewed",
                       self.job(svc, job_id)["reason"])
-        self.assertIn("its next reviews are skipped for 10 minutes", logs.output[0])
+        self.assertIn("on opus found a usage limit used up; its next reviews are skipped for 10 minutes",
+                      logs.output[0])
         self.assertEqual(len(self.agent_log("claude")), 1)
         head = self.remote.push_pr(1, {"src/calc.py": HOSTILE_FILES["src/calc.py"] + "# v3\n"})
         self.github.set_pr(1, head)
@@ -325,8 +333,27 @@ class PipelineTests(EnvTestCase):
             db.update_job(conn, later, status="running", started_at=self.clock())
         conn.close()
         self.assertEqual(pipeline.run_job(svc, later, pipeline.CancelToken()), "skipped")
-        self.assertIn("Claude Code's usage limit 0% left", self.job(svc, later)["reason"])
+        self.assertIn("Claude Code found a usage limit used up in the last 10 minutes; not reviewed",
+                      self.job(svc, later)["reason"])
+        self.assertIsNone(self.job(svc, later)["started_at"])  # it didn't start, so it isn't counted
         self.assertEqual(len(self.agent_log("claude")), 1)  # it didn't start
+        self.assertEqual(limits._readings[claude.limits_key()][1], [])  # the login's reading stands
+
+    def test_a_used_up_limit_is_remembered_for_its_model_only_and_for_a_while(self):
+        """Another model on the same login may have a quota of its own: its reviews still run."""
+        from local_autoreviewer import limits
+        from local_autoreviewer.agents import make_agent
+        cfg = make_config(self.tmp, agents=("claude", "claude-sonnet"), further={"claude-sonnet": {"model": "sonnet"}})
+        svc = self.services(cfg)
+        claude = make_agent(svc.config.agents["claude"], self.state)
+        limits.note_used_up(claude, "opus", self.clock())
+        self.assertTrue(limits.hit_recently(claude, "opus", self.clock() + limits.FRESH - 1))
+        self.assertFalse(limits.hit_recently(claude, "sonnet", self.clock()))
+        self.assertFalse(limits.hit_recently(claude, "", self.clock()))  # the default model is another model
+        self.assertFalse(limits.hit_recently(claude, "opus", self.clock() + limits.FRESH))  # tried again later
+        svc, (sonnet_job,) = self.queue(cfg, agents=("claude-sonnet",))
+        self.assertEqual(pipeline.run_job(svc, sonnet_job, pipeline.CancelToken()), "posted")
+        self.assertEqual(len(self.agent_log("claude")), 1)  # claude-sonnet runs the claude fake
 
     def test_without_a_reserve_a_usage_limit_defers_without_using_an_attempt(self):
         from local_autoreviewer import limits
