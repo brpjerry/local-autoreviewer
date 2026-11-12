@@ -22,26 +22,26 @@ from local_autoreviewer.limits import Limit, Unavailable
 NOW = 1_800_000_000
 LATER = NOW + 3600
 
-# Trimmed from a real /api/oauth/usage reply (2026-11-11).
+# Shaped like a real /api/oauth/usage reply (2026-11-11), with made-up figures.
 CLAUDE_USAGE = {
-    "five_hour": {"utilization": 8.0, "resets_at": "2027-01-15T10:20:00.586156+00:00"},
-    "seven_day": {"utilization": 82.0, "resets_at": "2027-01-18T01:00:00.586177+00:00"},
+    "five_hour": {"utilization": 12.0, "resets_at": "2027-01-15T10:20:00.586156+00:00"},
+    "seven_day": {"utilization": 64.0, "resets_at": "2027-01-18T01:00:00.586177+00:00"},
     "limits": [
-        {"kind": "session", "group": "session", "percent": 8, "resets_at": "2027-01-15T10:20:00.586156+00:00",
+        {"kind": "session", "group": "session", "percent": 12, "resets_at": "2027-01-15T10:20:00.586156+00:00",
          "scope": None},
-        {"kind": "weekly_all", "group": "weekly", "percent": 82, "resets_at": "2027-01-18T01:00:00.586177+00:00",
+        {"kind": "weekly_all", "group": "weekly", "percent": 64, "resets_at": "2027-01-18T01:00:00.586177+00:00",
          "scope": None},
-        {"kind": "weekly_scoped", "group": "weekly", "percent": 67, "resets_at": "2027-01-18T00:59:59.586352+00:00",
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 57, "resets_at": "2027-01-18T00:59:59.586352+00:00",
          "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
     ],
 }
-# Trimmed from a real account/rateLimits/read reply (codex-cli 0.166.0).
+# Shaped like a real account/rateLimits/read reply (codex-cli 0.166.0), with made-up figures.
 CODEX_REPLY = {
     "ordinaryUsageAllowed": True,
-    "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 73, "windowDurationMins": 10080,
-                                                   "resetsAt": 1794544713}, "secondary": None},
+    "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 41, "windowDurationMins": 10080,
+                                                   "resetsAt": 1800003600}, "secondary": None},
     "rateLimitsByLimitId": {"codex": {"limitId": "codex", "normalModelSlug": None, "primary": {
-        "usedPercent": 73, "windowDurationMins": 10080, "resetsAt": 1794544713}, "secondary": None}},
+        "usedPercent": 41, "windowDurationMins": 10080, "resetsAt": 1800003600}, "secondary": None}},
 }
 
 
@@ -64,7 +64,7 @@ class LimitTests(unittest.TestCase):
 
     def test_epoch(self):
         self.assertEqual(limits.epoch("1970-01-01T00:01:40+00:00"), 100)
-        self.assertEqual(limits.epoch(1794544713), 1794544713)
+        self.assertEqual(limits.epoch(1800003600), 1800003600)
         for value in (None, "soon", -5, float("nan"), True):
             self.assertEqual(limits.epoch(value), 0, value)
 
@@ -114,22 +114,22 @@ class ParserTests(unittest.TestCase):
     def test_claude(self):
         found = claude_limits(CLAUDE_USAGE)
         self.assertEqual([(l.name, l.used, l.model) for l in found],
-                         [("5-hour", 8.0, ""), ("weekly", 82.0, ""), ("weekly (Fable)", 67.0, "Fable")])
+                         [("5-hour", 12.0, ""), ("weekly", 64.0, ""), ("weekly (Fable)", 57.0, "Fable")])
         self.assertEqual(found[1].resets_at, limits.epoch("2027-01-18T01:00:00.586177+00:00"))
         # Without the limits list, the two windows.
         older = {key: CLAUDE_USAGE[key] for key in ("five_hour", "seven_day")}
-        self.assertEqual([(l.name, l.used) for l in claude_limits(older)], [("5-hour", 8.0), ("weekly", 82.0)])
+        self.assertEqual([(l.name, l.used) for l in claude_limits(older)], [("5-hour", 12.0), ("weekly", 64.0)])
         self.assertEqual(claude_limits({"limits": "x", "five_hour": None}), [])
 
     def test_codex(self):
         (weekly,) = codex_limits(CODEX_REPLY)
-        self.assertEqual((weekly.name, weekly.used, weekly.resets_at, weekly.model), ("weekly", 73.0, 1794544713, ""))
+        self.assertEqual((weekly.name, weekly.used, weekly.resets_at, weekly.model), ("weekly", 41.0, 1800003600, ""))
         reply = json.loads(json.dumps(CODEX_REPLY))
         reply["rateLimitsByLimitId"]["codex"]["secondary"] = {"usedPercent": 40, "windowDurationMins": 300}
         reply["rateLimitsByLimitId"]["sol"] = {"normalModelSlug": "gpt-6.1-sol", "primary": {"usedPercent": 95}}
         reply["rateLimitsByLimitId"]["cloud"] = {"primary": {"usedPercent": 99}}  # another product's quota
         self.assertEqual([(l.name, l.used, l.model) for l in codex_limits(reply)],
-                         [("weekly", 73.0, ""), ("5-hour", 40.0, ""), ("plan (gpt-6.1-sol)", 95.0, "gpt-6.1-sol")])
+                         [("weekly", 41.0, ""), ("5-hour", 40.0, ""), ("plan (gpt-6.1-sol)", 95.0, "gpt-6.1-sol")])
         # Only rateLimits, under another id; and a plan that is blocked outright.
         only = {"rateLimits": {"limitId": "pro", "primary": {"usedPercent": 20, "windowDurationMins": 10080}},
                 "ordinaryUsageAllowed": False}
@@ -233,8 +233,8 @@ class DoctorTests(unittest.TestCase):
         cfg = config.parse({"agents": {"codex-sol": {"model": "gpt-6.1-sol"}}})
         agent = mock.Mock()
         now = int(time.time())
-        cases = [([Limit("weekly", 73.0, now + 3600), Limit("plan (other)", 99.0, 0, "gpt-other")], True,
-                  "codex-sol: weekly limit 27% left, resets "),
+        cases = [([Limit("weekly", 59.0, now + 3600), Limit("plan (other)", 99.0, 0, "gpt-other")], True,
+                  "codex-sol: weekly limit 41% left, resets "),
                  ([Limit("weekly", 95.0, now + 3600)], False, "Under 10%: its reviews are skipped"),
                  (Unavailable("HTTP 429"), True, "usage limits unknown (HTTP 429)"),
                  ([], True, "no usage limits reported")]

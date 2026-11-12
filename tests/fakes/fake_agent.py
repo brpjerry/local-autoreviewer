@@ -80,7 +80,7 @@ def value_after(argv, flag):
 
 
 RATE_LIMITS = {"ordinaryUsageAllowed": True, "rateLimitsByLimitId": {"codex": {
-    "limitId": "codex", "primary": {"usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1794544713},
+    "limitId": "codex", "primary": {"usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1800003600},
     "secondary": None}}}
 
 
