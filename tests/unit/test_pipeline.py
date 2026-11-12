@@ -153,6 +153,15 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(status, "skipped")
         self.assertIn("OpenCode found a usage limit used up (provider.free-limit Free usage limit reached.",
                       job["reason"])
+        from local_autoreviewer import limits
+        for mode, said in (("barefreelimit", "(provider.free-limit)"),
+                           ("nocredit", "(provider.error Your credit balance is too low")):  # no other limit wording
+            with self.subTest(mode=mode):
+                limits._hits.clear()
+                status, job = run(mode)
+                self.assertEqual(status, "skipped")
+                self.assertIn(f"OpenCode found a usage limit used up {said}", job["reason"])
+                self.assertEqual(len(limits._hits), 1)
         self.assertIn("in the last 10 minutes", run("ok")[1]["reason"])  # remembered: the next doesn't start
         from local_autoreviewer import limits
         limits._hits.clear()  # ten minutes on

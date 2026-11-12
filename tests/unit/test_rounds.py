@@ -314,7 +314,8 @@ class RoundTests(EnvTestCase):
                 conn.close()
 
     def test_check_fallbacks(self):
-        for mode, note in (("dupratelimit", "the check hit a usage limit"), ("dupsleep", "the check timed out")):
+        for mode, note in (("dupratelimit", "the check hit a usage limit"), ("dupsleep", "the check timed out"),
+                           ("dupthrottle", "the check hit a usage limit")):  # a brief throttle: not remembered
             limits._hits.clear()
             with self.subTest(mode=mode), mock.patch.object(pipeline, "DUPLICATE_CHECK_TIMEOUT", 1):
                 self.github.posted.clear()
