@@ -156,7 +156,7 @@ def main():
         (share / "prompts").symlink_to(args.prompts.resolve())
         os.environ["LOCAL_AUTOREVIEWER_SHARE"] = str(share)
 
-    svc = pipeline.Services(
+    svc = pipeline.Services(  # with the limit check, as a replay spends the same plan as reviews
         config=cfg, state=state, github=ReplayGitHub(pr, head), git=Git(str(scratch / "remote"), ENV),
         runner=make_runner(), token_owner="",  # only used for posting, which a replay never does
         secrets=lambda: [token, *local_secrets(live_state)])

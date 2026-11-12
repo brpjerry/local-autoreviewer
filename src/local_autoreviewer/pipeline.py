@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, feedback, leakscan, review, suggestions
+from . import combine, db, events, feedback, leakscan, limits, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS, agent_type
@@ -45,6 +45,7 @@ class Services:
     token_owner: str
     secrets: object = list  # callable returning credentials to block in posted text
     clock: object = time.time
+    limits: object = limits.read  # (agent, now) -> its login's plan limits, or limits.Unavailable
 
     def connect(self):
         return db.connect(self.state / "state.sqlite3")
@@ -510,6 +511,24 @@ def _author_comments(svc, job, pr):
         return []
 
 
+def _check_limits(svc, job, agent):
+    """Skip the review when one of its plan's usage limits is nearly used up, so the operator keeps a reserve
+    (service.min_limit_left percent of each). Unknown limits don't stop it."""
+    reserve = svc.config.service.min_limit_left
+    if reserve <= 0:
+        return
+    now, model, label = svc.now(), svc.config.agents[job["agent"]].model, review.agent_label(job["agent"])
+    # No review runs, so none counts towards the daily cap; unless an earlier attempt of this job ran its agent.
+    uncounted = {} if job["scope_unit"] else {"started_at": None}
+    if limits.hit_recently(agent, model, now):
+        raise Outcome("skipped", f"{label} found a usage limit used up in the last {limits.FRESH // 60} minutes; "
+                                 "not reviewed", **uncounted)
+    low = limits.low(svc.limits(agent, now), model, reserve, now)
+    if low:
+        raise Outcome("skipped", f"{label}'s {limits.describe(low, now)}, under the {reserve}% kept for you "
+                                 "(min_limit_left); not reviewed", **uncounted)
+
+
 def _run(conn, svc, job, cancel):
     cfg = svc.config
     repo_cfg = cfg.repo(job["repo"])
@@ -523,6 +542,7 @@ def _run(conn, svc, job, cancel):
         Path(directory).mkdir(parents=True, exist_ok=True)
 
     pr = _check_pr(svc, job)
+    _check_limits(svc, job, agent)
     # Both agents' jobs for a PR start together; the lock also covers creating the mirror.
     with repo_lock(svc.git.mirror_path(svc.state, job["repo"])):
         mirror = svc.git.ensure_mirror(svc.state, job["repo"])
@@ -611,6 +631,11 @@ def _run(conn, svc, job, cancel):
     if run.timed_out:
         return _retry(conn, svc, job, f"timed out after {cfg.service.review_timeout}s")
     if result.error_kind == "rate_limit":
+        # A used-up limit is under any reserve: skip, as _check_limits would. A brief throttle is waited out.
+        if cfg.service.min_limit_left > 0 and limits.used_up(result.error):
+            limits.note_used_up(agent, cfg.agents[job["agent"]].model, svc.now())
+            raise Outcome("skipped", f"{review.agent_label(job['agent'])} found a usage limit used up "
+                                     f"({result.error[:300]}); not reviewed")
         return _retry(conn, svc, job, f"usage limit: {result.error}", delay=RATE_LIMIT_BACKOFF, count=False)
     if result.error_kind:
         return _retry(conn, svc, job, result.error or "agent failed")
@@ -790,6 +815,9 @@ def _check_duplicates(conn, svc, job, others, agent, cancel, *, title):
         if run.cancelled or run.timed_out or result.error_kind:
             why = ("it was cancelled" if run.cancelled else "it timed out" if run.timed_out
                    else "it hit a usage limit" if result.error_kind == "rate_limit" else "it failed")
+            if result.error_kind == "rate_limit" and not run.cancelled and svc.config.service.min_limit_left > 0 \
+                    and limits.used_up(result.error):
+                limits.note_used_up(agent, svc.config.agents[job["agent"]].model, svc.now())
             if run.cancelled:  # the job's cancel: a new push, `cancel` or a stop; the job's outcome says which
                 log.info("job %s: duplicate check: it was cancelled", job["id"])
             else:

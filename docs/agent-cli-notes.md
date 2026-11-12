@@ -63,6 +63,16 @@ Verified on 2026-11-11 against **opencode 2.2.7**, with `opencode/deepseek-v4.1-
 | Kill tree | `systemctl --user stop <scope>` kills every process in it, including a `setsid` child. |
 | Slice naming | Dashes nest slices: `foo-bar.slice` lives under `foo.slice`. Hence `autoreviewer.slice`. |
 
+## Plan usage limits
+
+Read on 2026-11-11 with the logins reviews use, as the operator's usage bar reads them. Nothing here starts a session or runs a model.
+
+| Agent | Source | Reply |
+| --- | --- | --- |
+| Claude | `GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer <claudeAiOauth.accessToken>` from `~/.claude/.credentials.json`, `anthropic-beta: oauth-2025-04-20`. Not a public API: it is what `/usage` shows. Rate limited (`429` with `Retry-After`). | A `limits` list: `{kind: session \| weekly_all \| weekly_scoped, percent, resets_at (ISO 8601), scope: null or {model: {display_name}}}`, and the same windows as `five_hour`/`seven_day` `{utilization, resets_at}`. Seen: a session, a weekly and a one-model weekly limit. |
+| Codex (0.166.0) | `codex app-server --listen stdio://`: `initialize`, then `account/rateLimits/read` (JSON-RPC lines). | `rateLimitsByLimitId.codex` (and `rateLimits`): `primary`/`secondary` `{usedPercent, windowDurationMins, resetsAt (epoch s)}`, `normalModelSlug`, `ordinaryUsageAllowed`. Some plans have only a weekly window (10080 min), as `primary`. |
+| OpenCode (2.2.7) | `opencode api --standalone get /api/experimental/usage/limits` | Without an OpenCode Go sign-in, `{"data": null}`. With one, as the usage bar reads it, `data.go.{rolling,weekly,monthly}` `{percent, limited, status, resetsAt (epoch ms)}` and `data.budgets` `{limitDollars, spentDollars}`; not seen here. |
+
 ## Duplicate check
 
 Before the reviews of a commit are posted as one, the agent whose review finished last runs once more to find the items both reviews share. It is the same invocation as a review, with the same locked flags (and for opencode the same config), in the same checkout and context directory. Only the prompt (`prompts/duplicates.md`, with the items inline) and the output schema (`prompts/duplicates.schema.json`) differ, and the output goes to `out/duplicates/`. The schema follows the same rules as the review schema: every object has `additionalProperties: false` and lists all its properties in `required`, which Codex's `--output-schema` needs.
@@ -73,4 +83,4 @@ A small review took about 25 s with Claude Haiku and about 28 s with Codex at lo
 
 ## Not yet verified
 
-- The exact shape of usage-limit errors from each CLI. Parsing is defensive: `api_error_status == 429` or usage-limit wording becomes a 30-minute deferral.
+- The exact shape of usage-limit errors from each CLI. Parsing is defensive: `api_error_status == 429` or usage-limit wording counts as a usage limit. Wording that says the plan is used up ("usage limit", "limit reached", "quota", "free limit") skips the review; anything else, such as "rate limit exceeded", is deferred for 30 minutes. Seen: OpenCode's free tier answers `provider.free-limit` "Free usage limit reached".

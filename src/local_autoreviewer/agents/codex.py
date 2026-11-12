@@ -3,10 +3,13 @@
 
 import json
 import os
+import selectors
 import subprocess
+import time
 from pathlib import Path
 
 from .. import review
+from ..limits import Limit, Unavailable, number
 from ..runner import Invocation
 from .base import AgentResult, agent_env, classify_error, missing_flags, operator_env, tail
 
@@ -39,6 +42,98 @@ def _latest_comments(text, limit):
         dropped += 1
         shown = json.dumps(comments, ensure_ascii=False, indent=2)
     return shown, f"\n(the {dropped} oldest comments left out: size limit)" if dropped else ""
+
+
+def _window_name(minutes):
+    return {300: "5-hour", 10080: "weekly"}.get(minutes) or (f"{minutes // 60}-hour" if minutes else "plan")
+
+
+def codex_limits(reply):
+    """The limits in an account/rateLimits/read reply: the codex bucket's windows, and those of another bucket
+    tied to one model (normalModelSlug), which count only for a reviewer running that model."""
+    main = reply.get("rateLimits") if isinstance(reply.get("rateLimits"), dict) else None
+    main_ids = {"codex", str((main or {}).get("limitId") or "codex")}
+    buckets = {key: raw for key, raw in (reply.get("rateLimitsByLimitId") or {}).items() if isinstance(raw, dict)} \
+        if isinstance(reply.get("rateLimitsByLimitId"), dict) else {}
+    if main is not None and not main_ids & set(buckets):
+        buckets[str(main.get("limitId") or "codex")] = main
+    found = []
+    for key, bucket in buckets.items():
+        model = "" if key in main_ids else str(bucket.get("normalModelSlug") or "")
+        if key not in main_ids and not model:
+            continue  # another product's quota, not the reviews'
+        for slot in ("primary", "secondary"):
+            window = bucket.get(slot)
+            if isinstance(window, dict) and number(window.get("usedPercent")):
+                minutes = int(window["windowDurationMins"]) if number(window.get("windowDurationMins")) else 0
+                name = _window_name(minutes) + (f" ({model})" if model else "")
+                resets = int(window["resetsAt"]) if number(window.get("resetsAt")) else 0
+                found.append(Limit(name, float(window["usedPercent"]), resets, model))
+    if reply.get("ordinaryUsageAllowed") is False:  # blocked, whatever the windows say
+        found.append(Limit("plan", 100.0))
+    return found
+
+
+def app_server_call(command, env, cwd, method, timeout=30):
+    """One request to a short-lived `codex app-server` over stdio, as the operator's usage bar makes it: no thread,
+    no inference. Raises Unavailable with a message that never holds the reply."""
+    try:
+        proc = subprocess.Popen([command, "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cwd)
+    except OSError as exc:
+        raise Unavailable(f"can't start codex app-server: {type(exc).__name__}") from None
+    deadline, pending = time.monotonic() + timeout, bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+
+            def send(message):
+                proc.stdin.write((json.dumps(message) + "\n").encode())
+                proc.stdin.flush()
+
+            def receive(request_id):
+                while True:
+                    while b"\n" in pending:
+                        line, _, rest = pending.partition(b"\n")
+                        pending[:] = rest
+                        try:
+                            message = json.loads(line)
+                        except ValueError:
+                            raise Unavailable("codex app-server sent something that isn't JSON") from None
+                        if isinstance(message, dict) and message.get("id") == request_id:
+                            if "result" not in message:
+                                raise Unavailable(f"codex app-server refused {method}")
+                            return message["result"]
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise Unavailable("codex app-server timed out")
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise Unavailable("codex app-server exited early")
+                    pending.extend(chunk)
+                    if len(pending) > 4 * 1024 * 1024:
+                        raise Unavailable("codex app-server's reply is too large")
+
+            send({"id": 1, "method": "initialize", "params": {"clientInfo": {
+                "name": "local_autoreviewer", "title": "local-autoreviewer", "version": "1"}}})
+            receive(1)
+            send({"method": "initialized"})
+            send({"id": 2, "method": method})
+            return receive(2)
+    except OSError as exc:
+        raise Unavailable(f"codex app-server: {type(exc).__name__}") from None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout):
+            try:  # closing stdin flushes what a failed send left in its buffer, into a pipe that is gone
+                stream.close()
+            except OSError:
+                pass
 
 
 class CodexAgent:
@@ -171,6 +266,17 @@ class CodexAgent:
                               capture_output=True, text=True, timeout=timeout)
         answer = out.read_text() if out.is_file() else (proc.stderr or proc.stdout)
         return proc.returncode, answer
+
+    def limits_key(self):
+        return f"codex:{self.home}"
+
+    def read_limits(self):
+        """The plan's limits, from the reviews' own login."""
+        reply = app_server_call(self.cfg.command, self.ensure_home(), self.home, "account/rateLimits/read")
+        limits = codex_limits(reply if isinstance(reply, dict) else {})
+        if not limits:
+            raise Unavailable("codex reported no limits")
+        return limits
 
     def doctor(self):
         try:

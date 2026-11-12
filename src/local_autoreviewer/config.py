@@ -85,6 +85,7 @@ class ServiceConfig:
     retain_jobs: int = 14 * 86400
     max_attempts: int = 3
     combine_wait: int = 30 * 60  # how long a finished review waits for a queued review of its commit (see pipeline.due)
+    min_limit_left: int = 10  # percent of each plan usage limit reviews leave you; 0: don't check
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,7 @@ class Config:
 
 
 _SERVICE_KEYS = {"paused", "review_timeout", "settle", "max_reviews_per_day", "bootstrap", "retain_jobs", "max_attempts",
-                 "combine_wait"}
+                 "combine_wait", "min_limit_left"}
 _REPO_KEYS = {"agents", "authors", "project_docs", "max_changed_files", "max_diff_bytes", "diff_exclude", "test_paths",
               "post", "extra_instructions"}
 _AGENT_KEYS = {"command", "model", "effort", "memory_max", "tasks_max", "mode"}
@@ -196,7 +197,10 @@ def parse(data, path=None):
         retain_jobs=parse_duration(service_table.get("retain_jobs", "14d"), "service.retain_jobs"),
         max_attempts=_typed(service_table.get("max_attempts", 3), int, "service.max_attempts"),
         combine_wait=parse_duration(service_table.get("combine_wait", "30m"), "service.combine_wait"),
+        min_limit_left=_typed(service_table.get("min_limit_left", 10), int, "service.min_limit_left"),
     )
+    if not 0 <= service.min_limit_left <= 100:
+        raise ConfigError("service.min_limit_left: expected a percentage from 0 to 100")
     if service.bootstrap not in ("baseline", "review"):
         raise ConfigError("service.bootstrap: expected 'baseline' or 'review'")
 

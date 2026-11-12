@@ -149,8 +149,25 @@ class PipelineTests(EnvTestCase):
                 status, job = run(mode)
                 self.assertEqual(status, "queued")  # retried
                 self.assertIn(reason, job["reason"])
-        status, job = run("ratelimit")
-        self.assertEqual((status, job["attempts"]), ("queued", 0))  # a usage limit uses no attempt
+        status, job = run("freelimit")  # the free tier used up: skipped
+        self.assertEqual(status, "skipped")
+        self.assertIn("OpenCode found a usage limit used up (provider.free-limit Free usage limit reached.",
+                      job["reason"])
+        from local_autoreviewer import limits
+        for mode, said in (("barefreelimit", "(provider.free-limit)"),
+                           ("nocredit", "(provider.error Your credit balance is too low")):  # no other limit wording
+            with self.subTest(mode=mode):
+                limits._hits.clear()
+                status, job = run(mode)
+                self.assertEqual(status, "skipped")
+                self.assertIn(f"OpenCode found a usage limit used up {said}", job["reason"])
+                self.assertEqual(len(limits._hits), 1)
+        self.assertIn("in the last 10 minutes", run("ok")[1]["reason"])  # remembered: the next doesn't start
+        from local_autoreviewer import limits
+        limits._hits.clear()  # ten minutes on
+        status, job = run("ratelimit")  # a brief throttle: waited out, as before, without using an attempt
+        self.assertEqual((status, job["attempts"]), ("queued", 0))
+        self.assertIn("retry: usage limit: provider.rate-limit Rate limit exceeded", job["reason"])
 
     def test_codex_and_opencode_reviews_are_posted_as_one(self):
         svc, ids = self.queue(agents=("codex", "opencode"))
@@ -170,6 +187,65 @@ class PipelineTests(EnvTestCase):
         record = json.loads(Path(pipeline.job_paths(self.state, ids[1]).out, "round.json").read_text())
         self.assertEqual(record["unchecked"], "the check failed")
         self.assertIn("weren't checked for duplicates (the check failed)", self.github.posted[0]["body"])
+
+    def test_a_review_is_skipped_when_its_plan_is_nearly_used_up(self):
+        """Nothing runs or posts for it, and the other reviewer's review of the commit posts without it."""
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit
+        svc, ids = self.queue(agents=("codex", "opencode"))
+        codex = make_agent(svc.config.agents["codex"], self.state)
+        self.plan_limits[codex.limits_key()] = [Limit("weekly", 92.0, self.clock() + 3600)]
+        self.assertEqual(pipeline.run_job(svc, ids[0], pipeline.CancelToken()), "skipped")
+        reason = self.job(svc, ids[0])["reason"]
+        self.assertIn("Codex's weekly limit 8% left, resets ", reason)
+        self.assertIn("under the 10% kept for you (min_limit_left); not reviewed", reason)
+        self.assertEqual(self.agent_log("codex"), [])
+        self.assertFalse(Path(pipeline.job_paths(self.state, ids[0]).worktree).exists())  # stopped before checkout
+        self.assertEqual(pipeline.run_job(svc, ids[1], pipeline.CancelToken()), "posted")  # not waiting for Codex
+        (posted,) = self.github.posted
+        self.assertIn("Automated review · OpenCode (opus)\n", posted["body"])
+        # No review ran, so it doesn't count towards the daily cap.
+        self.assertIsNone(self.job(svc, ids[0])["started_at"])
+        conn = svc.connect()
+        self.assertEqual(db.started_since(conn, "codex", 0), 0)
+        conn.close()
+
+    def test_a_skipped_retry_whose_agent_ran_before_still_counts(self):
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit
+        svc, (job_id,) = self.queue(agents=("codex",))
+        conn = svc.connect()
+        with db.transaction(conn):  # an earlier attempt ran the agent, then failed and was queued again
+            db.update_job(conn, job_id, scope_unit="local-autoreviewer-job-1")
+        conn.close()
+        self.plan_limits[make_agent(svc.config.agents["codex"], self.state).limits_key()] = [
+            Limit("weekly", 95.0, self.clock() + 3600)]
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(self.job(svc, job_id)["started_at"], self.clock())
+
+    def test_what_doesnt_stop_a_review(self):
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit, Unavailable
+        later = self.clock() + 3600
+        cases = [("a reset since", [Limit("weekly", 99.0, self.clock() - 1)], None),
+                 ("another model's limit", [Limit("weekly (gpt-x)", 99.0, later, "gpt-x")], None),
+                 ("unknown limits", Unavailable("HTTP 429"), None),
+                 ("no reserve", [Limit("weekly", 99.0, later)], {"min_limit_left": 0}),
+                 ("enough left", [Limit("weekly", 85.0, later)], None)]
+        for rerun, (why, reading, service) in enumerate(cases):
+            with self.subTest(why=why):
+                svc = self.services(make_config(self.tmp, service=service))
+                self.plan_limits[make_agent(svc.config.agents["codex"], self.state).limits_key()] = reading
+                conn = svc.connect()
+                with db.transaction(conn):
+                    conn.execute("UPDATE jobs SET status='superseded'")
+                    job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main",
+                                           agent="codex", model="m", source="poll", not_before=0, now=self.clock(),
+                                           post=False, rerun=rerun)
+                    db.update_job(conn, job_id, status="running", started_at=self.clock())
+                conn.close()
+                self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+                self.assertIn("review saved to", self.job(svc, job_id)["reason"])  # a trial ran to its end
 
     def test_head_moved_before_post_is_not_posted(self):
         svc, (job_id,) = self.queue()
@@ -241,10 +317,60 @@ class PipelineTests(EnvTestCase):
         svc.secrets = lambda: ["Division by zero is unhandled"]  # pretend the finding text is a secret
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "blocked")
 
-    def test_rate_limit_defers_without_using_an_attempt(self):
-        cfg = make_config(self.tmp, claude="ratelimit")
+    def test_a_usage_limit_skips_the_review_and_the_agents_next_ones(self):
+        """A used-up limit is under any reserve: skipped like one the check found, and the plan counts as used up
+        until its next reading, so the agent's next reviews don't start."""
+        from local_autoreviewer import limits
+        from local_autoreviewer.agents import make_agent
+        svc, (job_id,) = self.queue(make_config(self.tmp, claude="ratelimit"))
+        svc.limits = limits.read  # the real cache, primed so nothing is read from the plan
+        claude = make_agent(svc.config.agents["claude"], self.state)
+        limits._readings[claude.limits_key()] = (self.clock(), [])
+        with self.assertLogs("local_autoreviewer.limits", "INFO") as logs:
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertIn("Claude Code found a usage limit used up (success: Claude usage limit reached); not reviewed",
+                      self.job(svc, job_id)["reason"])
+        self.assertIn("on opus found a usage limit used up; its next reviews are skipped for 10 minutes",
+                      logs.output[0])
+        self.assertEqual(len(self.agent_log("claude")), 1)
+        head = self.remote.push_pr(1, {"src/calc.py": HOSTILE_FILES["src/calc.py"] + "# v3\n"})
+        self.github.set_pr(1, head)
+        conn = svc.connect()
+        with db.transaction(conn):
+            later = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref="main", agent="claude",
+                                  model="opus", source="poll", not_before=0, now=self.clock(), post=True)
+            db.update_job(conn, later, status="running", started_at=self.clock())
+        conn.close()
+        self.assertEqual(pipeline.run_job(svc, later, pipeline.CancelToken()), "skipped")
+        self.assertIn("Claude Code found a usage limit used up in the last 10 minutes; not reviewed",
+                      self.job(svc, later)["reason"])
+        self.assertIsNone(self.job(svc, later)["started_at"])  # it didn't start, so it isn't counted
+        self.assertEqual(len(self.agent_log("claude")), 1)  # it didn't start
+        self.assertEqual(limits._readings[claude.limits_key()][1], [])  # the login's reading stands
+
+    def test_a_used_up_limit_is_remembered_for_its_model_only_and_for_a_while(self):
+        """Another model on the same login may have a quota of its own: its reviews still run."""
+        from local_autoreviewer import limits
+        from local_autoreviewer.agents import make_agent
+        cfg = make_config(self.tmp, agents=("claude", "claude-sonnet"), further={"claude-sonnet": {"model": "sonnet"}})
+        svc = self.services(cfg)
+        claude = make_agent(svc.config.agents["claude"], self.state)
+        limits.note_used_up(claude, "opus", self.clock())
+        self.assertTrue(limits.hit_recently(claude, "opus", self.clock() + limits.FRESH - 1))
+        self.assertFalse(limits.hit_recently(claude, "sonnet", self.clock()))
+        self.assertFalse(limits.hit_recently(claude, "", self.clock()))  # the default model is another model
+        self.assertFalse(limits.hit_recently(claude, "opus", self.clock() + limits.FRESH))  # tried again later
+        svc, (sonnet_job,) = self.queue(cfg, agents=("claude-sonnet",))
+        self.assertEqual(pipeline.run_job(svc, sonnet_job, pipeline.CancelToken()), "posted")
+        self.assertEqual(len(self.agent_log("claude")), 1)  # claude-sonnet runs the claude fake
+
+    def test_without_a_reserve_a_usage_limit_defers_without_using_an_attempt(self):
+        from local_autoreviewer import limits
+        cfg = make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0})
         svc, (job_id,) = self.queue(cfg)
-        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+        with mock.patch.object(limits, "note_used_up") as noted:
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+        self.assertFalse(noted.called)
         job = self.job(svc, job_id)
         self.assertEqual(job["attempts"], 0)
         self.assertEqual(job["not_before"], self.clock() + pipeline.RATE_LIMIT_BACKOFF)
@@ -305,9 +431,16 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(self.job(svc, job_id)["attempts"], 1)
 
     def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
-        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"))
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0}))
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertIn("usage limit", self.job(svc, job_id)["reason"])
+
+    def test_a_foreground_review_that_hits_a_usage_limit_is_skipped(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        self.poll_saw(svc, self.head)
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "skipped")
+        self.assertEqual(self.poll_jobs(svc), 0)  # skipped, as the service would skip it
 
     def test_foreground_review_of_a_draft_runs(self):
         self.github.set_pr(1, self.head, draft=True)
@@ -621,7 +754,8 @@ class PipelineTests(EnvTestCase):
 
     def test_a_usage_limit_cancel_hands_the_head_back(self):
         self.seen_by_poller(self.head)
-        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0}),
+                                         post=True)
         self.poll_saw(svc, self.head)
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertEqual(self.poll_jobs(svc), 1)

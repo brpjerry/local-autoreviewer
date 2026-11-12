@@ -13,10 +13,12 @@ import subprocess
 from pathlib import Path
 
 from .. import review
+from ..limits import Limit, Unavailable, number
 from ..runner import Invocation
 from .base import AgentResult, agent_env, classify_error, missing_flags, tail
 
 AGENT = "review"  # the agent the locked config defines; --agent selects it
+USAGE_PATH = "/api/experimental/usage/limits"  # the server's OpenCode Go usage, as the operator's usage bar reads it
 TOOLS = ("read", "grep", "glob")
 REQUIRED_FLAGS = ("--standalone", "--agent", "--format", "--model", "--session")
 # opencode's own switches: no project config (opencode.json, .opencode/, AGENTS.md and the instruction files
@@ -158,6 +160,33 @@ def extract_json(text):
     return value
 
 
+GO_MODELS = "opencode-go/"  # the provider of OpenCode Go's models: the usage reply's limits are theirs only
+
+
+def opencode_limits(reply):
+    """The limits in a usage reply, the OpenCode Go usage the server reads: Go's rolling, weekly and monthly
+    meters and any budgets. They count only for reviewers on Go models: a free model spends none of them.
+    Without a Go sign-in the reply's data is null, so there are none."""
+    data = reply.get("data") if isinstance(reply.get("data"), dict) else None
+    go = (data or {}).get("go")
+    found = []
+    for key in ("rolling", "weekly", "monthly") if isinstance(go, dict) else ():
+        meter = go.get(key)
+        if isinstance(meter, dict) and number(meter.get("percent")):
+            limited = meter.get("limited") is True or meter.get("status") == "rate-limited"
+            resets = int(meter["resetsAt"] / 1000) if number(meter.get("resetsAt")) and meter["resetsAt"] > 0 else 0
+            found.append(Limit(f"Go {key}", 100.0 if limited else float(meter["percent"]), resets, GO_MODELS))
+    budgets = (data or {}).get("budgets")
+    for budget in budgets if isinstance(budgets, list) else ():
+        if isinstance(budget, dict) and number(budget.get("limitDollars")) and budget["limitDollars"] > 0 \
+                and number(budget.get("spentDollars")):
+            resets = int(budget["resetsAt"] / 1000) if number(budget.get("resetsAt")) and budget["resetsAt"] > 0 \
+                else 0
+            name = " ".join(filter(None, ("Go", str(budget.get("per") or ""), "budget")))
+            found.append(Limit(name, 100.0 * budget["spentDollars"] / budget["limitDollars"], resets, GO_MODELS))
+    return found
+
+
 def _usage(events):
     totals, cost, steps = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}, 0.0, 0
     for event in events:
@@ -291,6 +320,24 @@ class OpenCodeAgent:
             return proc.returncode or 1, "; ".join(errors) or proc.stderr.strip() or proc.stdout.strip() \
                 or f"exit {proc.returncode}"
         return 0, final_text(events)
+
+    def limits_key(self):
+        return f"opencode:{self.home}"
+
+    def read_limits(self):
+        """The plan's limits, from the server a private `opencode api` call starts in the reviews' home."""
+        try:
+            proc = subprocess.run([self.cfg.command, "api", "--standalone", "get", USAGE_PATH], capture_output=True,
+                                  text=True, timeout=60, env=self.tool_env(), cwd=self.home)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Unavailable(f"opencode api: {type(exc).__name__}") from None
+        if proc.returncode != 0:
+            raise Unavailable(f"opencode api exited {proc.returncode}")
+        try:
+            reply = json.loads(proc.stdout)
+        except ValueError:
+            raise Unavailable("opencode api's reply isn't JSON") from None
+        return opencode_limits(reply if isinstance(reply, dict) else {})
 
     def login_argv(self, integration=None):
         return [self.cfg.command, "auth", "login", "--standalone", integration or "opencode-go"]

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Claude Code adapter: headless, no command execution, file tools confined to the job."""
 
+import http.client
 import json
 import subprocess
+import time
+import urllib.error
+import urllib.request
 import uuid
+from pathlib import Path
 
 from .. import review
+from ..limits import Limit, Unavailable, epoch, number
 from ..runner import Invocation
 from .base import AgentResult, agent_env, classify_error, missing_flags, operator_env, tail
 
@@ -19,6 +25,32 @@ QUIET_ENV = {
     "DISABLE_UPDATES": "1",
     "DISABLE_INSTALLATION_CHECKS": "1",
 }
+
+
+# The endpoint behind Claude Code's /usage: the plan's 5-hour and weekly windows, and weekly limits on one model.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+_WINDOW_NAMES = {"session": "5-hour", "weekly_all": "weekly", "five_hour": "5-hour", "seven_day": "weekly"}
+
+
+def claude_limits(usage):
+    """The limits in a usage reply: its `limits` list, else its five_hour and seven_day windows."""
+    found, items = [], usage.get("limits")
+    for item in items if isinstance(items, list) else ():
+        if not isinstance(item, dict) or not number(item.get("percent")):
+            continue
+        scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
+        on_model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        model = str(on_model.get("display_name") or "")
+        name = _WINDOW_NAMES.get(item.get("kind"), str(item.get("group") or item.get("kind") or "plan"))
+        found.append(Limit(f"{name} ({model})" if model else name, float(item["percent"]),
+                           epoch(item.get("resets_at")), model))
+    if found:
+        return found
+    for key in ("five_hour", "seven_day"):
+        raw = usage.get(key)
+        if isinstance(raw, dict) and number(raw.get("utilization")):
+            found.append(Limit(_WINDOW_NAMES[key], float(raw["utilization"]), epoch(raw.get("resets_at"))))
+    return found
 
 
 class ClaudeAgent:
@@ -92,6 +124,34 @@ class ClaudeAgent:
         proc = subprocess.run(argv, cwd=paths.worktree, env=agent_env(QUIET_ENV), input=question,
                               capture_output=True, text=True, timeout=timeout)
         return proc.returncode, proc.stdout or proc.stderr
+
+    def limits_key(self):
+        return "claude"
+
+    def read_limits(self):
+        """The plan's limits, read with the login reviews use. Its access token is never refreshed here: that
+        would rotate the refresh token out from under Claude Code. An expired one waits for Claude's next run."""
+        try:
+            oauth = json.loads((Path.home() / ".claude/.credentials.json").read_text())["claudeAiOauth"]
+            token, expires = oauth["accessToken"], oauth["expiresAt"] / 1000
+        except (OSError, ValueError, KeyError, TypeError):
+            raise Unavailable("no Claude login to read them with") from None
+        if not token or expires <= time.time():
+            raise Unavailable("Claude's access token has expired; Claude renews it on its next run") from None
+        request = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json",
+            "User-Agent": "local-autoreviewer"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                usage = json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise Unavailable(f"the usage endpoint answered HTTP {exc.code}") from None
+        except (OSError, ValueError, http.client.HTTPException) as exc:  # IncompleteRead is an HTTPException
+            raise Unavailable(f"the usage endpoint failed: {type(exc).__name__}") from None
+        limits = claude_limits(usage if isinstance(usage, dict) else {})
+        if not limits:
+            raise Unavailable("the usage endpoint reported no limits")
+        return limits
 
     def doctor(self):
         try:

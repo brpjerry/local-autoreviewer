@@ -415,6 +415,8 @@ class ParseTests(unittest.TestCase):
     def test_classify(self):
         self.assertEqual(classify_error("You've hit your usage limit"), "rate_limit")
         self.assertEqual(classify_error("HTTP 429 Too Many Requests"), "rate_limit")
+        self.assertEqual(classify_error("Your credit balance is too low to access the Anthropic API"), "rate_limit")
+        self.assertEqual(classify_error("provider.free-limit"), "rate_limit")
         self.assertEqual(classify_error("segfault"), "error")
 
 

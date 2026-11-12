@@ -79,11 +79,37 @@ def value_after(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
 
+RATE_LIMITS = {"ordinaryUsageAllowed": True, "rateLimitsByLimitId": {"codex": {
+    "limitId": "codex", "primary": {"usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1800003600},
+    "secondary": None}}}
+
+
+def app_server(mode):
+    """`codex app-server --listen stdio://`: JSON-RPC lines, as the usage reading uses them."""
+    for line in sys.stdin:
+        message = json.loads(line)
+        if mode == "appserver_hang":
+            continue
+        if mode == "appserver_noise":
+            print("not json", flush=True)
+        if message.get("method") == "initialize":
+            print(json.dumps({"method": "note"}), flush=True)  # a notification first, as the server may send
+            print(json.dumps({"id": message["id"], "result": {"userAgent": "fake"}}), flush=True)
+        elif message.get("method") == "account/rateLimits/read":
+            if mode == "appserver_error":
+                print(json.dumps({"id": message["id"], "error": {"message": "not signed in"}}), flush=True)
+            else:
+                print(json.dumps({"id": message["id"], "result": RATE_LIMITS}), flush=True)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     sep = args.index("--")
     opts, argv = args[:sep], args[sep + 1:]
     mode, log = value_after(opts, "--mode"), value_after(opts, "--log")
+    if argv[:1] == ["app-server"]:
+        return app_server(mode)
     prompt = sys.stdin.read()
     with open(log, "a") as handle:
         handle.write(json.dumps({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd(),
@@ -100,7 +126,7 @@ def main():
             print("boom: duplicate check crashed", file=sys.stderr)
             return 3
         review = {} if mode == "dupempty" else duplicates(prompt)
-        mode = {"dupsleep": "sleep", "dupratelimit": "ratelimit"}.get(mode, "ok")
+        mode = {"dupsleep": "sleep", "dupratelimit": "ratelimit", "dupthrottle": "throttle"}.get(mode, "ok")
     if mode == "sleep":
         time.sleep(60)
     if mode == "fail":
@@ -118,9 +144,15 @@ def main():
     if opencode:  # `opencode run --format json` events; the review is the final message's text
         session = value_after(argv, "--session") or "ses_fake123"
         print(json.dumps({"type": "step_start", "sessionID": session, "part": {"type": "step-start"}}))
-        if mode == "ratelimit":
-            print(json.dumps({"type": "error", "sessionID": session,
-                              "error": {"type": "provider.rate-limit", "message": "Rate limit exceeded"}}))
+        errors = {"ratelimit": {"type": "provider.rate-limit", "message": "Rate limit exceeded"},  # a brief throttle
+                  "freelimit": {"type": "provider.free-limit", "message": "Free usage limit reached. Connect a "
+                                "provider or subscribe to OpenCode Go to keep going."},  # a free tier used up
+                  "barefreelimit": {"type": "provider.free-limit"},
+                  "nocredit": {"type": "provider.error",
+                               "message": "Your credit balance is too low to access the Anthropic API"}}
+        if mode in errors:
+            error = errors[mode]
+            print(json.dumps({"type": "error", "sessionID": session, "error": error}))
             return 1
         text = json.dumps(review)
         if mode == "prose":  # some models wrap the object in a sentence and a code fence
@@ -135,6 +167,9 @@ def main():
         print(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
         if mode == "ratelimit":
             print(json.dumps({"type": "error", "message": "You've hit your usage limit. Try again later."}))
+            return 1
+        if mode == "throttle":  # brief: too many requests at once
+            print(json.dumps({"type": "error", "message": "Too many requests (429); slow down."}))
             return 1
         with open(value_after(argv, "-o"), "w") as handle:
             json.dump(review, handle)

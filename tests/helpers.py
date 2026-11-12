@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["LOCAL_AUTOREVIEWER_SHARE"] = str(ROOT)
 
-from local_autoreviewer import config as config_mod, pipeline  # noqa: E402
+from local_autoreviewer import config as config_mod, limits, pipeline  # noqa: E402
 from local_autoreviewer.github import MARKER_PREFIX, GitHubError  # noqa: E402
 from local_autoreviewer.gitops import Git  # noqa: E402
 from local_autoreviewer.runner import DirectRunner  # noqa: E402
@@ -239,6 +239,10 @@ class EnvTestCase(unittest.TestCase):
         self.state = self.tmp / "state"
         self.state.mkdir()
         self.cfg = make_config(self.tmp)
+        self.plan_limits = {}  # limits_key -> [limits.Limit] or limits.Unavailable: what the plans report
+        for remembered in (limits._readings, limits._hits):  # what earlier tests' reviews left, such as a used-up limit
+            remembered.clear()
+            self.addCleanup(remembered.clear)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -247,7 +251,8 @@ class EnvTestCase(unittest.TestCase):
         return pipeline.Services(
             config=cfg or self.cfg, state=self.state, github=self.github,
             git=Git(str(self.remote.base), self.github.env()), runner=DirectRunner(), token_owner=OWNER,
-            secrets=lambda: list(secrets), clock=self.clock)
+            secrets=lambda: list(secrets), clock=self.clock,
+            limits=lambda agent, now: self.plan_limits.get(agent.limits_key(), []))  # offline: never the real ones
 
     def agent_log(self, name):
         import json

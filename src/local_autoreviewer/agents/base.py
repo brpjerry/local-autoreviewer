@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 # SSH_AUTH_SOCK, and anything else the operator's shell or other agent tooling exported.
 ENV_ALLOWLIST = ("HOME", "PATH", "LANG", "LC_ALL", "USER", "LOGNAME", "XDG_RUNTIME_DIR",
                  "DBUS_SESSION_BUS_ADDRESS", "TZ")
+# Every usage-limit error: a used-up plan (see limits.used_up) and a brief throttle alike.
 _RATE_LIMIT_RE = re.compile(r"usage limit|rate.?limit|too many requests|\b429\b|quota|limit reached|"
-                            r"out of (?:credits|usage)", re.IGNORECASE)
+                            r"out of (?:credits|usage)|free.?limit|credit balance", re.IGNORECASE)
 
 
 @dataclass
