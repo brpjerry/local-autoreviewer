@@ -1,6 +1,6 @@
 # Agent CLI notes
 
-These notes record what the code relies on in the agent CLIs, as verified on 2026-10-30 against **claude-code 2.1.296**, **openai-codex 0.163.0**, systemd 262 and gh 2.102.1. Re-check them whenever you change flags or bump the tested versions. `local-autoreviewer doctor` checks that the installed CLIs at least advertise every flag used.
+These notes record what the code relies on in the agent CLIs, as verified on 2026-10-30 against **claude-code 2.1.296**, **openai-codex 0.163.0**, systemd 262 and gh 2.102.1, and on 2026-11-11 against **opencode 2.2.7**. Re-check them whenever you change flags or bump the tested versions. `local-autoreviewer doctor` checks that the installed CLIs at least advertise every flag used.
 
 Method: a throwaway repo with planted root and nested `CLAUDE.md` files, an `AGENTS.md`, a `.claude/settings.json` hook that touches a marker file, and a canary file outside the checkout. Every agent ran with an allowlisted environment (`env -i`). `tests/integration/test_real_agents.py` repeats the essentials through the real pipeline.
 
@@ -33,6 +33,27 @@ Method: a throwaway repo with planted root and nested `CLAUDE.md` files, an `AGE
 | `--disable shell_tool --disable unified_exec` | Codex then **cannot read any file**. Hence `mode = "inline"` puts the diff and changed files in the prompt. |
 | `codex sandbox` under `NoNewPrivileges` | Works; Codex's bubblewrap sandbox sets no_new_privs itself. |
 
+## OpenCode: `opencode run --standalone --agent review --format json`
+
+Verified on 2026-11-11 against **opencode 2.2.7**, with `opencode/deepseek-v4.1-flash-free` and a home of its own (`HOME` and the XDG directories under the state directory). A trap repo held `AGENTS.md`, `CLAUDE.md`, an `opencode.json` granting every permission and naming an instruction file, a `.opencode/agents/review.md` redefining the agent, and skills in `.opencode/skills/`, `.agents/skills/`, the home's `~/.agents/skills/` and its config directory. A canary sat outside the checkout.
+
+| Check | Result |
+| --- | --- |
+| Auth | Free models (`opencode/*-free`) run with no login. OpenCode Go is the `opencode-go` integration, logged in with an API key (method `key`; `opencode auth login --standalone opencode-go` asks for it and needs a terminal). Logins live in the home's SQLite database: `credential.value` is JSON, `{"type": "key", "key"}` or `{"type": "oauth", "access", "refresh", "expires"}` (the binary's `Credential.Value`). |
+| Models | `opencode models --standalone` prints one bare `provider/model` per line, only those available: without a login, the 12 free ones; `opencode-go/glm-5` was then refused as unavailable. |
+| Background service | Plain `opencode run` connects to, or starts, a background server under `HOME`. `--standalone`, a global flag every subcommand takes, runs a private server for the one command instead. |
+| Concurrency | Two `opencode run --standalone` in one home at once both finished, their runs overlapping. |
+| Resume | `opencode --standalone --session <id>` starts the TUI (it ran until stopped; not tried on a real terminal). The top-level command has no `--agent` (with it, it prints its help and exits 1), so the locked config's `default_agent` selects the review agent. `opencode run --session <id>` continues a session with its context. |
+| Output | `--format json` prints one event per line: `step_start`, `text` (`part.text`), `tool_use`, `step_finish` (`part.reason`: `tool-calls`, `stop`, `length`; `part.tokens`, `part.cost`), and `error` (`error.type`, `error.message`; exit 1). Every event carries `sessionID`. A prompt on stdin works. |
+| Output schema | **No flag.** The schema goes in the prompt; the review is the JSON object in the final message, which the adapter checks against the schema itself. DeepSeek V4.1 Flash answered three full reviews in the schema; a follow-up and the duplicate check weren't tried against the real CLI (the free tier's limit stopped the duplicate check). |
+| Config sources | `opencode debug config` lists them. With `OPENCODE_CONFIG_DIR` set, it replaces the global config directory, which opencode creates and leaves empty. With `OPENCODE_CONFIG_PROJECT_DISABLE`/`OPENCODE_DISABLE_PROJECT_CONFIG`, the repo's `opencode.json` and `.opencode/` aren't sources; without them, both are. `OPENCODE_CONFIG_CONTENT` comes last. |
+| Instruction files | Not loaded with project config and Claude Code compatibility switched off: a one-word prompt cost 1,461 input tokens with the switches set and 1,480 without them (the 19 are the one-line `AGENTS.md` and `CLAUDE.md`), and no trap word appeared. |
+| Permissions | Rules are `{action, resource, effect}`; the last match wins, after opencode's defaults (which `opencode debug agents` shows). With `deny *` then `allow read/grep/glob`, the model is offered `read`, `grep`, `glob` and `skill` only: no shell, edit, write or fetch tool. No rule is left at `ask`, which would need a person. |
+| Reads outside the checkout | Denied (`Permission denied: external_directory`) for `read`, `grep` and `glob`, also through `context/../outside`. Allowed in the context directory by an `external_directory` rule for `<context>/*`, nested files included. |
+| Skills | Those in the repo's `.opencode/`/`.agents/` and the config directory aren't found; one in the home's `~/.agents/skills/` is found and refused (`Permission denied: skill`), as is the built-in `browser`. |
+| Errors | An unknown or unavailable model: `provider.no-route` "Model unavailable", exit 1. The free tier's limit: `provider.free-limit` "Free usage limit reached", which counts as a usage limit. |
+| Grep and glob | Use the system `ripgrep`, which Arch's `opencode` package depends on; nothing is downloaded. |
+
 ## systemd: `systemd-run --user --scope`
 
 | Check | Result |
@@ -44,11 +65,11 @@ Method: a throwaway repo with planted root and nested `CLAUDE.md` files, an `AGE
 
 ## Duplicate check
 
-Before the reviews of a commit are posted as one, the agent whose review finished last runs once more to find the items both reviews share. It is the same invocation as a review, with the same locked flags, in the same checkout and context directory. Only the prompt (`prompts/duplicates.md`, with the items inline) and the output schema (`prompts/duplicates.schema.json`) differ, and the output goes to `out/duplicates/`. The schema follows the same rules as the review schema: every object has `additionalProperties: false` and lists all its properties in `required`, which Codex's `--output-schema` needs.
+Before the reviews of a commit are posted as one, the agent whose review finished last runs once more to find the items both reviews share. It is the same invocation as a review, with the same locked flags (and for opencode the same config), in the same checkout and context directory. Only the prompt (`prompts/duplicates.md`, with the items inline) and the output schema (`prompts/duplicates.schema.json`) differ, and the output goes to `out/duplicates/`. The schema follows the same rules as the review schema: every object has `additionalProperties: false` and lists all its properties in `required`, which Codex's `--output-schema` needs.
 
 ## Footprint
 
-A small review took about 25 s with Claude Haiku and about 28 s with Codex at low reasoning effort. Larger PRs with stronger models take minutes; the default timeout is 20 minutes.
+A small review took about 25 s with Claude Haiku and about 28 s with Codex at low reasoning effort, and about 195 s with opencode's free DeepSeek V4.1 Flash (5 steps, 13k reasoning tokens). Larger PRs with stronger models take minutes; the default timeout is 20 minutes.
 
 ## Not yet verified
 

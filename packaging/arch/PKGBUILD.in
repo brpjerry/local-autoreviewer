@@ -2,13 +2,14 @@
 pkgname=local-autoreviewer
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc='Review your GitHub pull requests with local Claude Code and Codex sessions'
+pkgdesc='Review your GitHub pull requests with local Claude Code, Codex and OpenCode sessions'
 arch=('any')
 url='https://github.com/brpjerry/local-autoreviewer'
 license=('GPL-3.0-or-later')
 depends=('python' 'git' 'github-cli' 'systemd')
 optdepends=('claude-code: Claude Code reviews'
-            'openai-codex: Codex reviews')
+            'openai-codex: Codex reviews'
+            'opencode: OpenCode reviews')
 source=('local-autoreviewer.tar.gz')
 sha256sums=('@SHA256@')
 

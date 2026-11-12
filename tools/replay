@@ -16,9 +16,9 @@ often updated after the commit was reviewed, and can then describe the fixes the
 title and description are taken from the service's first review of COMMIT that kept them (the job's
 pr.json), unless --live-description is given; the replay says which it used.
 
-Codex runs with the reviews' own login: the replay links the live CODEX_HOME rather than copying it, so it
-can run while the service reviews (Codex processes sharing one auth.json take turns refreshing it; a copy
-would race it).
+Codex and opencode run with the reviews' own logins: the replay links the live CODEX_HOME and opencode home
+rather than copying them, so it can run while the service reviews (Codex processes sharing one auth.json take
+turns refreshing it; a copy would race it).
 """
 
 import argparse
@@ -34,8 +34,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from local_autoreviewer import config as config_mod  # noqa: E402
-from local_autoreviewer import db, leakscan, paths, pipeline  # noqa: E402
-from local_autoreviewer.__main__ import CliError, auth_files, parse_ref  # noqa: E402
+from local_autoreviewer import db, paths, pipeline  # noqa: E402
+from local_autoreviewer.__main__ import CliError, local_secrets, parse_ref  # noqa: E402
 from local_autoreviewer.github import GitHub, GitHubError, read_token  # noqa: E402
 from local_autoreviewer.gitops import Git, GitError  # noqa: E402
 from local_autoreviewer.runner import make_runner  # noqa: E402
@@ -103,7 +103,7 @@ def main():
     parser.add_argument("head", help="the PR commit to review")
     parser.add_argument("--base-sha", help="the base commit (default: the one the service last fetched)")
     parser.add_argument("--agent", action="append",
-                        help="agent to run, such as claude, codex or codex-sol; repeatable "
+                        help="agent to run, such as claude, codex, codex-sol or opencode; repeatable "
                              "(default: the repo's configured agents)")
     parser.add_argument("--prompts", type=Path, help="directory with review.md and review.schema.json")
     parser.add_argument("--json", action="store_true", help="print the structured reviews")
@@ -147,6 +147,8 @@ def main():
     state = scratch / "state"
     state.mkdir()
     (state / "codex-home").symlink_to(live_state / "codex-home")
+    (live_state / "opencode-home").mkdir(mode=0o700, exist_ok=True)  # the link's target must exist
+    (state / "opencode-home").symlink_to(live_state / "opencode-home")
     os.environ.pop("LOCAL_AUTOREVIEWER_SHARE", None)  # default: this checkout's prompts/
     if args.prompts:
         share = scratch / "share"
@@ -157,7 +159,7 @@ def main():
     svc = pipeline.Services(
         config=cfg, state=state, github=ReplayGitHub(pr, head), git=Git(str(scratch / "remote"), ENV),
         runner=make_runner(), token_owner="",  # only used for posting, which a replay never does
-        secrets=lambda: [token, *leakscan.collect_secrets(auth_files(live_state))])
+        secrets=lambda: [token, *local_secrets(live_state)])
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
     reviews = {}

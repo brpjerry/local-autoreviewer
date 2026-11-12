@@ -50,6 +50,18 @@ def auth_files(state):
     return [home / ".claude/.credentials.json", home / ".codex/auth.json", Path(state) / "codex-home/auth.json"]
 
 
+def auth_databases(state):
+    """opencode's databases, which hold its logins: the operator's own and the reviews'."""
+    data = Path("opencode/opencode.db")
+    own = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    return [own / data, Path(state) / "opencode-home/.local/share" / data]
+
+
+def local_secrets(state):
+    """The local agent credentials a review must never quote."""
+    return [*leakscan.collect_secrets(auth_files(state)), *leakscan.collect_db_secrets(auth_databases(state))]
+
+
 def resolve_token_owner(github, state):
     conn = db.connect(state / "state.sqlite3")
     try:
@@ -77,7 +89,7 @@ def build_services(cfg):
     owner = resolve_token_owner(github, state)
     return pipeline.Services(
         config=cfg, state=state, github=github, git=git, runner=make_runner(), token_owner=owner,
-        secrets=lambda: [token, *leakscan.collect_secrets(auth_files(state))])
+        secrets=lambda: [token, *local_secrets(state)])
 
 
 def load_config():
@@ -120,7 +132,7 @@ def _repo_cfg(cfg, repo):
 
 
 def _agents_arg(cfg, agents):
-    """The --agent values, checked against the configured agents (claude, codex and any further reviewers)."""
+    """The --agent values, checked against the configured agents (each type's own and any further reviewers)."""
     for agent in agents or ():
         if agent not in cfg.agents:
             raise CliError(f"unknown agent {agent!r}; configured: {', '.join(cfg.agents)}")
@@ -422,10 +434,7 @@ def _ensure_worktree(cfg, job):
 def cmd_resume(args):
     cfg, _state, job, agent = _job_and_agent(args.job)
     job_paths = _ensure_worktree(cfg, job)
-    argv, extra_env = agent.resume_interactive(paths=job_paths, session_id=job["session_id"])
-    env = dict(os.environ)
-    env.pop("GH_TOKEN", None)
-    env.update(extra_env or {})
+    argv, env = agent.resume_interactive(paths=job_paths, session_id=job["session_id"])  # its whole environment
     os.chdir(job_paths.worktree)
     print(f"resuming job {job['id']} ({job['agent']} session {job['session_id']}) in {job_paths.worktree}",
           file=sys.stderr)
@@ -448,6 +457,17 @@ def cmd_codex_login(args):
           file=sys.stderr)
     os.execvpe(cfg.agents["codex"].command, [cfg.agents["codex"].command, "login", "--device-auth"],
                {**os.environ, **env})
+
+
+def cmd_opencode_login(args):
+    cfg = load_config()
+    agent = make_agent(cfg.agents["opencode"], paths.state_dir())
+    env = agent.tool_env()
+    env["TERM"] = os.environ.get("TERM", "dumb")  # an interactive prompt
+    argv = agent.login_argv(args.integration)
+    print(f"Logging opencode in to {argv[-1]} for reviews (HOME={agent.home}); this is separate from your own "
+          "opencode.", file=sys.stderr)
+    os.execvpe(argv[0], argv, env)
 
 
 def cmd_config_check(args):
@@ -534,7 +554,8 @@ def cmd_doctor(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="local-autoreviewer",
-                                     description="Review your GitHub PRs with local Claude Code / Codex sessions.")
+                                     description="Review your GitHub PRs with local Claude Code, Codex and "
+                                                 "OpenCode sessions.")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {paths.read_version()}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -548,14 +569,16 @@ def build_parser():
     p = sub.add_parser("review", help="review one PR now, in the foreground")
     p.add_argument("ref", help="owner/repo#N or PR URL")
     p.add_argument("--agent", action="append",
-                   help="agent to run, such as claude, codex or codex-sol; repeatable (default: the repo's)")
+                   help="agent to run, such as claude, codex, codex-sol or opencode; repeatable (default: the "
+                        "repo's)")
     p.add_argument("--post", action="store_true", help="post the review (default: save it locally only)")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("enqueue", help="queue a review for the worker (any author)")
     p.add_argument("ref")
     p.add_argument("--agent", action="append",
-                   help="agent to run, such as claude, codex or codex-sol; repeatable (default: the repo's)")
+                   help="agent to run, such as claude, codex, codex-sol or opencode; repeatable (default: the "
+                        "repo's)")
     p.add_argument("--force", action="store_true", help="review again even if this head was reviewed")
     p.set_defaults(func=cmd_enqueue)
 
@@ -602,6 +625,10 @@ def build_parser():
     sub.add_parser("doctor", help="check config, credentials, agents and units").set_defaults(func=cmd_doctor)
     sub.add_parser("codex-login", help="log Codex in for reviews (separate CODEX_HOME)").set_defaults(
         func=cmd_codex_login)
+    p = sub.add_parser("opencode-login", help="log opencode in for reviews (separate home), such as to OpenCode Go")
+    p.add_argument("integration", nargs="?", default="opencode-go",
+                   help="the integration to log in to (default: opencode-go, the OpenCode Go subscription)")
+    p.set_defaults(func=cmd_opencode_login)
     sub.add_parser("config-check", help="validate the config file").set_defaults(func=cmd_config_check)
     sub.add_parser("housekeeping", help="expire old job dirs and prune mirrors").set_defaults(
         func=cmd_housekeeping)

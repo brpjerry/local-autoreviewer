@@ -37,8 +37,13 @@ effort = ""                # e.g. "high"; empty: codex's default
 mode = "shell"             # "inline": no shell tool; the diff and changed files are put in the prompt
 # memory_max = "3G"
 
-# More reviewers: any number of either type, named claude-<name> or codex-<name>, each with the keys
-# above. List them in a repo's (or [defaults]) agents. All reviewers run side by side.
+# [agents.opencode]
+# model = "opencode/deepseek-v4.1-flash-free"   # provider/model; free models need no login, OpenCode Go
+#                                                 # models need `local-autoreviewer opencode-login`
+# effort = ""              # appended as the model's variant (provider/model#high); empty: none
+
+# More reviewers: any number of each type, named claude-<name>, codex-<name> or opencode-<name>, each with
+# the keys above. List them in a repo's (or [defaults]) agents. All reviewers run side by side.
 # [agents.codex-sol]
 # model = "gpt-6.1-sol"
 # effort = "xhigh"

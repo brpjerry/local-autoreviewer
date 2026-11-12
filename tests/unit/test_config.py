@@ -52,7 +52,7 @@ class ConfigTests(unittest.TestCase):
                        "claude-sonnet": {"model": "sonnet"}},
             "repo": [{"name": "a/b"}, {"name": "a/c", "agents": ["claude"]}],
         })
-        self.assertEqual(list(cfg.agents), ["claude", "codex", "codex-sol", "claude-sonnet"])
+        self.assertEqual(list(cfg.agents), ["claude", "codex", "opencode", "codex-sol", "claude-sonnet"])
         sol = cfg.agents["codex-sol"]
         self.assertEqual((sol.type, sol.command, sol.model, sol.effort, sol.mode),
                          ("codex", "codex", "gpt-6.1-sol", "xhigh", "inline"))
@@ -60,6 +60,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((sonnet.type, sonnet.command, sonnet.model), ("claude", "claude", "sonnet"))
         self.assertEqual(cfg.repo("a/b").agents, ("codex", "codex-sol", "claude-sonnet"))
         self.assertEqual(cfg.repo("a/c").agents, ("claude",))
+
+    def test_opencode_reviewers(self):
+        cfg = config.parse({
+            "agents": {"opencode": {"model": "opencode/deepseek-v4.1-flash-free"},
+                       "opencode-go": {"model": "opencode-go/glm-5", "effort": "high"}},
+            "repo": [{"name": "a/b", "agents": ["codex", "opencode", "opencode-go"]}],
+        })
+        self.assertEqual((cfg.agents["opencode"].type, cfg.agents["opencode"].command), ("opencode", "opencode"))
+        go = cfg.agents["opencode-go"]
+        self.assertEqual((go.type, go.command, go.model, go.effort), ("opencode", "opencode", "opencode-go/glm-5", "high"))
+        self.assertEqual(cfg.repo("a/b").agents, ("codex", "opencode", "opencode-go"))
+        with self.assertRaisesRegex(config.ConfigError, "only codex supports 'inline'"):
+            config.parse({"agents": {"opencode": {"mode": "inline"}}})
 
     def test_further_reviewer_errors(self):
         bad = [
@@ -70,6 +83,8 @@ class ConfigTests(unittest.TestCase):
             {"agents": {"codex\n": {}}},  # $ would match before the newline
             {"agents": {"codex-sol": "gpt-6.1-sol"}},
             {"agents": {"codex-sol": {"tools": "Bash"}}},
+            {"agents": {"opencode-go": {"permissions": "allow"}}},
+            {"agents": {"opencodex": {}}},
             {"agents": {"claude-sonnet": {"mode": "inline"}}},
             {"defaults": {"agents": ["codex-sol"]}},  # never defined
             {"repo": [{"name": "a/b", "agents": ["claude-haiku"]}]},

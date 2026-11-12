@@ -3,7 +3,7 @@ It merges into `$base_ref`. You are reviewing head commit $head_sha.
 
 ## Where things are
 
-- `$worktree`: the repository checked out at the PR head (read-only). Agent instruction files (CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, .mcp.json) were removed from this checkout on purpose.
+- `$worktree`: the repository checked out at the PR head (read-only). Agent instruction files (CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, .opencode/, .mcp.json, opencode.json, opencode.jsonc) were removed from this checkout on purpose.
 - `$context/pr.diff`: the full diff from the merge base to the head. Lock files and generated files matching the exclusion list are left out. They are listed under `excluded_from_diff` in pr.json.
 - `$context/pr.json`: title, description, author, refs and SHAs.
 - `$context/files.txt`: changed files with their status. `$context/commits.txt`: the commit messages.

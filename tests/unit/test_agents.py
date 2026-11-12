@@ -26,6 +26,16 @@ def agents(**codex):
     return make_agent(cfg.agents["claude"], STATE), make_agent(cfg.agents["codex"], STATE)
 
 
+def opencode_agent(**table):
+    cfg = config.parse({"agents": {"opencode": {"model": "opencode/deepseek-v4.1-flash-free", **table}}})
+    return make_agent(cfg.agents["opencode"], STATE)
+
+
+def opencode_config(env):
+    import json
+    return json.loads(env["OPENCODE_CONFIG_CONTENT"])
+
+
 class ArgvTests(unittest.TestCase):
     def test_claude_locked_flags(self):
         claude, _ = agents()
@@ -78,6 +88,78 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "claude")
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
 
+    def test_opencode_locked_flags(self):
+        opencode = opencode_agent()
+        inv = opencode.invocation(unit="u", paths=PATHS, prompt="p", session_id=None)
+        self.assertEqual(inv.argv, ["opencode", "run", "--standalone", "--agent", "review", "--format", "json",
+                                    "--model", "opencode/deepseek-v4.1-flash-free"])
+        self.assertNotIn("--auto", inv.argv)  # it would approve whatever isn't denied
+        self.assertEqual(inv.cwd, PATHS.worktree)
+        prompt = inv.stdin.decode()
+        self.assertTrue(prompt.startswith("p\n\n## Output format"))  # the schema, in place of a schema flag
+        self.assertIn('"findings"', prompt)
+
+    def test_opencode_locked_config(self):
+        """Only the read-only file tools, reads outside the checkout only in the context directory, and nothing
+        that loads instructions, tools or code from elsewhere."""
+        env = opencode_agent().invocation(unit="u", paths=PATHS, prompt="p", session_id=None).env
+        cfg = opencode_config(env)
+        rules = [{"action": "*", "resource": "*", "effect": "deny"},
+                 {"action": "read", "resource": "*", "effect": "allow"},
+                 {"action": "grep", "resource": "*", "effect": "allow"},
+                 {"action": "glob", "resource": "*", "effect": "allow"},
+                 {"action": "external_directory", "resource": f"{PATHS.context}/*", "effect": "allow"}]
+        self.assertEqual(cfg["permissions"], rules)
+        self.assertEqual(cfg["agents"], {"review": {"description": "Read-only code review", "mode": "primary",
+                                                    "permissions": rules}})
+        self.assertEqual(cfg["default_agent"], "review")
+        self.assertEqual({(p["action"], p["resource"], p["effect"]) for p in cfg["policies"]},
+                         {(action, "*", "deny") for action in ("mcp.use", "skill.use", "plugin.use", "websearch.use")})
+        for key in ("instructions", "plugins", "skills"):
+            self.assertEqual(cfg[key], [], key)
+        for key in ("lsp", "formatter", "snapshots", "websearch", "warming"):
+            self.assertIs(cfg[key], False, key)
+        self.assertEqual((cfg["share"], cfg["update"]), ("disabled", "disable"))
+        self.assertNotIn("mcp", cfg)
+        for switch in ("OPENCODE_CONFIG_PROJECT_DISABLE", "OPENCODE_DISABLE_PROJECT_CONFIG",
+                       "OPENCODE_DISABLE_CLAUDE_CODE", "OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_FILEWATCHER"):
+            self.assertEqual(env[switch], "1", switch)
+        home = f"{STATE}/opencode-home"
+        self.assertEqual((env["HOME"], env["XDG_CONFIG_HOME"], env["XDG_DATA_HOME"], env["XDG_STATE_HOME"],
+                          env["XDG_CACHE_HOME"]),
+                         (home, f"{home}/.config", f"{home}/.local/share", f"{home}/.local/state", f"{home}/.cache"))
+        self.assertEqual(env["OPENCODE_CONFIG_DIR"], f"{PATHS.root}/opencode-config")  # the job's own, empty
+
+    def test_opencode_further_reviewers_and_effort(self):
+        cfg = config.parse({"agents": {"opencode-go": {"model": "opencode-go/glm-5", "effort": "high"}}})
+        go = make_agent(cfg.agents["opencode-go"], STATE)
+        base = opencode_agent()
+        self.assertIs(type(go), type(base))
+        self.assertEqual(go.home, base.home)  # one login for every opencode reviewer
+        self.assertEqual(go._locked_flags(), base._locked_flags())
+        argv = go.invocation(unit="u", paths=PATHS, prompt="p", session_id=None).argv
+        self.assertEqual(argv[argv.index("--model") + 1], "opencode-go/glm-5#high")  # effort is the variant
+        self.assertEqual(opencode_agent(model="a/b#max", effort="high")._model_flags(), ["--model", "a/b#max"])
+        self.assertEqual(opencode_agent(model="")._model_flags(), [])
+
+    def test_opencode_resume_keeps_the_locks(self):
+        """`resume` runs the TUI in the review's whole environment, not the operator's with overrides."""
+        hostile = {**SECRET_ENV, "OPENCODE_CONFIG": "/home/u/evil.json", "XDG_DATA_HOME": "/home/u/.local/share",
+                   "TERM": "xterm-256color"}
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            argv, env = opencode_agent().resume_interactive(paths=PATHS, session_id="ses_1")
+            _, claude_env = agents()[0].resume_interactive(paths=PATHS, session_id="s")
+        self.assertEqual(argv, ["opencode", "--standalone", "--session", "ses_1"])  # the TUI has no --agent
+        self.assertEqual(env["HOME"], f"{STATE}/opencode-home")
+        self.assertEqual(env["XDG_DATA_HOME"], f"{STATE}/opencode-home/.local/share")
+        self.assertEqual(env["TERM"], "xterm-256color")  # a real terminal this time
+        self.assertEqual(opencode_config(env)["permissions"][0], {"action": "*", "resource": "*", "effect": "deny"})
+        for key in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "OPENCODE_CONFIG", "ANTHROPIC_API_KEY"):
+            self.assertNotIn(key, env)
+        self.assertNotIn("GH_TOKEN", claude_env)  # Claude's stays the operator's own session, as before
+        self.assertEqual(claude_env["GITHUB_TOKEN"], "y")
+        self.assertEqual(opencode_agent().login_argv(), ["opencode", "auth", "login", "--standalone", "opencode-go"])
+
     def test_codex_inline_mode_disables_shell(self):
         _, codex = agents(mode="inline")
         argv = codex._locked_flags()
@@ -114,9 +196,14 @@ class ArgvTests(unittest.TestCase):
 
 class EnvTests(unittest.TestCase):
     def test_env_is_allowlisted(self):
-        with mock.patch.dict(os.environ, SECRET_ENV, clear=True):
+        with mock.patch.dict(os.environ, {**SECRET_ENV, "XDG_DATA_HOME": "/home/u/.local/share",
+                                          "OPENCODE_CONFIG": "/home/u/evil.json"}, clear=True):
             claude, codex = agents()
-            for env in (claude.invocation(unit="u", paths=PATHS, prompt="", session_id="s").env, codex.env()):
+            opencode_env = opencode_agent().invocation(unit="u", paths=PATHS, prompt="", session_id=None).env
+            self.assertEqual(opencode_env["XDG_DATA_HOME"], f"{STATE}/opencode-home/.local/share")
+            self.assertNotIn("OPENCODE_CONFIG", opencode_env)  # the operator's config file, added to the locked one
+            for env in (claude.invocation(unit="u", paths=PATHS, prompt="", session_id="s").env, codex.env(),
+                        {**opencode_env, "HOME": "/home/u"}):
                 for key in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "OTHER_AGENT_TOKEN", "ANTHROPIC_API_KEY"):
                     self.assertNotIn(key, env)
                 self.assertEqual(env["HOME"], "/home/u")
@@ -167,6 +254,163 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(result.session_id, "t1")
         self.assertEqual(result.review["summary"], "ok")
         self.assertIsNone(result.error_kind)
+
+    def opencode_run(self, events, returncode=0):
+        import json
+        self.write("agent.stdout", "".join(json.dumps(event) + "\n" for event in events))
+        return opencode_agent().parse(RunResult(returncode, False, False, 1.0), self.paths, None)
+
+    def test_opencode_success(self):
+        import json
+        review = {"summary": "ok", "trivial": False, "findings": [], "test_gaps": [], "questions": [], "nits": []}
+        step = {"type": "step_start", "sessionID": "ses_9", "part": {}}
+        finish = {"type": "step_finish", "sessionID": "ses_9",
+                  "part": {"reason": "stop", "cost": 0.5, "tokens": {"input": 7, "output": 3, "reasoning": 1,
+                                                                    "cache": {"read": 2, "write": 0}}}}
+        tool_step = [step, {"type": "text", "part": {"text": "Reading calc.py."}},
+                     {"type": "tool_use", "part": {"tool": "read"}}, dict(finish, part={**finish["part"],
+                                                                                       "reason": "tool-calls"})]
+        for text in (json.dumps(review), f"Done.\n\n```json\n{json.dumps(review, indent=2)}\n```",
+                     f"```\n{json.dumps(review)}\n```"):
+            with self.subTest(text=text[:20]):
+                result = self.opencode_run([*tool_step, step, {"type": "text", "part": {"text": text}}, finish])
+                self.assertIsNone(result.error_kind, result.error)
+                self.assertEqual(result.review, review)
+                self.assertEqual(result.session_id, "ses_9")
+                self.assertEqual(result.usage, {"usage": {"input": 14, "output": 6, "reasoning": 2, "cache_read": 4,
+                                                          "cache_write": 0}, "total_cost_usd": 1.0, "num_turns": 2})
+
+    def test_opencode_failures(self):
+        step = {"type": "step_start", "sessionID": "ses_9", "part": {}}
+        limit = {"type": "error", "error": {"type": "provider.rate-limit", "message": "Rate limit exceeded"}}
+        result = self.opencode_run([step, limit], returncode=1)
+        self.assertEqual((result.error_kind, result.error), ("rate_limit", "provider.rate-limit Rate limit exceeded"))
+        result = self.opencode_run([{"type": "error", "error": {"type": "provider.no-route",
+                                                               "message": "Model unavailable: x/y"}}], returncode=1)
+        self.assertEqual(result.error_kind, "error")
+        self.assertIn("Model unavailable", result.error)
+        cases = [([step, {"type": "text", "part": {"text": "I reviewed it; looks fine."}}], "holds no JSON object"),
+                 ([step, {"type": "text", "part": {"text": "[1, 2]"}}], "isn't an object"),
+                 ([step, {"type": "text", "part": {"text": '{"summary": "x",}'}}], "doesn't parse"),
+                 ([step, {"type": "text", "part": {"text": '{"summary": "Found a problem", "issues": []}'}}],
+                  "doesn't match the schema: $: missing trivial, findings, test_gaps, questions, nits; $: unexpected "
+                  "issues"),
+                 ([step, {"type": "text", "part": {"text": '{"summary": "x"}'}},
+                   {"type": "step_finish", "part": {"reason": "length"}}], "cut off"),
+                 ([], "holds no JSON object")]
+        for events, why in cases:
+            with self.subTest(why=why):
+                result = self.opencode_run(events)
+                self.assertEqual(result.error_kind, "error")
+                self.assertIn(why, result.error)
+        self.write("agent.stderr", "opencode: crashed")
+        self.write("agent.stdout", "")
+        result = opencode_agent().parse(RunResult(2, False, False, 1.0), self.paths, None)
+        self.assertEqual((result.error_kind, result.error), ("error", "opencode: crashed"))
+
+    def test_opencode_answers_are_checked_against_their_runs_schema(self):
+        """The follow-up's and the duplicate check's own schemas, not the review's; review.validate() would
+        accept an old-shaped or empty answer."""
+        import json
+        from pathlib import Path
+        from local_autoreviewer import review
+        opencode = opencode_agent()
+        followup = Path(self._tmp.name, "followup.schema.json")
+        followup.write_text(json.dumps(review.followup_schema()))
+        duplicates = Path(self._tmp.name, "duplicates.schema.json")
+        duplicates.write_text((review.paths.prompts_dir() / "duplicates.schema.json").read_text())
+        step = {"type": "step_start", "sessionID": "ses_9", "part": {}}
+        for schema, answer, why in (
+                (followup, {"summary": "All fixed."}, "$: missing new_code, resolutions"),
+                (followup, {"summary": "x", "new_code": "no", "resolutions": [{"finding": 1, "status": "done",
+                                                                               "detail": ""}],
+                            "regressions": [], "test_gaps": [], "questions": [], "nits": []},
+                 "$.new_code: expected boolean; $.resolutions[0].status: not one of fixed"),
+                (duplicates, {}, "$: missing duplicates")):
+            with self.subTest(why=why):
+                opencode.invocation(unit="u", paths=self.paths, prompt="p", session_id=None, schema=schema)
+                self.write("agent.stdout", "".join(json.dumps(e) + "\n" for e in [
+                    step, {"type": "text", "part": {"text": json.dumps(answer)}}]))
+                result = opencode.parse(RunResult(0, False, False, 1.0), self.paths, None)
+                self.assertEqual(result.error_kind, "error")
+                self.assertIn(why, result.error)
+        opencode.invocation(unit="u", paths=self.paths, prompt="p", session_id=None, schema=duplicates)
+        self.write("agent.stdout", json.dumps({"type": "text", "part": {"text": '{"duplicates": []}'}}) + "\n")
+        self.assertEqual(opencode.parse(RunResult(0, False, False, 1.0), self.paths, None).review, {"duplicates": []})
+
+    def test_the_schemas_use_only_what_the_opencode_check_understands(self):
+        import json
+        from local_autoreviewer import review
+        from local_autoreviewer.agents import opencode as opencode_mod
+
+        def keywords(node):
+            found = set(node)
+            for sub_schema in node.get("properties", {}).values():
+                found |= keywords(sub_schema)
+            if isinstance(node.get("items"), dict):
+                found |= keywords(node["items"])
+            return found
+        prompts = review.paths.prompts_dir()
+        for schema in (json.loads((prompts / "review.schema.json").read_text()), review.followup_schema(),
+                       json.loads((prompts / "duplicates.schema.json").read_text())):
+            self.assertLessEqual(keywords(schema), opencode_mod.SCHEMA_KEYWORDS)
+
+    def test_opencode_json_extraction(self):
+        import json
+        from local_autoreviewer.agents.opencode import extract_json, read_events
+        review = {"summary": "Uses {count}.", "nits": [{"text": "a}b"}]}
+        for text, expected in (
+                (f"Checked {{count}} files; here it is: {json.dumps(review)}", review),  # a brace before it
+                (f"An example: {{\"a\": 1}}. The review:\n{json.dumps(review)}\nDone.", review),  # the last one
+                ("```json\n{\"a\": 1}\n```", {"a": 1})):
+            with self.subTest(text=text[:30]):
+                self.assertEqual(extract_json(text), expected)
+        # U+2028 is legal inside a JSON string, and JSON.stringify leaves it raw: it doesn't end a line.
+        line = json.dumps({"type": "text", "part": {"text": "a\u2028b"}}, ensure_ascii=False)
+        self.assertEqual(read_events(line + "\n" + line + "\r\n"), [json.loads(line)] * 2)
+
+    def test_opencode_ask(self):
+        import json
+        opencode = opencode_agent()
+        progress = [{"type": "step_start"}, {"type": "text", "part": {"text": "Reading calc.py."}}]
+        limit = {"type": "error", "error": {"type": "provider.free-limit", "message": "Free usage limit reached"}}
+        answer = [{"type": "step_start"}, {"type": "text", "part": {"text": "Because b can be 0."}}]
+        for events, returncode, expected in ((progress + [limit], 1, (1, "provider.free-limit Free usage limit "
+                                                                         "reached")),
+                                             (progress + [limit], 0, (1, "provider.free-limit Free usage limit "
+                                                                         "reached")),
+                                             (progress + answer, 0, (0, "Because b can be 0."))):
+            proc = mock.Mock(returncode=returncode, stdout="".join(json.dumps(e) + "\n" for e in events), stderr="")
+            with self.subTest(expected=expected), mock.patch("subprocess.run", return_value=proc) as run:
+                self.assertEqual(opencode.ask(paths=PATHS, session_id="ses_1", question="why?"), expected)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:5], ["opencode", "run", "--standalone", "--agent", "review"])
+        self.assertEqual(argv[argv.index("--session") + 1], "ses_1")
+        self.assertEqual(run.call_args.kwargs["input"], "why?")
+        self.assertEqual(run.call_args.kwargs["env"]["HOME"], f"{STATE}/opencode-home")
+
+    def test_opencode_doctor(self):
+        opencode = opencode_agent()
+        help_text = "--standalone --agent --format --model --session"
+
+        def runner(models, help_=help_text):
+            def run(argv, **kwargs):
+                self.assertEqual(kwargs["env"]["HOME"], f"{STATE}/opencode-home")
+                out = {"--version": "opencode v2.2.7\n", "--help": help_, "models": models}
+                return mock.Mock(returncode=0, stdout=next(v for k, v in out.items() if k in argv), stderr="")
+            return run
+        listed = "opencode/big-pickle\nopencode/deepseek-v4.1-flash-free\n"
+        with mock.patch("subprocess.run", side_effect=runner(listed)):
+            self.assertEqual(opencode.doctor(), (True, f"opencode v2.2.7: opencode/deepseek-v4.1-flash-free "
+                                                       f"available (HOME={STATE}/opencode-home)"))
+        with mock.patch("subprocess.run", side_effect=runner("opencode/big-pickle\n")):
+            ok, message = opencode.doctor()
+            self.assertFalse(ok)
+            self.assertIn("opencode-login", message)
+        with mock.patch("subprocess.run", side_effect=runner(listed, help_="--format --model")):
+            ok, message = opencode.doctor()
+            self.assertFalse(ok)
+            self.assertIn("lacks --standalone, --agent, --session", message)
 
     def test_classify(self):
         self.assertEqual(classify_error("You've hit your usage limit"), "rate_limit")

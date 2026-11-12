@@ -685,7 +685,8 @@ def due(conn, svc, job):
 
 
 def _display_order(rows):
-    """Claude's reviews first, then Codex's; a type's own reviewer before its further ones (codex, codex-sol)."""
+    """Reviews by type in config.AGENTS order (Claude's, Codex's, OpenCode's); a type's own reviewer before its
+    further ones (codex, codex-sol)."""
     def key(row):
         kind = agent_type(row["agent"])
         return AGENTS.index(kind) if kind in AGENTS else len(AGENTS), row["agent"], row["id"]

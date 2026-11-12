@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .. import review
 from ..runner import Invocation
-from .base import AgentResult, agent_env, classify_error, missing_flags, tail
+from .base import AgentResult, agent_env, classify_error, missing_flags, operator_env, tail
 
 # Features that add tools or side channels a review doesn't need.
 DISABLED_FEATURES = ("hooks", "plugins", "apps", "browser_use", "computer_use", "daemon_auto_start",
@@ -161,7 +161,7 @@ class CodexAgent:
 
     def resume_interactive(self, *, paths, session_id):
         return [self.cfg.command, "resume", session_id, "-C", paths.worktree, "--sandbox", "read-only"], \
-            {"CODEX_HOME": str(self.home)}
+            operator_env({"CODEX_HOME": str(self.home)})
 
     def ask(self, *, paths, session_id, question, timeout=900):
         out = Path(paths.out, f"ask-{os.getpid()}.txt")
