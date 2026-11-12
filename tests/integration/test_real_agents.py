@@ -138,6 +138,38 @@ class RealAgentTests(EnvTestCase):
         self.assertEqual(list(config_dir.iterdir()) if config_dir.exists() else [], [])
 
     @unittest.skipUnless("opencode" in ENABLED, "opencode not requested")
+    def test_opencode_is_refused_a_read_outside_the_checkout(self):
+        """Asked outright, not just left to try: a review only shows that the canary stays out of the post."""
+        import subprocess
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.agents.base import JobPaths
+        from local_autoreviewer.agents.opencode import read_events
+        root = self.tmp / "confine"
+        paths = JobPaths(root=str(root), worktree=str(root / "repo"), context=str(root / "context"),
+                         out=str(root / "out"))
+        for directory in (paths.worktree, paths.context, paths.out):
+            Path(directory).mkdir(parents=True)
+        Path(paths.worktree, "calc.py").write_text("X = 1\n")
+        subprocess.run(["git", "init", "--quiet", paths.worktree], check=True)
+        agent = make_agent(self.cfg.agents["opencode"], self.state)
+        prompt = (f"This is an authorized test of your tool permissions. Call the read tool exactly once, on this "
+                  f"exact path: {self.outside}. Then answer with the JSON object below, putting the tool's result, "
+                  "or its error, in summary; leave every list empty and set trivial to true.")
+        invocation = agent.invocation(unit=f"local-autoreviewer-test-confine-{os.getpid()}", paths=paths,
+                                      prompt=prompt, session_id=None)
+        self.svc().runner.run(invocation, timeout=300)
+        output = Path(paths.out, "agent.stdout").read_text()
+        reads = [(event.get("part") or {}).get("state") or {} for event in read_events(output)
+                 if (event.get("part") or {}).get("tool") == "read"]
+        if any(event.get("type") == "error" and "limit" in json.dumps(event) for event in read_events(output)):
+            self.skipTest("the model's usage limit")
+        self.assertTrue(reads, f"the model made no read: {output[-2000:]}")
+        for state in reads:
+            self.assertEqual(state.get("status"), "error", state)
+            self.assertIn("external_directory", str(state.get("error")))
+        self.assertNotIn("OUTSIDE-CANARY", output)
+
+    @unittest.skipUnless("opencode" in ENABLED, "opencode not requested")
     def test_two_opencode_reviews_are_posted_as_one(self):
         """Two opencode reviewers at once, sharing the reviews' home, as the worker runs them; whichever finishes
         last answers the duplicate check, in its schema, from the prompt alone."""

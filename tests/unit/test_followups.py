@@ -20,13 +20,13 @@ class FollowupTests(EnvTestCase):
         self.head_a = self.remote.open_pr(1, {"src/calc.py": "def divide(a, b):\n    return a / b if b else 0\n"})
         self.svc = self.services(make_config(self.tmp, agents=("claude",)))
 
-    def review_at(self, head, *, post=True, source="poll", base="main"):
+    def review_at(self, head, *, post=True, source="poll", base="main", agent="claude"):
         self.github.set_pr(1, head, base=base)
         conn = self.svc.connect()
         with db.transaction(conn):
-            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref=base, agent="claude",
+            job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref=base, agent=agent,
                                    model="opus", source=source, not_before=0, now=self.clock(), post=post,
-                                   rerun=db.next_rerun(conn, REPO, 1, head, base, "claude"))
+                                   rerun=db.next_rerun(conn, REPO, 1, head, base, agent))
             db.update_job(conn, job_id, status="running", started_at=self.clock())
         conn.close()
         status = pipeline.run_job(self.svc, job_id, pipeline.CancelToken())
@@ -69,6 +69,24 @@ class FollowupTests(EnvTestCase):
         self.assertIn(f"✅ Fixed: {finding['title']}", posted["body"])
         self.assertIn("1. **The fix dropped the docstring**", posted["body"])
         self.assertEqual([(c["path"], c["line"]) for c in posted["comments"]], [("src/calc.py", 1)])
+
+    def test_an_opencode_followup(self):
+        """A complete opencode follow-up: asked for in the follow-up schema, it passes the adapter's own check
+        against that schema, and its statuses are recorded like any reviewer's."""
+        self.svc = self.services(make_config(self.tmp, agents=("opencode",)))
+        first, status = self.review_at(self.head_a, agent="opencode")
+        self.assertEqual(status, "posted")
+        (finding,) = self.rows("SELECT id FROM findings WHERE job_id=? AND kind='finding'", first)
+        second, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}), agent="opencode")
+        self.assertEqual(status, "posted")
+        (job,) = self.rows("SELECT review_kind, followup_of FROM jobs WHERE id=?", second)
+        self.assertEqual((job["review_kind"], job["followup_of"]), ("followup", self.head_a))
+        prompt = self.agent_log("opencode")[-1]["prompt"]
+        self.assertIn("This is a follow-up.", prompt)
+        self.assertIn('"resolutions"', prompt.split("## Output format", 1)[1])  # the follow-up's own schema
+        self.assertEqual(self.rows("SELECT finding_id, status FROM resolutions WHERE job_id=?", second),
+                         [{"finding_id": finding["id"], "status": "fixed"}])
+        self.assertIn("Follow-up review · OpenCode", self.github.posted[-1]["body"])
 
     def test_base_commits_merged_into_the_pr_are_not_its_changes(self):
         self.review_at(self.head_a)
