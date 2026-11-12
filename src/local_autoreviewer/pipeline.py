@@ -628,6 +628,10 @@ def _run(conn, svc, job, cancel):
     if run.timed_out:
         return _retry(conn, svc, job, f"timed out after {cfg.service.review_timeout}s")
     if result.error_kind == "rate_limit":
+        if cfg.service.min_limit_left > 0:  # a used-up limit is under any reserve: skip, as _check_limits would
+            limits.note_used_up(agent, svc.now())
+            raise Outcome("skipped", f"{review.agent_label(job['agent'])} hit a usage limit ({result.error[:300]}); "
+                                     "not reviewed")
         return _retry(conn, svc, job, f"usage limit: {result.error}", delay=RATE_LIMIT_BACKOFF, count=False)
     if result.error_kind:
         return _retry(conn, svc, job, result.error or "agent failed")
@@ -807,6 +811,8 @@ def _check_duplicates(conn, svc, job, others, agent, cancel, *, title):
         if run.cancelled or run.timed_out or result.error_kind:
             why = ("it was cancelled" if run.cancelled else "it timed out" if run.timed_out
                    else "it hit a usage limit" if result.error_kind == "rate_limit" else "it failed")
+            if result.error_kind == "rate_limit" and not run.cancelled and svc.config.service.min_limit_left > 0:
+                limits.note_used_up(agent, svc.now())
             if run.cancelled:  # the job's cancel: a new push, `cancel` or a stop; the job's outcome says which
                 log.info("job %s: duplicate check: it was cancelled", job["id"])
             else:

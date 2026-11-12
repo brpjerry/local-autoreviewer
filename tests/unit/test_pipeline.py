@@ -150,7 +150,8 @@ class PipelineTests(EnvTestCase):
                 self.assertEqual(status, "queued")  # retried
                 self.assertIn(reason, job["reason"])
         status, job = run("ratelimit")
-        self.assertEqual((status, job["attempts"]), ("queued", 0))  # a usage limit uses no attempt
+        self.assertEqual(status, "skipped")
+        self.assertIn("OpenCode hit a usage limit (provider.rate-limit Rate limit exceeded)", job["reason"])
 
     def test_codex_and_opencode_reviews_are_posted_as_one(self):
         svc, ids = self.queue(agents=("codex", "opencode"))
@@ -300,10 +301,40 @@ class PipelineTests(EnvTestCase):
         svc.secrets = lambda: ["Division by zero is unhandled"]  # pretend the finding text is a secret
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "blocked")
 
-    def test_rate_limit_defers_without_using_an_attempt(self):
-        cfg = make_config(self.tmp, claude="ratelimit")
+    def test_a_usage_limit_skips_the_review_and_the_agents_next_ones(self):
+        """A used-up limit is under any reserve: skipped like one the check found, and the plan counts as used up
+        until its next reading, so the agent's next reviews don't start."""
+        from local_autoreviewer import limits
+        from local_autoreviewer.agents import make_agent
+        svc, (job_id,) = self.queue(make_config(self.tmp, claude="ratelimit"))
+        svc.limits = limits.read  # the real cache, primed so nothing is read from the plan
+        claude = make_agent(svc.config.agents["claude"], self.state)
+        limits._readings[claude.limits_key()] = (self.clock(), [])
+        with self.assertLogs("local_autoreviewer.limits", "INFO") as logs:
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertIn("Claude Code hit a usage limit (success: Claude usage limit reached); not reviewed",
+                      self.job(svc, job_id)["reason"])
+        self.assertIn("its next reviews are skipped for 10 minutes", logs.output[0])
+        self.assertEqual(len(self.agent_log("claude")), 1)
+        head = self.remote.push_pr(1, {"src/calc.py": HOSTILE_FILES["src/calc.py"] + "# v3\n"})
+        self.github.set_pr(1, head)
+        conn = svc.connect()
+        with db.transaction(conn):
+            later = db.insert_job(conn, repo=REPO, number=1, head_sha=head, base_ref="main", agent="claude",
+                                  model="opus", source="poll", not_before=0, now=self.clock(), post=True)
+            db.update_job(conn, later, status="running", started_at=self.clock())
+        conn.close()
+        self.assertEqual(pipeline.run_job(svc, later, pipeline.CancelToken()), "skipped")
+        self.assertIn("Claude Code's usage limit 0% left", self.job(svc, later)["reason"])
+        self.assertEqual(len(self.agent_log("claude")), 1)  # it didn't start
+
+    def test_without_a_reserve_a_usage_limit_defers_without_using_an_attempt(self):
+        from local_autoreviewer import limits
+        cfg = make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0})
         svc, (job_id,) = self.queue(cfg)
-        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+        with mock.patch.object(limits, "note_used_up") as noted:
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "queued")
+        self.assertFalse(noted.called)
         job = self.job(svc, job_id)
         self.assertEqual(job["attempts"], 0)
         self.assertEqual(job["not_before"], self.clock() + pipeline.RATE_LIMIT_BACKOFF)
@@ -364,9 +395,16 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(self.job(svc, job_id)["attempts"], 1)
 
     def test_foreground_cancels_instead_of_waiting_out_a_usage_limit(self):
-        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"))
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0}))
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertIn("usage limit", self.job(svc, job_id)["reason"])
+
+    def test_a_foreground_review_that_hits_a_usage_limit_is_skipped(self):
+        self.seen_by_poller(self.head)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        self.poll_saw(svc, self.head)
+        self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "skipped")
+        self.assertEqual(self.poll_jobs(svc), 0)  # skipped, as the service would skip it
 
     def test_foreground_review_of_a_draft_runs(self):
         self.github.set_pr(1, self.head, draft=True)
@@ -680,7 +718,8 @@ class PipelineTests(EnvTestCase):
 
     def test_a_usage_limit_cancel_hands_the_head_back(self):
         self.seen_by_poller(self.head)
-        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit"), post=True)
+        svc, (job_id,) = self.foreground(make_config(self.tmp, claude="ratelimit", service={"min_limit_left": 0}),
+                                         post=True)
         self.poll_saw(svc, self.head)
         self.assertEqual(pipeline.run_foreground(svc, job_id, sleep=self.fail), "cancelled")
         self.assertEqual(self.poll_jobs(svc), 1)

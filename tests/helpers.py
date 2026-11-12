@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["LOCAL_AUTOREVIEWER_SHARE"] = str(ROOT)
 
-from local_autoreviewer import config as config_mod, pipeline  # noqa: E402
+from local_autoreviewer import config as config_mod, limits, pipeline  # noqa: E402
 from local_autoreviewer.github import MARKER_PREFIX, GitHubError  # noqa: E402
 from local_autoreviewer.gitops import Git  # noqa: E402
 from local_autoreviewer.runner import DirectRunner  # noqa: E402
@@ -240,6 +240,8 @@ class EnvTestCase(unittest.TestCase):
         self.state.mkdir()
         self.cfg = make_config(self.tmp)
         self.plan_limits = {}  # limits_key -> [limits.Limit] or limits.Unavailable: what the plans report
+        limits._readings.clear()  # what earlier tests' reviews noted, such as a usage limit they hit
+        self.addCleanup(limits._readings.clear)
 
     def tearDown(self):
         self._tmp.cleanup()

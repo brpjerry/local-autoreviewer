@@ -76,6 +76,18 @@ def read(agent, now):
         return cached[1]
 
 
+def note_used_up(agent, now):
+    """A review hit one of the plan's usage limits: until the next reading, FRESH seconds on, count the plan as
+    used up, so the agent's next reviews are skipped without starting. A free tier, which reports no limits,
+    is then simply tried again."""
+    key = agent.limits_key()
+    with _guard:
+        lock = _locks.setdefault(key, threading.Lock())
+    with lock:
+        _readings[key] = (now, [Limit("usage", 100.0)])
+    log.info("%s: a review hit a usage limit; its next reviews are skipped for %d minutes", key, FRESH // 60)
+
+
 def describe(limit, now):
     when = (f", resets {datetime.fromtimestamp(limit.resets_at).astimezone():%a %H:%M}"
             if limit.resets_at > now else "")

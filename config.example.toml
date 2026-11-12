@@ -13,7 +13,8 @@ retain_jobs = "14d"        # job checkouts are kept this long for `resume` / `as
 combine_wait = "30m"       # a finished review waits for the other agent's review of the same commit while that
                            # one runs, and this long while it is queued, to post both as one; "0s": each on its own
 min_limit_left = 10        # percent of each plan usage limit (5-hour, weekly, ...) reviews leave you: a review whose
-                           # plan has less left is skipped, not run; 0: don't check
+                           # plan has less left, or that hits a limit, is skipped; 0: don't check, and a review
+                           # that hits a limit waits 30 minutes and tries again
 # max_attempts = 3
 
 [defaults]                 # every [[repo]] inherits these and may override any of them
