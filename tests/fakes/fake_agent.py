@@ -79,11 +79,37 @@ def value_after(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
 
+RATE_LIMITS = {"ordinaryUsageAllowed": True, "rateLimitsByLimitId": {"codex": {
+    "limitId": "codex", "primary": {"usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1794544713},
+    "secondary": None}}}
+
+
+def app_server(mode):
+    """`codex app-server --listen stdio://`: JSON-RPC lines, as the usage reading uses them."""
+    for line in sys.stdin:
+        message = json.loads(line)
+        if mode == "appserver_hang":
+            continue
+        if mode == "appserver_noise":
+            print("not json", flush=True)
+        if message.get("method") == "initialize":
+            print(json.dumps({"method": "note"}), flush=True)  # a notification first, as the server may send
+            print(json.dumps({"id": message["id"], "result": {"userAgent": "fake"}}), flush=True)
+        elif message.get("method") == "account/rateLimits/read":
+            if mode == "appserver_error":
+                print(json.dumps({"id": message["id"], "error": {"message": "not signed in"}}), flush=True)
+            else:
+                print(json.dumps({"id": message["id"], "result": RATE_LIMITS}), flush=True)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     sep = args.index("--")
     opts, argv = args[:sep], args[sep + 1:]
     mode, log = value_after(opts, "--mode"), value_after(opts, "--log")
+    if argv[:1] == ["app-server"]:
+        return app_server(mode)
     prompt = sys.stdin.read()
     with open(log, "a") as handle:
         handle.write(json.dumps({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd(),

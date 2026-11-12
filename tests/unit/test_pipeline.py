@@ -171,6 +171,47 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(record["unchecked"], "the check failed")
         self.assertIn("weren't checked for duplicates (the check failed)", self.github.posted[0]["body"])
 
+    def test_a_review_is_skipped_when_its_plan_is_nearly_used_up(self):
+        """Nothing runs or posts for it, and the other reviewer's review of the commit posts without it."""
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit
+        svc, ids = self.queue(agents=("codex", "opencode"))
+        codex = make_agent(svc.config.agents["codex"], self.state)
+        self.plan_limits[codex.limits_key()] = [Limit("weekly", 92.0, self.clock() + 3600)]
+        self.assertEqual(pipeline.run_job(svc, ids[0], pipeline.CancelToken()), "skipped")
+        reason = self.job(svc, ids[0])["reason"]
+        self.assertIn("Codex's weekly limit 8% left, resets ", reason)
+        self.assertIn("under the 10% kept for you (min_limit_left); not reviewed", reason)
+        self.assertEqual(self.agent_log("codex"), [])
+        self.assertFalse(Path(pipeline.job_paths(self.state, ids[0]).worktree).exists())  # stopped before checkout
+        self.assertEqual(pipeline.run_job(svc, ids[1], pipeline.CancelToken()), "posted")  # not waiting for Codex
+        (posted,) = self.github.posted
+        self.assertIn("Automated review · OpenCode (opus)\n", posted["body"])
+
+    def test_what_doesnt_stop_a_review(self):
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit, Unavailable
+        later = self.clock() + 3600
+        cases = [("a reset since", [Limit("weekly", 99.0, self.clock() - 1)], None),
+                 ("another model's limit", [Limit("weekly (gpt-x)", 99.0, later, "gpt-x")], None),
+                 ("unknown limits", Unavailable("HTTP 429"), None),
+                 ("no reserve", [Limit("weekly", 99.0, later)], {"min_limit_left": 0}),
+                 ("enough left", [Limit("weekly", 85.0, later)], None)]
+        for rerun, (why, reading, service) in enumerate(cases):
+            with self.subTest(why=why):
+                svc = self.services(make_config(self.tmp, service=service))
+                self.plan_limits[make_agent(svc.config.agents["codex"], self.state).limits_key()] = reading
+                conn = svc.connect()
+                with db.transaction(conn):
+                    conn.execute("UPDATE jobs SET status='superseded'")
+                    job_id = db.insert_job(conn, repo=REPO, number=1, head_sha=self.head, base_ref="main",
+                                           agent="codex", model="m", source="poll", not_before=0, now=self.clock(),
+                                           post=False, rerun=rerun)
+                    db.update_job(conn, job_id, status="running", started_at=self.clock())
+                conn.close()
+                self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+                self.assertIn("review saved to", self.job(svc, job_id)["reason"])  # a trial ran to its end
+
     def test_head_moved_before_post_is_not_posted(self):
         svc, (job_id,) = self.queue()
         original = self.github.pr_view

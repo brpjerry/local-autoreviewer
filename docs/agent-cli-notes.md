@@ -63,6 +63,16 @@ Verified on 2026-11-11 against **opencode 2.2.7**, with `opencode/deepseek-v4.1-
 | Kill tree | `systemctl --user stop <scope>` kills every process in it, including a `setsid` child. |
 | Slice naming | Dashes nest slices: `foo-bar.slice` lives under `foo.slice`. Hence `autoreviewer.slice`. |
 
+## Plan usage limits
+
+Read on 2026-11-11 with the logins reviews use, as the operator's usage bar reads them. Nothing here starts a session or runs a model.
+
+| Agent | Source | Reply |
+| --- | --- | --- |
+| Claude | `GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer <claudeAiOauth.accessToken>` from `~/.claude/.credentials.json`, `anthropic-beta: oauth-2025-04-20`. Not a public API: it is what `/usage` shows. Rate limited (`429` with `Retry-After`). | A `limits` list: `{kind: session \| weekly_all \| weekly_scoped, percent, resets_at (ISO 8601), scope: null or {model: {display_name}}}`, and the same windows as `five_hour`/`seven_day` `{utilization, resets_at}`. Seen: session 8%, weekly 82%, a Fable-only weekly 67%. |
+| Codex (0.166.0) | `codex app-server --listen stdio://`: `initialize`, then `account/rateLimits/read` (JSON-RPC lines). | `rateLimitsByLimitId.codex` (and `rateLimits`): `primary`/`secondary` `{usedPercent, windowDurationMins, resetsAt (epoch s)}`, `normalModelSlug`, `ordinaryUsageAllowed`. On this plan only a weekly window (10080 min, 73%) and no 5-hour one. |
+| OpenCode (2.2.7) | `opencode api --standalone get /api/experimental/usage/limits` | Without an OpenCode Go sign-in, `{"data": null}`. With one, as the usage bar reads it, `data.go.{rolling,weekly,monthly}` `{percent, limited, status, resetsAt (epoch ms)}` and `data.budgets` `{limitDollars, spentDollars}`; not seen here. |
+
 ## Duplicate check
 
 Before the reviews of a commit are posted as one, the agent whose review finished last runs once more to find the items both reviews share. It is the same invocation as a review, with the same locked flags (and for opencode the same config), in the same checkout and context directory. Only the prompt (`prompts/duplicates.md`, with the items inline) and the output schema (`prompts/duplicates.schema.json`) differ, and the output goes to `out/duplicates/`. The schema follows the same rules as the review schema: every object has `additionalProperties: false` and lists all its properties in `required`, which Codex's `--output-schema` needs.

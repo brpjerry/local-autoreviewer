@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, feedback, leakscan, review, suggestions
+from . import combine, db, events, feedback, leakscan, limits, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS, agent_type
@@ -45,6 +45,7 @@ class Services:
     token_owner: str
     secrets: object = list  # callable returning credentials to block in posted text
     clock: object = time.time
+    limits: object = limits.read  # (agent, now) -> its login's plan limits, or limits.Unavailable
 
     def connect(self):
         return db.connect(self.state / "state.sqlite3")
@@ -510,6 +511,19 @@ def _author_comments(svc, job, pr):
         return []
 
 
+def _check_limits(svc, job, agent):
+    """Skip the review when one of its plan's usage limits is nearly used up, so the operator keeps a reserve
+    (service.min_limit_left percent of each). Unknown limits don't stop it."""
+    reserve = svc.config.service.min_limit_left
+    if reserve <= 0:
+        return
+    now = svc.now()
+    low = limits.low(svc.limits(agent, now), svc.config.agents[job["agent"]].model, reserve, now)
+    if low:
+        raise Outcome("skipped", f"{review.agent_label(job['agent'])}'s {limits.describe(low, now)}, under the "
+                                 f"{reserve}% kept for you (min_limit_left); not reviewed")
+
+
 def _run(conn, svc, job, cancel):
     cfg = svc.config
     repo_cfg = cfg.repo(job["repo"])
@@ -523,6 +537,7 @@ def _run(conn, svc, job, cancel):
         Path(directory).mkdir(parents=True, exist_ok=True)
 
     pr = _check_pr(svc, job)
+    _check_limits(svc, job, agent)
     # Both agents' jobs for a PR start together; the lock also covers creating the mirror.
     with repo_lock(svc.git.mirror_path(svc.state, job["repo"])):
         mirror = svc.git.ensure_mirror(svc.state, job["repo"])

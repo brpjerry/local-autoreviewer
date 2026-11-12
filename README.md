@@ -103,6 +103,10 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 - **Foreground reviews.** `review` waits out retries of up to 5 minutes and cancels a job that would wait longer, such as one hitting a usage limit. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit. With `--post`, a post interrupted by Ctrl-C is finished by the worker, and a run cancelled before its review is ready lets the service review that commit as it otherwise would have.
 - **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish, including posts that were interrupted or failed.
 - **Daily cap.** `max_reviews_per_day` limits reviews per agent, which protects your interactive budget. The short duplicate check before a combined post is part of its review and doesn't count separately. Usage-limit errors defer the job for 30 minutes without using up a retry.
+- **Plan reserve.** Before a review starts, the service reads its agent's plan usage limits, as the agents' own usage displays do. If any of them has less than `min_limit_left` percent left (10 by default), the review is skipped: nothing runs or posts for it, the job ends `skipped` with the limit in its reason, and the other reviewers' reviews of the commit post without it. A later push is checked again. A limit on one model only counts for a reviewer running that model. Readings are kept for 10 minutes per login; when they can't be read, the review runs. `doctor` shows each reviewer's limits.
+  - Claude: `api.anthropic.com/api/oauth/usage`, the endpoint behind `/usage`, with your Claude login's access token. The token is never refreshed, which would rotate it out from under Claude Code: an expired one means unknown limits until Claude next runs.
+  - Codex: the `account/rateLimits/read` request to a short-lived `codex app-server` in the reviews' `CODEX_HOME`, which starts no thread and runs no model.
+  - OpenCode: `opencode api --standalone get /api/experimental/usage/limits` in the reviews' home: OpenCode Go's rolling, weekly and monthly meters and budgets. Free models report none, so their reviews are never skipped for it.
 - **Resuming.** `resume` opens a normal interactive session with your full config. Run it in any terminal or multiplexer pane. Changes made there land in the review checkout, not your own clone.
 - **Retention.** Job checkouts are kept for `retain_jobs` (14 days by default); the review output and the recorded review data stay. After that, `resume` recreates the checkout as long as the commit can still be fetched.
 
@@ -148,6 +152,8 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 - Symlinks are checked out as plain files.
 - Git runs with hooks, LFS smudge, fsmonitor, external diff and your `~/.gitconfig` disabled.
 - Nothing from the PR is built or installed. The agents are told not to run anything; Claude has no way to.
+
+**Reading plan limits** (see Plan reserve) sends your Claude access token only to Anthropic's usage endpoint, from the service's own process; it never reaches an agent, argv or a log.
 
 **Running the agents:**
 - Agents get an allowlisted environment, with no `GH_TOKEN` and no `SSH_AUTH_SOCK`.

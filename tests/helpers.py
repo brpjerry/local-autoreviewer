@@ -239,6 +239,7 @@ class EnvTestCase(unittest.TestCase):
         self.state = self.tmp / "state"
         self.state.mkdir()
         self.cfg = make_config(self.tmp)
+        self.plan_limits = {}  # limits_key -> [limits.Limit] or limits.Unavailable: what the plans report
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -247,7 +248,8 @@ class EnvTestCase(unittest.TestCase):
         return pipeline.Services(
             config=cfg or self.cfg, state=self.state, github=self.github,
             git=Git(str(self.remote.base), self.github.env()), runner=DirectRunner(), token_owner=OWNER,
-            secrets=lambda: list(secrets), clock=self.clock)
+            secrets=lambda: list(secrets), clock=self.clock,
+            limits=lambda agent, now: self.plan_limits.get(agent.limits_key(), []))  # offline: never the real ones
 
     def agent_log(self, name):
         import json

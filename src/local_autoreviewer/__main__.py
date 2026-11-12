@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_mod
-from . import db, events, feedback, leakscan, maintenance, paths, pipeline
+from . import db, events, feedback, leakscan, limits, maintenance, paths, pipeline
 from .agents import make_agent
 from .config import ConfigError, ConfigWatcher
 from .github import GitHub, GitHubError, read_token
@@ -530,10 +530,13 @@ def cmd_doctor(args):
         if not shutil.which(agent_cfg.command):
             report(False, f"{name}: command {agent_cfg.command!r} not found")
             continue
-        ok, message = make_agent(agent_cfg, state).doctor()
+        agent = make_agent(agent_cfg, state)
+        ok, message = agent.doctor()
         if name != agent_cfg.type:  # a further reviewer: its login is its type's, so name the model it runs
             message = f"{name} ({agent_cfg.model or 'default model'}): {message}"
         report(ok, message)
+        if ok:
+            report(*_limits_line(cfg, name, agent))
     try:
         proc = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True,
                               timeout=30)
@@ -550,6 +553,23 @@ def cmd_doctor(args):
         report(False, f"systemctl --user unavailable: {exc}")
     print(f"version {paths.read_version()}")
     return 1 if failures else 0
+
+
+def _limits_line(cfg, name, agent):
+    """doctor's line on a reviewer's plan usage limits: a warning when one is under the reserve."""
+    now = int(time.time())
+    reading = limits.read(agent, now)
+    if isinstance(reading, limits.Unavailable):
+        return True, f"{name}: usage limits unknown ({reading}); its reviews run unchecked"
+    shown = [limit for limit in reading if limit.applies_to(cfg.agents[name].model)]
+    if not shown:
+        return True, f"{name}: no usage limits reported"
+    reserve = cfg.service.min_limit_left
+    low = limits.low(shown, cfg.agents[name].model, reserve, now)
+    text = "; ".join(limits.describe(limit, now) for limit in shown)
+    if low:
+        return False, f"{name}: {text}. Under {reserve}%: its reviews are skipped", True
+    return True, f"{name}: {text}"
 
 
 def build_parser():

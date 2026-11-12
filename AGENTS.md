@@ -5,7 +5,7 @@
 ## Rules
 
 - Use only the standard library at runtime, Python ≥ 3.11. The package depends only on `python`, `git`, `github-cli` and `systemd`; the agent CLIs are optional dependencies. Discuss any new runtime dependency first.
-- Tests use stdlib `unittest`: `python3 -m unittest discover -s tests -t .` (`pytest` works too). They must stay offline and fast, because they also run in the package's `check()`. Use the fakes in `tests/helpers.py` and `tests/fakes/fake_agent.py`, never a real agent or the GitHub API. The real-CLI test in `tests/integration/` is opt-in.
+- Tests use stdlib `unittest`: `python3 -m unittest discover -s tests -t .` (`pytest` works too). They must stay offline and fast, because they also run in the package's `check()`. Use the fakes in `tests/helpers.py` and `tests/fakes/fake_agent.py`, never a real agent or the GitHub API. `EnvTestCase.services()` also replaces the plan-limit reader with `self.plan_limits`, so no test reads a real plan's limits. The real-CLI test in `tests/integration/` is opt-in.
 - Never weaken the agent invocation. The locked parts are:
   - the flags in `agents/claude.py`, `agents/codex.py` and `agents/opencode.py` (`_locked_flags`, `DISABLED_FEATURES`), and opencode's locked config and environment (`locked_config`, `permissions`, `LOCKED_ENV`, its own home);
   - the environment allowlist in `agents/base.py`;
