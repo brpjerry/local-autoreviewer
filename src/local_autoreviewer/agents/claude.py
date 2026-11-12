@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Claude Code adapter: headless, no command execution, file tools confined to the job."""
 
+import http.client
 import json
 import subprocess
 import time
@@ -145,7 +146,7 @@ class ClaudeAgent:
                 usage = json.load(response)
         except urllib.error.HTTPError as exc:
             raise Unavailable(f"the usage endpoint answered HTTP {exc.code}") from None
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:  # IncompleteRead is an HTTPException
             raise Unavailable(f"the usage endpoint failed: {type(exc).__name__}") from None
         limits = claude_limits(usage if isinstance(usage, dict) else {})
         if not limits:

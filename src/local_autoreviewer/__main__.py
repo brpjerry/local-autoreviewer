@@ -562,8 +562,10 @@ def _limits_line(cfg, name, agent):
     if isinstance(reading, limits.Unavailable):
         return True, f"{name}: usage limits unknown ({reading}); its reviews run unchecked"
     shown = [limit for limit in reading if limit.applies_to(cfg.agents[name].model)]
-    if not shown:
+    if not reading:
         return True, f"{name}: no usage limits reported"
+    if not shown:
+        return True, f"{name}: none of its plan's usage limits are on its model"
     reserve = cfg.service.min_limit_left
     low = limits.low(shown, cfg.agents[name].model, reserve, now)
     text = "; ".join(limits.describe(limit, now) for limit in shown)

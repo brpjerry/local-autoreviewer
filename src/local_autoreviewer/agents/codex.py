@@ -129,8 +129,11 @@ def app_server_call(command, env, cwd, method, timeout=30):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-        proc.stdin.close()
-        proc.stdout.close()
+        for stream in (proc.stdin, proc.stdout):
+            try:  # closing stdin flushes what a failed send left in its buffer, into a pipe that is gone
+                stream.close()
+            except OSError:
+                pass
 
 
 class CodexAgent:

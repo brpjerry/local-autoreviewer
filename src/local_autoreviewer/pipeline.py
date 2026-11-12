@@ -520,8 +520,10 @@ def _check_limits(svc, job, agent):
     now = svc.now()
     low = limits.low(svc.limits(agent, now), svc.config.agents[job["agent"]].model, reserve, now)
     if low:
+        # No review ran, so none counts towards the daily cap; unless an earlier attempt of this job ran its agent.
+        uncounted = {} if job["scope_unit"] else {"started_at": None}
         raise Outcome("skipped", f"{review.agent_label(job['agent'])}'s {limits.describe(low, now)}, under the "
-                                 f"{reserve}% kept for you (min_limit_left); not reviewed")
+                                 f"{reserve}% kept for you (min_limit_left); not reviewed", **uncounted)
 
 
 def _run(conn, svc, job, cancel):

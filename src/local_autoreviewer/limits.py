@@ -25,7 +25,7 @@ class Limit:
     name: str  # "5-hour", "weekly", "weekly (Fable)"
     used: float  # percent of the limit used
     resets_at: int = 0  # epoch seconds; 0 if not known
-    model: str = ""  # set for a limit on one model only, which counts only for a reviewer running it
+    model: str = ""  # set for a limit on some models only (part of their name, such as a provider prefix)
 
     def left(self, now):
         """Percent left: all of it once the window has reset."""
@@ -68,6 +68,10 @@ def read(agent, now):
             except Unavailable as exc:
                 value = exc
                 log.info("%s: can't read the plan's usage limits (%s); reviews run without the check", key, exc)
+            except Exception as exc:  # the check is optional: an unexpected failure mustn't fail the review
+                value = Unavailable(f"unexpected {type(exc).__name__}")
+                log.warning("%s: reading the plan's usage limits failed (%s); reviews run without the check", key,
+                            type(exc).__name__, exc_info=True)
             cached = _readings[key] = (now, value)
         return cached[1]
 

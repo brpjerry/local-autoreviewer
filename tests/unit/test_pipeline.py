@@ -187,6 +187,24 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(pipeline.run_job(svc, ids[1], pipeline.CancelToken()), "posted")  # not waiting for Codex
         (posted,) = self.github.posted
         self.assertIn("Automated review · OpenCode (opus)\n", posted["body"])
+        # No review ran, so it doesn't count towards the daily cap.
+        self.assertIsNone(self.job(svc, ids[0])["started_at"])
+        conn = svc.connect()
+        self.assertEqual(db.started_since(conn, "codex", 0), 0)
+        conn.close()
+
+    def test_a_skipped_retry_whose_agent_ran_before_still_counts(self):
+        from local_autoreviewer.agents import make_agent
+        from local_autoreviewer.limits import Limit
+        svc, (job_id,) = self.queue(agents=("codex",))
+        conn = svc.connect()
+        with db.transaction(conn):  # an earlier attempt ran the agent, then failed and was queued again
+            db.update_job(conn, job_id, scope_unit="local-autoreviewer-job-1")
+        conn.close()
+        self.plan_limits[make_agent(svc.config.agents["codex"], self.state).limits_key()] = [
+            Limit("weekly", 95.0, self.clock() + 3600)]
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(self.job(svc, job_id)["started_at"], self.clock())
 
     def test_what_doesnt_stop_a_review(self):
         from local_autoreviewer.agents import make_agent

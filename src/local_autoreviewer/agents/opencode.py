@@ -160,9 +160,13 @@ def extract_json(text):
     return value
 
 
+GO_MODELS = "opencode-go/"  # the provider of OpenCode Go's models: the usage reply's limits are theirs only
+
+
 def opencode_limits(reply):
-    """The limits in a usage reply: OpenCode Go's rolling, weekly and monthly meters and any budgets. Without a
-    Go subscription the reply's data is null, so there are none: free models report no limits."""
+    """The limits in a usage reply, the OpenCode Go usage the server reads: Go's rolling, weekly and monthly
+    meters and any budgets. They count only for reviewers on Go models: a free model spends none of them.
+    Without a Go sign-in the reply's data is null, so there are none."""
     data = reply.get("data") if isinstance(reply.get("data"), dict) else None
     go = (data or {}).get("go")
     found = []
@@ -171,15 +175,15 @@ def opencode_limits(reply):
         if isinstance(meter, dict) and number(meter.get("percent")):
             limited = meter.get("limited") is True or meter.get("status") == "rate-limited"
             resets = int(meter["resetsAt"] / 1000) if number(meter.get("resetsAt")) and meter["resetsAt"] > 0 else 0
-            found.append(Limit(key, 100.0 if limited else float(meter["percent"]), resets))
+            found.append(Limit(f"Go {key}", 100.0 if limited else float(meter["percent"]), resets, GO_MODELS))
     budgets = (data or {}).get("budgets")
     for budget in budgets if isinstance(budgets, list) else ():
         if isinstance(budget, dict) and number(budget.get("limitDollars")) and budget["limitDollars"] > 0 \
                 and number(budget.get("spentDollars")):
             resets = int(budget["resetsAt"] / 1000) if number(budget.get("resetsAt")) and budget["resetsAt"] > 0 \
                 else 0
-            name = f"{budget.get('per') or ''} budget".strip()
-            found.append(Limit(name, 100.0 * budget["spentDollars"] / budget["limitDollars"], resets))
+            name = " ".join(filter(None, ("Go", str(budget.get("per") or ""), "budget")))
+            found.append(Limit(name, 100.0 * budget["spentDollars"] / budget["limitDollars"], resets, GO_MODELS))
     return found
 
 

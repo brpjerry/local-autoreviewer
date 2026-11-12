@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Plan usage limits: reading them per agent type, and deciding which reviews to skip."""
 
+import http.client
 import json
 import os
 import tempfile
@@ -93,6 +94,16 @@ class ReadTests(unittest.TestCase):
         self.assertIsInstance(limits.read(agent, NOW + 60), Unavailable)
         self.assertEqual(agent.read_limits.call_count, 1)  # not asked again on every review
 
+    def test_an_unexpected_failure_counts_as_unknown(self):
+        agent = mock.Mock()
+        agent.limits_key.return_value = "codex:/home"
+        agent.read_limits.side_effect = RuntimeError("boom")
+        with self.assertLogs("local_autoreviewer.limits", "WARNING") as logs:
+            reading = limits.read(agent, NOW)
+        self.assertIsInstance(reading, Unavailable)
+        self.assertEqual(str(reading), "unexpected RuntimeError")
+        self.assertIn("reviews run without the check", logs.output[0])
+
     def test_reviews_starting_together_share_one_reading(self):
         started, calls = threading.Event(), []
 
@@ -145,9 +156,15 @@ class ParserTests(unittest.TestCase):
                                  "monthly": {"percent": 20, "status": "rate-limited"}},
                           "budgets": [{"ruleID": "r1", "per": "monthly", "limitDollars": 20, "spentDollars": 19},
                                       {"limitDollars": 0, "spentDollars": 1}]}}
-        self.assertEqual([(l.name, l.used, l.resets_at) for l in opencode_limits(reply)],
-                         [("rolling", 40.0, 1_800_000_000), ("weekly", 100.0, 0), ("monthly", 100.0, 0),
-                          ("monthly budget", 95.0, 0)])
+        found = opencode_limits(reply)
+        self.assertEqual([(l.name, l.used, l.resets_at) for l in found],
+                         [("Go rolling", 40.0, 1_800_000_000), ("Go weekly", 100.0, 0), ("Go monthly", 100.0, 0),
+                          ("Go monthly budget", 95.0, 0)])
+        # The reply is OpenCode Go's usage: it counts for Go models only, not for a free or another provider's.
+        for model, low in (("opencode-go/glm-5", True), ("opencode/deepseek-v4.1-flash-free", False),
+                           ("anthropic/claude-x", False), ("", False)):
+            with self.subTest(model=model):
+                self.assertEqual(limits.low(found, model, 10, NOW) is not None, low)
 
 
 class ReaderTests(unittest.TestCase):
@@ -186,6 +203,10 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaisesRegex(Unavailable, "HTTP 429") as raised:
                 self.agent("claude").read_limits()
             self.assertNotIn("tok-123", str(raised.exception))
+            urlopen.side_effect = None
+            with mock.patch("json.load", side_effect=http.client.IncompleteRead(b"{")), \
+                    self.assertRaisesRegex(Unavailable, "IncompleteRead"):  # a body cut short
+                self.agent("claude").read_limits()
 
     def test_codex_asks_its_app_server(self):
         command, _ = agent_command(self.tmp, "codex", "ok")
@@ -205,11 +226,26 @@ class ReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(Unavailable, "can't start"):
             self.agent("codex", command=str(self.tmp / "missing")).read_limits()
 
+    def test_a_codex_app_server_gone_before_the_request(self):
+        """The send fails, and closing stdin then flushes the same bytes into the same broken pipe: still
+        Unavailable, with both pipes closed."""
+        from local_autoreviewer.agents import codex as codex_mod
+        read_end, write_end = os.pipe()
+        os.close(write_end)
+        stdin = mock.Mock(flush=mock.Mock(side_effect=BrokenPipeError), close=mock.Mock(side_effect=BrokenPipeError))
+        stdout = os.fdopen(read_end, "rb")
+        proc = mock.Mock(stdin=stdin, stdout=stdout)
+        with mock.patch("subprocess.Popen", return_value=proc), \
+                self.assertRaisesRegex(Unavailable, "BrokenPipeError"):
+            codex_mod.app_server_call("codex", {}, self.tmp, "account/rateLimits/read")
+        stdin.close.assert_called_once()
+        self.assertTrue(stdout.closed)
+
     def test_opencode_asks_a_private_server(self):
         opencode = self.agent("opencode", model="opencode/deepseek-v4.1-flash-free")
         reply = json.dumps({"data": {"go": {"weekly": {"percent": 91}}}})
         with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=reply)) as run:
-            self.assertEqual([(l.name, l.used) for l in opencode.read_limits()], [("weekly", 91.0)])
+            self.assertEqual([(l.name, l.used) for l in opencode.read_limits()], [("Go weekly", 91.0)])
         self.assertEqual(run.call_args.args[0], ["opencode", "api", "--standalone", "get",
                                                  "/api/experimental/usage/limits"])
         self.assertEqual(run.call_args.kwargs["env"]["HOME"], str(self.tmp / "state/opencode-home"))
@@ -237,7 +273,9 @@ class DoctorTests(unittest.TestCase):
                   "codex-sol: weekly limit 41% left, resets "),
                  ([Limit("weekly", 95.0, now + 3600)], False, "Under 10%: its reviews are skipped"),
                  (Unavailable("HTTP 429"), True, "usage limits unknown (HTTP 429)"),
-                 ([], True, "no usage limits reported")]
+                 ([], True, "no usage limits reported"),
+                 ([Limit("Go weekly", 99.0, now + 3600, "opencode-go/")], True,
+                  "none of its plan's usage limits are on its model")]
         for reading, ok, text in cases:
             with self.subTest(text=text), mock.patch.object(cli.limits, "read", return_value=reading):
                 line = cli._limits_line(cfg, "codex-sol", agent)
