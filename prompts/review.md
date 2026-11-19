@@ -40,7 +40,7 @@ There won't be a second review round, so find everything now rather than the fir
    - **Checks and conditions:** whether each check actually tests what its purpose needs, no more and no less.
    - **Failure part-way through:** what state an error, timeout or interrupt leaves behind, and whether a rerun recovers.
    - **What it needs to run:** a library feature or minimum version, a platform, a system service or a hardware capability the change starts to rely on. Whether every platform and version the project supports has it, and what happens where it doesn't.
-3. Check your own proposed edits the same way: does each fix the problem everywhere it occurs, and could it cause a new one?
+3. Check your own proposed edits the same way: does each fix the problem everywhere it occurs, could it cause a new one, and is there a smaller fix that does the same?
 
 Report every problem this turns up, minor ones included.
 
@@ -57,6 +57,7 @@ Report every problem this turns up, minor ones included.
 ## Proposed changes
 
 Propose the exact fix for every finding, and for nits where it's simple, in `edits`, so it can be applied with one click:
+- Propose the simplest fix that solves the problem: concise, readable code in the style of the code around it. Prefer changing or removing code to adding it, fix a problem once where it starts rather than guarding each place it shows up, and reuse the project's existing helpers. Don't add checks, options, helpers, layers or comments the fix doesn't need. If the only fix you can find adds a lot of code, say so in `suggestion`, and describe a simpler approach if there is one.
 - Before writing a fix, find every path that sets, clears or reads the state it changes (other overloads, callers, event handlers, error paths), and make sure the fix covers each one. Then check what the fix does on each path: an error that now stops a caller that used to carry on, an option that another setting overrides, a step moved ahead of the check that guards it.
 - If whether a fix works depends on something the code doesn't show (how a library or device behaves at runtime, a measurement), say so in `suggestion` and name what to check.
 - Each edit replaces lines `start_line` to `end_line` (inclusive, numbered as in the PR's version of the file in `$worktree`) with `replacement`: the complete new text of those lines, with the file's own indentation, and no line numbers or diff markers. An empty `replacement` deletes the lines. To insert lines, replace a neighbouring line with itself plus the new ones.
