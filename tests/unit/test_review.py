@@ -81,6 +81,14 @@ class RenderTests(unittest.TestCase):
         self.assertIn("2. **Clever**", nits)
         self.assertIn("lowered from major: less readable", nits)
 
+    def test_render_notes_lines_a_fix_removes(self):
+        shorter = dict(SAMPLE["findings"][1], loc_delta=-3, impact=3, likelihood="rare")
+        body = self.render(dict(SAMPLE, findings=[shorter, dict(shorter, loc_delta=-1, title="One"),
+                                                  dict(shorter, loc_delta=2, title="Longer")]))
+        self.assertIn("impact 3/10, rare, the fix removes 3 lines)_", body)
+        self.assertIn("the fix removes 1 line)_", body)
+        self.assertEqual(body.count("the fix removes"), 2)
+
     def test_render_leaves_out_dropped_edits(self):
         def change(line, anchor, **extra):
             return {"file": "a.py", "start_line": line, "end_line": line, "replacement": f"new{line}",

@@ -136,17 +136,17 @@ class SuggestionTests(unittest.TestCase):
         self.assertEqual(suggestions.replacement_lines(""), [])
         self.assertEqual(suggestions.replacement_lines("x\n"), ["x"])
 
-    def test_severity_modifiers(self):
+    def test_severity_modifier(self):
         cases = [
-            (("minor", -3, "same"), "major"), (("major", -1, "same"), "blocker"), (("minor", 2, "same"), "minor"),
-            (("major", 0, "worse"), "nit"), (("minor", 0, "worse"), "nit"), (("major", -1, "worse"), "minor"),
-            (("minor", -1, "worse"), "nit"), (("blocker", -5, "worse"), "blocker"), (("minor", 0, "better"), "minor"),
+            (("major", "worse"), "nit"), (("minor", "worse"), "nit"), (("blocker", "worse"), "blocker"),
+            (("minor", "better"), "minor"), (("major", "same"), "major"),
         ]
         for args, expected in cases:
             with self.subTest(args=args):
                 self.assertEqual(suggestions.adjust(*args)[0], expected)
-        self.assertEqual(suggestions.adjust("minor", -2, "worse")[1], ["removes 2 lines", "less readable"])
-        self.assertEqual(suggestions.adjust("blocker", -2, "worse")[1], [])
+        self.assertEqual(suggestions.adjust("minor", "worse")[1], ["less readable"])
+        self.assertEqual(suggestions.adjust("blocker", "worse")[1], [])
+        self.assertEqual(suggestions.adjust("major", "same")[1], [])
 
     def test_fence_cannot_be_closed_early(self):
         block = suggestions.fence("suggestion", "x = '```'\n````")
@@ -164,8 +164,9 @@ class SuggestionTests(unittest.TestCase):
                 "nits": [{"text": "t", "edits": [edit("tests/test_app.py", 1, 1, "T")]}]}
         hunks = {"src/app.py": [(1, 4)]}
         out = suggestions.apply(data, worktree=self.worktree, hunks=hunks, test_paths=DEFAULT_TEST_PATHS)
-        self.assertEqual([(f["title"], f["reviewer_severity"], f["severity"]) for f in out["findings"]],
-                         [("n", "minor", "major"), ("o", "minor", "minor"), ("m", "major", "nit")])
+        # A fix that removes lines (n's) no longer raises the finding; it's recorded in loc_delta.
+        self.assertEqual([(f["title"], f["reviewer_severity"], f["severity"], f["loc_delta"]) for f in out["findings"]],
+                         [("n", "minor", "minor", -2), ("o", "minor", "minor", 0), ("m", "major", "nit", 0)])
         self.assertEqual(out["findings"][1]["edits"], [])  # the edit outside the checkout was dropped
         self.assertTrue(out["findings"][0]["edits"][0]["inline"])
         self.assertFalse(out["nits"][0]["edits"][0]["inline"])  # tests/ isn't part of this diff
