@@ -148,7 +148,7 @@ def build_followup_prompt(*, previous_sha, previous_count, prompts=None, **field
     full = prompts["review.md"]
     # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
     text = Template(prompts["followup.md"]).safe_substitute(
-        method=_section(full, "Method: this is the only pass"),
+        what_to_report=_section(full, "What to report"), method=_section(full, "Method: this is the only pass"),
         coverage=_section(full, "What to cover (a thorough review)"),
         proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
         previous_sha=previous_sha, previous_count=previous_count)
@@ -249,7 +249,7 @@ def _edits(raw):
             if isinstance(item.get("stated"), list) and len(item["stated"]) == 2:
                 edit["stated"] = [_int(n) for n in item["stated"]]
         edits.append(edit)
-    return edits[:suggestions.MAX_EDITS]
+    return edits if len(edits) <= suggestions.MAX_EDITS else []  # a cut-down fix would look complete
 
 
 def _int(value):

@@ -263,6 +263,14 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(body.count("(also a one-click suggestion on the PR)"), 1)
         self.assertEqual([e["inline"] for e in saved["findings"][0]["edits"]], [True, True, True])  # as recorded
 
+    def test_a_fix_over_the_edit_limit_is_left_out_whole(self):
+        def edits(count):
+            return [{"file": "a.py", "start_line": n, "end_line": n, "replacement": "x", "current": "y"}
+                    for n in range(1, count + 1)]
+        data = review.validate(dict(SAMPLE, findings=[dict(SAMPLE["findings"][0], edits=edits(10)),
+                                                      dict(SAMPLE["findings"][0], edits=edits(11))]))
+        self.assertEqual([len(f["edits"]) for f in data["findings"]], [10, 0])  # not a fix cut short
+
     def test_validate_rejects_garbage(self):
         for data in (None, [], {"summary": ""}, {"summary": "x", "findings": ["no"]}):
             with self.subTest(data=data), self.assertRaises(review.ReviewFormatError):

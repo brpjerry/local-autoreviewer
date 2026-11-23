@@ -17,7 +17,12 @@ $agent_note
 - Start with pr.diff, then read the surrounding code you need to judge each change: callers, definitions, tests, config.
 - Only report problems in code this PR adds or changes, or problems the PR makes reachable. Don't review untouched legacy code.
 - Be concrete. Every finding needs a failure scenario: which input or state leads to which wrong result. Leave out speculative findings you can't support from the code.
+
+## What to report
+
 - Treat what the description and commit messages say about the code as claims to check, not facts: what causes a bug, what a change fixes, what was measured or tested, what never happens, and why the chosen design beats the alternatives. Check each against the code. If a finding rests on one you can't confirm there, say so in its `detail`; if the code can't settle it, ask for the evidence in `questions`.
+- Before reporting a problem, check that the PR causes it, by the lines it adds or changes or by what it leaves out (a caller, a version number or a migration it should have updated). If the base branch already had it and the PR only makes it reachable another way, say in `detail` that it predates the PR, and rate only what the PR adds.
+- Respect what the project's docs, code comments, the description or commit messages declare out of scope, unsupported or deliberate: the limit itself isn't a defect. A failure in supported behaviour that can be fixed while keeping the limit still is. If a small change would lift the limit, propose it once, as a minor finding that says the limit was declared. Ask about other doubts on a decision once in `questions`, saying what they cost.
 
 ## Trivial PRs
 
@@ -42,8 +47,6 @@ There won't be a second review round, so find everything now rather than the fir
    - **What it needs to run:** a library feature or minimum version, a platform, a system service or a hardware capability the change starts to rely on. Whether every platform and version the project supports has it, and what happens where it doesn't.
 3. Check your own proposed edits the same way: does each fix the problem everywhere it occurs, could it cause a new one, and is there a smaller fix that does the same?
 4. When you find a problem, search the PR for the same pattern elsewhere. When several problems share one cause (a design choice, a shared helper, one missing check), report the cause once, as one finding that lists where it shows up, and say whether narrowing what the code supports would be simpler than fixing each place.
-5. Before reporting a problem, check that the PR causes it, by the lines it adds or changes or by what it leaves out (a caller, a version number or a migration it should have updated). If the base branch already had it and the PR only makes it reachable another way, say in `detail` that it predates the PR, and rate only what the PR adds.
-6. Respect what the project's docs, code comments, the description or commit messages declare out of scope, unsupported or deliberate: the limit itself isn't a defect. A failure in supported behaviour that can be fixed while keeping the limit still is. If a small change would lift the limit, propose it once, as a minor finding that says the limit was declared. Ask about other doubts on a decision once in `questions`, saying what they cost.
 
 Report every problem this turns up, minor ones included.
 
