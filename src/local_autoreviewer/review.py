@@ -354,8 +354,9 @@ def _finding(number, item, repo, sha, attribute=False):
         rating.append(f"impact {item['impact']}/10")
     if item.get("likelihood"):
         rating.append(item["likelihood"])
-    if (item.get("loc_delta") or 0) < 0:
-        rating.append(f"the fix removes {-item['loc_delta']} line{'s' if item['loc_delta'] < -1 else ''}")
+    notes = item.get("severity_notes") or []
+    if (item.get("loc_delta") or 0) < 0 and not any(note.startswith("removes ") for note in notes):  # pre-0.12.1
+        rating.append(f"the fix removes {-item['loc_delta']} non-test line{'s' if item['loc_delta'] < -1 else ''}")
     rating = ", ".join(rating)
     if attribute:
         rating = f"{reviewer_names(item['reviewers'])}; {rating}"
