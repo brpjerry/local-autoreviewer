@@ -355,15 +355,16 @@ def _finding(number, item, repo, sha, attribute=False):
     if item.get("likelihood"):
         rating.append(item["likelihood"])
     notes = item.get("severity_notes") or []
-    if (item.get("loc_delta") or 0) < 0 and not any(note.startswith("removes ") for note in notes):  # pre-0.12.1
-        rating.append(f"the fix removes {-item['loc_delta']} non-test line{'s' if item['loc_delta'] < -1 else ''}")
+    removed = -(item.get("loc_delta") or 0)
+    if removed > 0 and not any(note.startswith("removes ") for note in notes):  # a pre-0.12.1 review says it already
+        rating.append(f"the fix removes {removed} non-test line{'s' if removed > 1 else ''}")
     rating = ", ".join(rating)
     if attribute:
         rating = f"{reviewer_names(item['reviewers'])}; {rating}"
-    if item.get("severity_notes"):
+    if notes:
         moved = "raised" if suggestions.LEVELS.index(item["severity"]) > \
             suggestions.LEVELS.index(item["reviewer_severity"]) else "lowered"
-        rating += f"; {moved} from {item['reviewer_severity']}: {', '.join(item['severity_notes'])}"
+        rating += f"; {moved} from {item['reviewer_severity']}: {', '.join(notes)}"
     lines = [line + f" _({rating})_"]
     for other in item.get("also") or []:  # the same issue from another reviewer, rated differently
         if other["severity"] == "nit":
