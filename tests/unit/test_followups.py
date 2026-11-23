@@ -861,6 +861,10 @@ class FollowupFormatTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertNotIn("$", prompt)
         self.assertEqual(prompt.count("Return your "), 1)
+        # What to report applies to a review of the whole PR too: the method carries those rules.
+        method = prompt[prompt.index("## Method: this is the only pass"):prompt.index("## What to cover")]
+        self.assertIn("predates the PR", method)
+        self.assertIn("declare out of scope, unsupported or deliberate", method)
 
     def test_render_new_code(self):
         previous = [{"id": 1, "agent": "codex", "severity": "major", "title": "Leaks a handle", "file": "a.py",

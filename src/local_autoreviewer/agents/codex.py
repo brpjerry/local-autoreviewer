@@ -176,7 +176,8 @@ class CodexAgent:
 
     def agent_note(self):
         if self.cfg.mode == "inline":
-            return "You have no tools. Everything you may use (the diff and the changed files) is included below."
+            return ("You have no tools. Everything you may use (the PR's description and commits, the project's docs, "
+                    "the diff and the changed files) is included below.")
         return ("You can run read-only shell commands (cat, rg, git log/show) in a sandbox with no "
                 "network and no write access. Use them only to read code; never build, install or run it.")
 
@@ -186,7 +187,8 @@ class CodexAgent:
         diff = Path(paths.context, "pr.diff").read_text(errors="replace")
         parts.append(f"\n## pr.diff\n\n```diff\n{diff[:INLINE_LIMIT // 2]}\n```\n")
         size += len(parts[-1])
-        for name in ("previous-findings.json", "already-raised.json", "author-comments.json", "since-review.diff"):
+        for name in ("pr.json", "commits.txt", "project-docs/CLAUDE.md", "project-docs/AGENTS.md",
+                     "previous-findings.json", "already-raised.json", "author-comments.json", "since-review.diff"):
             extra = Path(paths.context, name)
             if extra.is_file():
                 text = extra.read_text(errors="replace")

@@ -179,7 +179,13 @@ class ArgvTests(unittest.TestCase):
             comments = [{"kind": "comment", "body": f"note {n} " + "é" * 2900} for n in range(40)]
             comments[-1]["body"] = "Won't fix 2: the caller closes it."
             Path(paths.context, "author-comments.json").write_text(json.dumps(comments, indent=2))
+            Path(paths.context, "pr.json").write_text(json.dumps({"body": "Not done: the reader version."}))
+            Path(paths.context, "project-docs").mkdir()
+            Path(paths.context, "project-docs", "AGENTS.md").write_text("Only Linux is supported.")
             text = codex.inline_context(paths)
+        self.assertIn("Not done: the reader version.", text)  # declared limits reach a reviewer without tools
+        self.assertIn("## project-docs/AGENTS.md\n\n```\nOnly Linux is supported.", text)
+        self.assertNotIn("## commits.txt", text)  # absent files are skipped
         self.assertIn("## author-comments.json", text)
         self.assertIn("Won't fix 2: the caller closes it.", text)  # the latest survives the cut
         self.assertNotIn("note 0 ", text)
