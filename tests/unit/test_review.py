@@ -267,9 +267,14 @@ class RenderTests(unittest.TestCase):
         def edits(count):
             return [{"file": "a.py", "start_line": n, "end_line": n, "replacement": "x", "current": "y"}
                     for n in range(1, count + 1)]
-        data = review.validate(dict(SAMPLE, findings=[dict(SAMPLE["findings"][0], edits=edits(10)),
-                                                      dict(SAMPLE["findings"][0], edits=edits(11))]))
-        self.assertEqual([len(f["edits"]) for f in data["findings"]], [10, 0])  # not a fix cut short
+        too_long = dict(edits(1)[0], replacement="x" * (suggestions.MAX_REPLACEMENT + 1))
+        data = review.validate(dict(SAMPLE, findings=[
+            dict(SAMPLE["findings"][0], edits=edits(10), readability="worse"),
+            dict(SAMPLE["findings"][0], edits=edits(11), readability="worse"),
+            dict(SAMPLE["findings"][0], edits=edits(10) + [too_long])]))  # counted as sent, not as kept
+        self.assertEqual([len(f["edits"]) for f in data["findings"]], [10, 0, 0])  # not a fix cut short
+        # A fix the reader never sees doesn't lower the finding for being less readable.
+        self.assertEqual([f["readability"] for f in data["findings"][:2]], ["worse", "same"])
 
     def test_validate_rejects_garbage(self):
         for data in (None, [], {"summary": ""}, {"summary": "x", "findings": ["no"]}):

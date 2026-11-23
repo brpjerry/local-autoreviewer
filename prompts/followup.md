@@ -33,7 +33,7 @@ $agent_note
 - Do not build, install, test or run anything from the repository. Read the code instead.
 - Check each fix against the finding's failure scenario, not against the proposed edit or what a commit message says it fixes: a different fix can be right, an applied edit can still miss a case, and a commit message can claim more than the code does.
 - When checking for regressions, follow each change through its callers and the code that runs alongside it: unusual inputs, the order things happen in, concurrency, whether checks test what they should, failure part-way through, and anything it newly needs to run (a library feature or version, a platform, hardware).
-- The next section, from the full review, applies to every follow-up, with regressions as its findings; without new code, leave out what it says to ask in `questions`.
+- The next section, from the full review, applies to every follow-up, with regressions as its findings, and what the author wrote in `author-comments.json` counts among the declared limits. Without new code, leave out what it says to propose for lifting a declared limit or to ask in `questions`.
 
 $what_to_report
 ## A full review, for job 3
