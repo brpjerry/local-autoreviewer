@@ -2,9 +2,9 @@
 """Reviewers' proposed changes: check them against the checkout, measure what they do to the size of
 the code, adjust each finding's severity, and turn the edits GitHub can show into suggested changes.
 
-Severity modifiers (blockers are exempt): a fix that removes non-test lines goes up one level; a fix
-the reviewer rates less readable goes down two. The levels are nit < minor < major < blocker, so a
-finding can end up a nit, and one only goes up to blocker from major.
+Severity modifier (blockers are exempt): a fix the reviewer rates less readable goes down two levels. The
+levels are nit < minor < major < blocker, so a finding can end up a nit. A fix that removes non-test lines
+no longer raises the finding: the review notes it (loc_delta) instead.
 """
 
 import html
@@ -139,18 +139,11 @@ def loc_delta(edits, test_paths):
                for e in applied(edits) if not is_test_path(e["file"], test_paths))
 
 
-def adjust(severity, delta, readability):
+def adjust(severity, readability):
     """Final severity and the reasons it differs from the reviewer's."""
-    if severity == "blocker":
+    if severity == "blocker" or readability != "worse":
         return severity, []
-    level, notes = LEVELS.index(severity), []
-    if delta < 0:
-        level += 1
-        notes.append(f"removes {-delta} line{'s' if delta < -1 else ''}")
-    if readability == "worse":
-        level -= 2
-        notes.append("less readable")
-    return LEVELS[max(0, min(level, len(LEVELS) - 1))], notes
+    return LEVELS[max(0, LEVELS.index(severity) - 2)], ["less readable"]
 
 
 def apply(review, *, worktree, hunks, test_paths):
@@ -163,7 +156,7 @@ def apply(review, *, worktree, hunks, test_paths):
         delta = loc_delta(edits, test_paths)
         # Readability rates the proposed fix; if none of it can be applied, the review doesn't show it.
         readability = item["readability"] if applied(edits) or not item["edits"] else "same"
-        final, notes = adjust(item["severity"], delta, readability)
+        final, notes = adjust(item["severity"], readability)
         findings.append({**item, "edits": _mark_inline(edits, hunks), "loc_delta": delta,
                          "reviewer_severity": item["severity"], "severity": final, "severity_notes": notes})
     findings.sort(key=lambda f: LEVELS.index(f["severity"]), reverse=True)

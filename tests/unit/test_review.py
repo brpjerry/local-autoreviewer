@@ -71,15 +71,24 @@ class RenderTests(unittest.TestCase):
 
     def test_render_shows_severity_changes_and_demoted_findings(self):
         raised = dict(SAMPLE["findings"][0], severity="major", reviewer_severity="minor",
-                      severity_notes=["removes 3 lines"], title="Shorter")
+                      severity_notes=["removes 3 lines"], loc_delta=-3, title="Shorter")
         demoted = dict(SAMPLE["findings"][0], severity="nit", reviewer_severity="major",
-                       severity_notes=["less readable"], title="Clever")
+                       severity_notes=["less readable"], loc_delta=-2, title="Clever")
         body = self.render(dict(SAMPLE, findings=[raised, demoted], nits=[]))
-        self.assertIn("1. **Shorter**", body)
-        self.assertIn("raised from minor: removes 3 lines", body)
-        nits = body[body.index("<details><summary>Nits (1)</summary>"):]
-        self.assertIn("2. **Clever**", nits)
-        self.assertIn("lowered from major: less readable", nits)
+        nits = body.index("<details><summary>Nits (1)</summary>")
+        self.assertIn("1. **Shorter**", body[:nits])
+        self.assertIn("raised from minor: removes 3 lines", body[:nits])
+        self.assertNotIn("the fix removes", body[:nits])  # a review saved before 0.12.1 already says so
+        self.assertIn("2. **Clever**", body[nits:])
+        self.assertIn("the fix removes 2 non-test lines; lowered from major: less readable", body[nits:])
+
+    def test_render_notes_lines_a_fix_removes(self):
+        shorter = dict(SAMPLE["findings"][1], loc_delta=-3, impact=3, likelihood="rare")
+        body = self.render(dict(SAMPLE, findings=[shorter, dict(shorter, loc_delta=-1, title="One"),
+                                                  dict(shorter, loc_delta=2, title="Longer")]))
+        self.assertIn("impact 3/10, rare, the fix removes 3 non-test lines)_", body)
+        self.assertIn("the fix removes 1 non-test line)_", body)
+        self.assertEqual(body.count("the fix removes"), 2)
 
     def test_render_leaves_out_dropped_edits(self):
         def change(line, anchor, **extra):
