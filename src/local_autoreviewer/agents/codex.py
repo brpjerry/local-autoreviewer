@@ -176,7 +176,8 @@ class CodexAgent:
 
     def agent_note(self):
         if self.cfg.mode == "inline":
-            return "You have no tools. Everything you may use (the diff and the changed files) is included below."
+            return ("You have no tools. Everything you may use (the PR's description and commits, the project's docs, "
+                    "the diff and the changed files) is included below.")
         return ("You can run read-only shell commands (cat, rg, git log/show) in a sandbox with no "
                 "network and no write access. Use them only to read code; never build, install or run it.")
 
@@ -186,16 +187,21 @@ class CodexAgent:
         diff = Path(paths.context, "pr.diff").read_text(errors="replace")
         parts.append(f"\n## pr.diff\n\n```diff\n{diff[:INLINE_LIMIT // 2]}\n```\n")
         size += len(parts[-1])
-        for name in ("previous-findings.json", "already-raised.json", "author-comments.json", "since-review.diff"):
+        # The PR's text and the project's docs get less room, so they can't crowd out the changed files.
+        extras = [(name, INLINE_LIMIT // 16) for name in ("pr.json", "commits.txt", "project-docs/CLAUDE.md",
+                                                          "project-docs/AGENTS.md")]
+        extras += [(name, INLINE_LIMIT // 4) for name in ("previous-findings.json", "already-raised.json",
+                                                          "author-comments.json", "since-review.diff")]
+        for name, limit in extras:
             extra = Path(paths.context, name)
             if extra.is_file():
                 text = extra.read_text(errors="replace")
                 cut = ""
                 if name == "author-comments.json":  # oldest first: leave out whole old ones, keep the latest
-                    text, cut = _latest_comments(text, INLINE_LIMIT // 4)
-                if len(text) > INLINE_LIMIT // 4:
+                    text, cut = _latest_comments(text, limit)
+                if len(text) > limit:
                     cut = "\n(truncated: size limit)"
-                parts.append(f"\n## {name}\n\n```\n{text[:INLINE_LIMIT // 4]}\n```{cut}\n")
+                parts.append(f"\n## {name}\n\n```\n{text[:limit]}\n```{cut}\n")
                 size += len(parts[-1])
         for line in Path(paths.context, "files.txt").read_text().splitlines():
             fields = line.split("\t")

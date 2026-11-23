@@ -141,14 +141,14 @@ def build_prompt(*, repo, number, title, author, base_ref, head_sha, worktree, c
 
 
 def build_followup_prompt(*, previous_sha, previous_count, prompts=None, **fields):
-    """The follow-up prompt. It shares the review prompt's sections on method, coverage, proposed changes and
-    severity (the first two for a follow-up that finds new code and reviews the whole PR), so the two can't
-    drift apart."""
+    """The follow-up prompt. It shares the review prompt's sections on what to report, method, coverage,
+    proposed changes and severity (method and coverage only for a follow-up that finds new code and reviews the
+    whole PR), so the two can't drift apart."""
     prompts = prompts or snapshot(followup=True)
     full = prompts["review.md"]
     # Sections first: they contain placeholders such as $worktree that build_prompt fills in.
     text = Template(prompts["followup.md"]).safe_substitute(
-        method=_section(full, "Method: this is the only pass"),
+        what_to_report=_section(full, "What to report"), method=_section(full, "Method: this is the only pass"),
         coverage=_section(full, "What to cover (a thorough review)"),
         proposed_changes=_section(full, "Proposed changes"), severity_and_impact=_section(full, "Severity and impact"),
         previous_sha=previous_sha, previous_count=previous_count)
@@ -191,14 +191,17 @@ def validate(review):
             raise ReviewFormatError("malformed finding")
         severity = item.get("severity") if item.get("severity") in suggestions.LEVELS else "minor"
         reviewer = item.get("reviewer_severity") if item.get("reviewer_severity") in SEVERITIES else severity
+        edits = _edits(item.get("edits"))
         findings.append({
             "severity": severity,
             # Set by suggestions.apply(); kept so a saved review.json loads back unchanged.
             "reviewer_severity": reviewer,
             "severity_notes": [str(n) for n in item.get("severity_notes") or []],
             "loc_delta": item.get("loc_delta") if isinstance(item.get("loc_delta"), int) else None,
-            "edits": _edits(item.get("edits")),
-            "readability": item.get("readability") if item.get("readability") in READABILITY else "same",
+            "edits": edits,
+            # A fix that was sent but is left out isn't shown, so its readability doesn't count.
+            "readability": item["readability"] if item.get("readability") in READABILITY and (
+                edits or not item.get("edits")) else "same",
             # Reviews from before the calibrated schema have no impact, likelihood or trigger.
             "impact": _impact(item.get("impact")),
             "likelihood": item.get("likelihood") if item.get("likelihood") in LIKELIHOODS else "",
@@ -227,7 +230,10 @@ def validate(review):
 
 
 def _edits(raw):
-    """Well-formed edits only; suggestions.check_edit() later checks them against the checkout."""
+    """Well-formed edits only; suggestions.check_edit() later checks them against the checkout. A fix sent with
+    more than MAX_EDITS edits is left out whole, as a cut-down one would look complete."""
+    if isinstance(raw, list) and len(raw) > suggestions.MAX_EDITS:
+        return []
     edits = []
     for item in raw if isinstance(raw, list) else []:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str) or not item["file"]:
@@ -249,7 +255,7 @@ def _edits(raw):
             if isinstance(item.get("stated"), list) and len(item["stated"]) == 2:
                 edit["stated"] = [_int(n) for n in item["stated"]]
         edits.append(edit)
-    return edits[:suggestions.MAX_EDITS]
+    return edits
 
 
 def _int(value):

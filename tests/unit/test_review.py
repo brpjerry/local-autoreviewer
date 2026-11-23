@@ -263,6 +263,19 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(body.count("(also a one-click suggestion on the PR)"), 1)
         self.assertEqual([e["inline"] for e in saved["findings"][0]["edits"]], [True, True, True])  # as recorded
 
+    def test_a_fix_over_the_edit_limit_is_left_out_whole(self):
+        def edits(count):
+            return [{"file": "a.py", "start_line": n, "end_line": n, "replacement": "x", "current": "y"}
+                    for n in range(1, count + 1)]
+        too_long = dict(edits(1)[0], replacement="x" * (suggestions.MAX_REPLACEMENT + 1))
+        data = review.validate(dict(SAMPLE, findings=[
+            dict(SAMPLE["findings"][0], edits=edits(10), readability="worse"),
+            dict(SAMPLE["findings"][0], edits=edits(11), readability="worse"),
+            dict(SAMPLE["findings"][0], edits=edits(10) + [too_long])]))  # counted as sent, not as kept
+        self.assertEqual([len(f["edits"]) for f in data["findings"]], [10, 0, 0])  # not a fix cut short
+        # A fix the reader never sees doesn't lower the finding for being less readable.
+        self.assertEqual([f["readability"] for f in data["findings"][:2]], ["worse", "same"])
+
     def test_validate_rejects_garbage(self):
         for data in (None, [], {"summary": ""}, {"summary": "x", "findings": ["no"]}):
             with self.subTest(data=data), self.assertRaises(review.ReviewFormatError):

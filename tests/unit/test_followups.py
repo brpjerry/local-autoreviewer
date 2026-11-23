@@ -861,6 +861,10 @@ class FollowupFormatTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertNotIn("$", prompt)
         self.assertEqual(prompt.count("Return your "), 1)
+        # The full review's rules on what to report apply to every follow-up, before job 3's sections.
+        section = prompt[prompt.index("## What to report"):prompt.index("## A full review, for job 3")]
+        for rule in ("claims to check", "predates the PR", "declare out of scope, unsupported or deliberate"):
+            self.assertIn(rule, section)
 
     def test_render_new_code(self):
         previous = [{"id": 1, "agent": "codex", "severity": "major", "title": "Leaks a handle", "file": "a.py",
