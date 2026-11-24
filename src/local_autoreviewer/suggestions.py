@@ -199,13 +199,14 @@ def comments(review, label, suggest=True):
         inline = next((edit for edit in edits if edit.get("inline")), None)
         if inline is None:
             continue
+        heading = label(index, item)
         if suggest:
             change = fence("suggestion", inline["replacement"])
-        else:  # whole, as a suggestion is, if the comment has room; otherwise as a change shown only in the body
+        else:  # whole, as a suggestion is (MAX_REPLACEMENT makes room for it); shortened if it can't fit
             change = shown_diff(inline, whole=True)
-            if len(change) > MAX_COMMENT - 1000:
-                change = shown_diff(inline, shorten=False)
-        body = f"{label(index, item)}\n\n{change}"
+            if len(heading) + 2 + len(change) > MAX_COMMENT:
+                change = shown_diff(inline)
+        body = f"{heading}\n\n{change}"
         others = [edit for edit in edits if edit is not inline]
         if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
             rest = _rest_of_fix(others)

@@ -126,12 +126,24 @@ class ClientTests(unittest.TestCase):
             def __call__(self, request, timeout=None):
                 response = super().__call__(request, timeout)
                 page = int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))["page"])
-                response.headers = {"Link": '<next>; rel="next"'} if page < 3 else {}
+                response.headers = {"Link": '<next>; rel="next"' if page < 3 else '<prev>; rel="prev"'}
                 return response
         pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
         server = Uncounted({("GET", api("repos/team/tool/pulls")): pages})
         client = Forgejo("forge.example", TOKEN, opener=server)
         self.assertEqual(len(client.list_open_prs("team/tool")), 45)
+        self.assertEqual(len(server.requests), 3)
+
+    def test_without_any_paging_headers_an_empty_page_ends_the_list(self):
+        class Bare(FakeServer):  # a proxy that drops both headers
+            def __call__(self, request, timeout=None):
+                response = super().__call__(request, timeout)
+                response.headers = {}
+                return response
+        pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
+        server = Bare({("GET", api("repos/team/tool/pulls")): pages})
+        self.assertEqual(len(Forgejo("forge.example", TOKEN, opener=server).list_open_prs("team/tool")), 45)
+        self.assertEqual(len(server.requests), 4)
 
     def test_a_cut_off_error_page_is_still_a_forgejo_error(self):
         class CutOff(io.BytesIO):
@@ -142,7 +154,8 @@ class ClientTests(unittest.TestCase):
         client, _ = self.client({("GET", api("user")): refused})
         with self.assertRaises(ForgejoError) as caught:
             client.viewer_login()
-        self.assertIn("HTTP 502", str(caught.exception))
+        self.assertIn("status 502", str(caught.exception))
+        self.assertFalse(pipeline._rejected(caught.exception))  # retried, as a dropped connection is
 
     def test_an_answer_that_isnt_json_is_a_forgejo_error(self):
         client, _ = self.client({("GET", api("user")): b"<html>Sign in</html>"})
@@ -456,6 +469,21 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("suggestion", inline["body"])
         (github_inline,) = suggestions.comments(data, review.comment_label(data))
         self.assertIn("```suggestion\nnew\n```", github_inline["body"])
+
+    def test_an_inline_diff_is_whole_while_the_comment_has_room(self):
+        def comment_for(width):
+            edit = {"file": "a.rs", "start_line": 1, "end_line": 1, "current": "x", "original": ["x"],
+                    "replacement": "\n".join("y" * width for _ in range(100)), "inline": True, "anchor": "matched"}
+            item = {"title": "T", "file": "a.rs", "line": 1, "severity": "nit", "edits": [edit]}
+            (inline,) = suggestions.comments({"findings": [], "nits": [item]}, lambda index, item: "**T**",
+                                             suggest=False)
+            return inline["body"]
+        fits = comment_for(590)  # about 59,100 characters of diff, under MAX_COMMENT with a short heading
+        self.assertLessEqual(len(fits), suggestions.MAX_COMMENT)
+        self.assertNotIn("more lines", fits)
+        too_long = comment_for(700)
+        self.assertIn("more lines", too_long)  # shortened, as the body's copy is
+        self.assertLessEqual(len(too_long), suggestions.MAX_COMMENT)
 
     def test_a_long_inline_change_is_whole_in_its_forgejo_comment(self):
         old = [f"old {n}" for n in range(220)]

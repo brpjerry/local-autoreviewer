@@ -388,9 +388,10 @@ def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running"))
         try:
             owner = svc.owner(job["repo"])
         except GitHubError as exc:  # the service's own review then waits for the PR's next update
-            log.warning("job %s: cannot look up the token owner for %s (%s), so its review of %s#%s isn't handed "
-                        "back to the service; run `local-autoreviewer enqueue %s#%s` to review that commit",
-                        job["id"], job["repo"], exc, job["repo"], job["number"], job["repo"], job["number"])
+            log.warning("job %s: cannot look up the token owner for %s (%s), so its review may not be handed back "
+                        "to the service. If %s is still the PR's head and needs this review, run `local-autoreviewer "
+                        "enqueue %s#%s --agent %s` once the host is reachable", job["id"], job["repo"], exc,
+                        job["head_sha"][:12], job["repo"], job["number"], job["agent"])
     with db.transaction(conn):
         cancelled = conn.execute(
             f"UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status IN ({marks})",
