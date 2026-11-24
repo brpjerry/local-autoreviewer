@@ -315,10 +315,10 @@ def _proposed_changes(edits, by="", suggests=True):
         where = clean(suggestions.edit_where(edit), 300)
         note = (" (also a one-click suggestion on the PR)" if suggests else " (also inline on the PR)") \
             if edit.get("inline") else ""
-        # Shortened to the usual length when the inline suggestion has it whole, or when the review is too long
-        # (see _compacted); otherwise the body is its one copy, so only a huge one is cut. Forgejo's inline copy
-        # is a diff, cut where the body's would be, so the body's isn't shortened for it.
-        shorten = bool((edit.get("inline") and suggests) or edit.get("shorten"))
+        # Shortened to the usual length when the inline suggestion (on Forgejo, the inline diff) has it whole, or
+        # when the review is too long (see _compacted); otherwise the body is its one copy, so only a huge one is
+        # cut.
+        shorten = bool(edit.get("inline") or edit.get("shorten"))
         diff = suggestions.shown_diff(edit, shorten=shorten).replace("<!--", "<!\u200b--")
         lines += [f"<details><summary>{what} to <code>{where}</code>{note}</summary>", "", diff, "",
                   "</details>"]

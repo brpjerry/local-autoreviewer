@@ -12,7 +12,7 @@ from http.client import HTTPException
 
 from .github import MARKER_PREFIX, GitHubError, find_marked
 
-PAGE = 50  # asked for; a server may send fewer (MAX_RESPONSE_ITEMS), so X-Total-Count says when to stop
+PAGE = 50  # asked for; a server may send fewer (MAX_RESPONSE_ITEMS), so X-Total-Count (or Link) says when to stop
 MAX_PAGES = 100
 
 
@@ -81,7 +81,10 @@ class Forgejo:
                 body, answered = response.read(), response.headers
             result = json.loads(body) if body.strip() else None
         except urllib.error.HTTPError as exc:  # "HTTP 4xx" is what pipeline._rejected and the 422 retry look for
-            detail = exc.read().decode(errors="replace").strip() if exc.fp else ""
+            try:
+                detail = exc.read().decode(errors="replace").strip() if exc.fp else ""
+            except (OSError, HTTPException):  # a cut-off error page
+                detail = ""
             raise self._fail(method, path, f"HTTP {exc.code}: {exc.reason} {detail[:500]}") from None
         except (urllib.error.URLError, OSError, HTTPException) as exc:  # timeouts and cut-off answers too
             raise self._fail(method, path, exc) from None
@@ -98,8 +101,9 @@ class Forgejo:
                 raise self._fail("GET", path, "the answer is not a list")
             items += batch
             total = (headers.get("X-Total-Count") or "").strip() if headers else ""
+            more = 'rel="next"' in ((headers.get("Link") or "") if headers else "")  # without a count (a proxy's)
             if not batch or (limit and len(items) >= limit) or (
-                    len(items) >= int(total) if total.isdigit() else len(batch) < PAGE):
+                    len(items) >= int(total) if total.isdigit() else not more and len(batch) < PAGE):
                 return items[:limit] if limit else items
         raise self._fail("GET", path, f"more than {MAX_PAGES} pages")
 
@@ -147,7 +151,9 @@ class Forgejo:
         for c in comments:
             key = (c.get("path"), c.get("position") or 0, c.get("original_position") or 0)
             review_id = c.get("pull_request_review_id")
-            root = (ours[review_id] if review_id in ours else roots).setdefault(key, c)
+            root = roots.setdefault(key, c)  # the conversation Forgejo shows: a reply in another review joins it
+            if review_id in ours:  # but each of our reviews starts threads of its own
+                root = ours[review_id].setdefault(key, c)
             posted_with_root = review_id == root.get("pull_request_review_id") and (
                 submitted.get(review_id) is None or _time(c.get("created_at")) <= _time(submitted[review_id]))
             reply = root is not c and not posted_with_root

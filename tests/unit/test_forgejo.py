@@ -2,10 +2,12 @@
 """Forgejo repos: the API client (against a fake HTTP opener), routing by repo name, links, git auth."""
 
 import base64
+import http.client
 import io
 import sqlite3
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import urllib.error
@@ -119,6 +121,29 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ForgejoError):  # not a partial list taken for the whole
             client.list_open_prs("team/tool")
 
+    def test_without_a_count_the_next_link_says_there_is_more(self):
+        class Uncounted(FakeServer):  # a proxy that drops X-Total-Count but keeps Link
+            def __call__(self, request, timeout=None):
+                response = super().__call__(request, timeout)
+                page = int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))["page"])
+                response.headers = {"Link": '<next>; rel="next"'} if page < 3 else {}
+                return response
+        pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
+        server = Uncounted({("GET", api("repos/team/tool/pulls")): pages})
+        client = Forgejo("forge.example", TOKEN, opener=server)
+        self.assertEqual(len(client.list_open_prs("team/tool")), 45)
+
+    def test_a_cut_off_error_page_is_still_a_forgejo_error(self):
+        class CutOff(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b"partial")
+        refused = urllib.error.HTTPError("u", 502, "Bad Gateway", {}, CutOff())
+        self.addCleanup(refused.close)
+        client, _ = self.client({("GET", api("user")): refused})
+        with self.assertRaises(ForgejoError) as caught:
+            client.viewer_login()
+        self.assertIn("HTTP 502", str(caught.exception))
+
     def test_an_answer_that_isnt_json_is_a_forgejo_error(self):
         client, _ = self.client({("GET", api("user")): b"<html>Sign in</html>"})
         with self.assertRaises(ForgejoError):
@@ -150,7 +175,7 @@ class ClientTests(unittest.TestCase):
 
     def test_inline_comments_on_one_line_are_a_thread(self):
         reviews = [{"id": 1, "state": "COMMENT", "comments_count": 4, "user": {"login": "imouto"},
-                    "submitted_at": "2026-11-23T02:00:00-08:00"},
+                    "body": review.marker(1, "a" * 40, "codex"), "submitted_at": "2026-11-23T02:00:00-08:00"},
                    {"id": 2, "state": "COMMENT", "comments_count": 0, "user": {"login": "imouto"},
                     "submitted_at": "2026-11-23T10:30:00Z"},
                    {"id": 3, "state": "COMMENT", "comments_count": 2, "user": {"login": "author"},
@@ -355,6 +380,12 @@ class RoutingTests(unittest.TestCase):
                     read_token(path)
                 self.assertNotIn("abc", str(caught.exception))
 
+    def test_a_token_file_that_goes_away_while_read_is_a_github_error(self):
+        self.token("forge.example")
+        with mock.patch.object(Path, "stat", side_effect=FileNotFoundError(2, "gone")), \
+                self.assertRaises(GitHubError):
+            read_token(self.tokens / "forge.example")
+
     def test_the_token_owner_is_looked_up_once_per_host(self):
         self.token("forge.example")
         self.assertEqual(self.forges.owner(FORGE_REPO), "imouto")
@@ -426,20 +457,21 @@ class RenderTests(unittest.TestCase):
         (github_inline,) = suggestions.comments(data, review.comment_label(data))
         self.assertIn("```suggestion\nnew\n```", github_inline["body"])
 
-    def test_a_long_inline_change_is_shown_whole_in_a_forgejo_reviews_body(self):
-        old = [f"old {n}" for n in range(60)]
-        edit = {"file": "a.rs", "start_line": 1, "end_line": 60, "current": "\n".join(old), "original": old,
-                "replacement": "\n".join(f"new {n}" for n in range(60)), "inline": True, "anchor": "matched"}
+    def test_a_long_inline_change_is_whole_in_its_forgejo_comment(self):
+        old = [f"old {n}" for n in range(220)]
+        edit = {"file": "a.rs", "start_line": 1, "end_line": 220, "current": "\n".join(old), "original": old,
+                "replacement": "\n".join(f"new {n}" for n in range(220)), "inline": True, "anchor": "matched"}
         finding = {"title": "Long", "file": "a.rs", "line": 1, "severity": "minor", "category": "correctness",
                    "detail": "d", "suggestion": "", "trigger": "", "impact": 3, "likelihood": "rare",
                    "edits": [edit], "readability": "same"}
         data = review.validate({"summary": "s", "findings": [finding], "nits": [], "test_gaps": [], "questions": []})
         data["findings"][0]["edits"] = [edit]
         render = dict(number=4, sha="a" * 40, base_ref="main", agent="codex", model="m", job_id=7)
-        forgejo_body = review.render(data, repo=FORGE_REPO, **render)
-        self.assertIn("+new 59", forgejo_body)
-        self.assertNotIn("more lines", forgejo_body)
-        self.assertIn("more lines", review.render(data, repo="alice/demo", **render))  # its suggestion has it whole
+        self.assertIn("more lines", review.render(data, repo=FORGE_REPO, **render))  # as on GitHub: the inline
+        (inline,) = suggestions.comments(data, review.comment_label(data), suggest=False)  # copy has it whole
+        self.assertIn("-old 0\n", inline["body"])
+        self.assertIn("+new 219\n```", inline["body"])
+        self.assertNotIn("more lines", inline["body"])
 
 
 class PipelineTests(EnvTestCase):
@@ -536,11 +568,22 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(jobs, [(REPO, 2), (FORGE_REPO, 1)])
 
     def test_recreating_a_checkout_loads_the_hosts_token_before_fetching(self):
+        for missing in (False, True):  # without one, a public repo still fetches
+            with self.subTest(missing=missing):
+                self.recreate_checkout(missing)
+
+    def recreate_checkout(self, missing):
         loaded = []
-        self.github.forgejo = loaded.append
+
+        def forgejo(host):
+            loaded.append(host)
+            if missing:
+                raise GitHubError(f"Forgejo token for {host} missing")
+        self.github.forgejo = forgejo
         svc = self.services()
         conn = svc.connect()
         with db.transaction(conn):
+            conn.execute("DELETE FROM jobs")
             job_id = db.insert_job(conn, repo=FORGE_REPO, number=4, head_sha=self.head, base_ref="main",
                                    agent="claude", model="", source="poll", not_before=0, now=self.clock(), post=True)
             job = dict(db.get_job(conn, job_id))
@@ -549,6 +592,8 @@ class PipelineTests(EnvTestCase):
             paths = cli._ensure_worktree(self.cfg, job)
         self.assertEqual(loaded, ["forge.example"])
         self.assertTrue(Path(paths.worktree, "src/calc.py").is_file())
+        svc.git.remove_worktree(svc.git.mirror_path(self.state, FORGE_REPO), paths.worktree)
+        shutil.rmtree(svc.git.mirror_path(self.state, FORGE_REPO))  # so the next one fetches again
 
 
 class OwnerCacheTests(EnvTestCase):

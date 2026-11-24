@@ -465,7 +465,10 @@ def _ensure_worktree(cfg, job):
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)
         except GitError:
             if forges.host(job["repo"]):  # its token, for git: a repo since removed from the config wasn't loaded
-                svc.github.forgejo(forges.host(job["repo"]))
+                try:
+                    svc.github.forgejo(forges.host(job["repo"]))
+                except GitHubError as exc:  # a public repo still fetches without one
+                    log.warning("fetching %s without a Forgejo token: %s", job["repo"], exc)
             svc.git.run(["-C", str(mirror), "fetch", "--quiet", "--no-tags", "origin",
                          f"+refs/pull/{job['number']}/head:refs/autoreview/pr/{job['number']}/head"])
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)

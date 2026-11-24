@@ -26,7 +26,11 @@ def read_token(path, what="GitHub token", hint="a fine-grained PAT"):
         raise GitHubError(f"{what} file {path} is empty")
     if not token.isascii() or not token.isprintable() or " " in token:  # it goes in a header: never quote it
         raise GitHubError(f"{what} file {path} must hold the token alone, on one line")
-    if path.stat().st_mode & 0o077:
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:  # gone since it was read
+        raise GitHubError(f"cannot read {what} file {path}: {type(exc).__name__}") from None
+    if mode & 0o077:
         raise GitHubError(f"{what} file {path} must not be group/world readable (chmod 600)")
     return token
 

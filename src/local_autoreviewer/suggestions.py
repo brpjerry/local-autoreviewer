@@ -199,7 +199,12 @@ def comments(review, label, suggest=True):
         inline = next((edit for edit in edits if edit.get("inline")), None)
         if inline is None:
             continue
-        change = fence("suggestion", inline["replacement"]) if suggest else shown_diff(inline, shorten=False)
+        if suggest:
+            change = fence("suggestion", inline["replacement"])
+        else:  # whole, as a suggestion is, if the comment has room; otherwise as a change shown only in the body
+            change = shown_diff(inline, whole=True)
+            if len(change) > MAX_COMMENT - 1000:
+                change = shown_diff(inline, shorten=False)
         body = f"{label(index, item)}\n\n{change}"
         others = [edit for edit in edits if edit is not inline]
         if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
@@ -229,10 +234,13 @@ def _rest_of_fix(edits, *, shorten=False):
     return "".join(parts)
 
 
-def shown_diff(edit, *, shorten=True):
+def shown_diff(edit, *, shorten=True, whole=False):
     """The edit as a diff for the review body: shortened if long and shorten is set (to MAX_SHOWN_LINES lines
-    and MAX_SHOWN_CHARS characters; the inline suggestion has it whole), else only if huge."""
+    and MAX_SHOWN_CHARS characters; the inline suggestion has it whole), else only if huge. whole: all of it,
+    for a Forgejo inline comment, which stands in for a suggestion."""
     lines = [f"-{line}" for line in edit["original"]] + [f"+{line}" for line in replacement_lines(edit["replacement"])]
+    if whole:
+        return fence("diff", "\n".join(lines))
     limit = MAX_SHOWN_LINES if shorten else MAX_BODY_ONLY_LINES
     shown, size = [], 0
     for line in lines[:limit]:
