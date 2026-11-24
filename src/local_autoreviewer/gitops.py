@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import forges
+
 # A PR's own agent configuration must never load: hooks, settings, MCP servers or
 # instructions. Matched case-insensitively against every path component.
 AGENT_FILES = {"claude.md", "claude.local.md", "agents.md", "agents.override.md", ".mcp.json", "opencode.json",
@@ -49,10 +51,12 @@ class Context:
 
 
 class Git:
-    def __init__(self, base_url, env):
+    def __init__(self, base_url, env, auth_env=dict):
         # base_url is https://github.com normally; tests point it at a local directory.
+        # auth_env: more environment for each run, the Forgejo tokens (forges.Forges.git_env).
         self.base_url = base_url.rstrip("/")
         self.local = not self.base_url.startswith("https://")
+        self.auth_env = auth_env
         self.env = dict(env)
         self.env.update({
             "GIT_CONFIG_GLOBAL": os.devnull,  # ignore the user's ~/.gitconfig (helpers, aliases, signing)
@@ -70,8 +74,8 @@ class Git:
             command += ["-c", "protocol.file.allow=never",
                         "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
         try:
-            proc = subprocess.run([*command, *args], cwd=cwd, env=self.env, capture_output=True,
-                                  text=text, timeout=timeout)
+            proc = subprocess.run([*command, *args], cwd=cwd, env={**self.env, **self.auth_env()},
+                                  capture_output=True, text=text, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise GitError(f"git {args[0]} timed out") from None
         if check and proc.returncode != 0:
@@ -84,8 +88,15 @@ class Git:
 
     # Mirrors -----------------------------------------------------------------
 
+    def url(self, repo):
+        """Where the repo is fetched from: its Forgejo host for host/owner/name (see forges), else under
+        base_url."""
+        if forges.host(repo) and not self.local:
+            return f"https://{repo}.git"
+        return f"{self.base_url}/{repo}.git"
+
     def mirror_path(self, state, repo):
-        owner, name = repo.split("/", 1)
+        owner, name = repo.split("/", 1)  # host/owner/name: under the host
         return Path(state) / "mirrors" / owner.lower() / f"{name.lower()}.git"
 
     def ensure_mirror(self, state, repo):
@@ -93,7 +104,7 @@ class Git:
         if not (path / "HEAD").exists():
             path.mkdir(parents=True, exist_ok=True)
             self.run(["init", "--bare", "--quiet", "--template=", str(path)])  # no sample hooks
-            self.run(["-C", str(path), "config", "remote.origin.url", f"{self.base_url}/{repo}.git"])
+            self.run(["-C", str(path), "config", "remote.origin.url", self.url(repo)])
             self.run(["-C", str(path), "config", "gc.auto", "256"])
         return path
 

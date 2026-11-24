@@ -186,11 +186,12 @@ def fence(info, text):
     return f"{ticks}{info}\n{body + chr(10) if body else ''}{ticks}"
 
 
-def comments(review, label):
+def comments(review, label, suggest=True):
     """GitHub review comments with a suggested change: one per finding or nit with an inline edit (see
     _mark_inline), so each has one thread. The rest of the item's fix is shown in the same comment as diffs,
     unless that would make it too long; the review body has all of it either way. label(index, item) gives
-    the heading that ties the comment to its item in the review body."""
+    the heading that ties the comment to its item in the review body. suggest: False on a forge without
+    suggested changes (forges.suggests), where the inline edit is a diff too."""
     out = []
     items = [(i, f) for i, f in enumerate(review["findings"])] + [(None, n) for n in review["nits"]]
     for index, item in items:
@@ -198,14 +199,22 @@ def comments(review, label):
         inline = next((edit for edit in edits if edit.get("inline")), None)
         if inline is None:
             continue
-        body = f"{label(index, item)}\n\n{fence('suggestion', inline['replacement'])}"
+        heading = label(index, item)
+        if suggest:
+            change = fence("suggestion", inline["replacement"])
+        else:  # whole, as a suggestion is (MAX_REPLACEMENT makes room for it); shortened if it can't fit
+            change = shown_diff(inline, whole=True)
+            if len(heading) + 2 + len(change) > MAX_COMMENT:
+                change = shown_diff(inline)
+        body = f"{heading}\n\n{change}"
         others = [edit for edit in edits if edit is not inline]
-        if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
-            rest = _rest_of_fix(others)
-            if len(body) + len(rest) > MAX_COMMENT:
-                rest = _rest_of_fix(others, shorten=True)
-            body += (rest if len(body) + len(rest) <= MAX_COMMENT else
-                     f"\n\n_The fix also changes {_places(len(others))}, shown in the review._")
+        if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer if it fits
+            room = MAX_COMMENT - len(body)
+            for rest in (_rest_of_fix(others), _rest_of_fix(others, shorten=True),
+                         f"\n\n_The fix also changes {_places(len(others))}, shown in the review._"):
+                if len(rest) <= room:
+                    body += rest
+                    break
         comment = {"path": inline["file"], "line": inline["end_line"], "side": "RIGHT", "body": body}
         if inline["start_line"] < inline["end_line"]:
             comment.update(start_line=inline["start_line"], start_side="RIGHT")
@@ -227,10 +236,13 @@ def _rest_of_fix(edits, *, shorten=False):
     return "".join(parts)
 
 
-def shown_diff(edit, *, shorten=True):
+def shown_diff(edit, *, shorten=True, whole=False):
     """The edit as a diff for the review body: shortened if long and shorten is set (to MAX_SHOWN_LINES lines
-    and MAX_SHOWN_CHARS characters; the inline suggestion has it whole), else only if huge."""
+    and MAX_SHOWN_CHARS characters; the inline suggestion has it whole), else only if huge. whole: all of it,
+    for a Forgejo inline comment, which stands in for a suggestion."""
     lines = [f"-{line}" for line in edit["original"]] + [f"+{line}" for line in replacement_lines(edit["replacement"])]
+    if whole:
+        return fence("diff", "\n".join(lines))
     limit = MAX_SHOWN_LINES if shorten else MAX_BODY_ONLY_LINES
     shown, size = [], 0
     for line in lines[:limit]:

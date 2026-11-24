@@ -33,11 +33,11 @@ def git(*args, cwd=None, check=True):
 
 
 class Remote:
-    """A bare repo laid out like GitHub: <base>/alice/demo.git with refs/pull/N/head."""
+    """A bare repo laid out like GitHub: <base>/alice/demo.git with refs/pull/N/head (or <base>/<repo>.git)."""
 
-    def __init__(self, base):
+    def __init__(self, base, repo=REPO):
         self.base = Path(base)
-        self.bare = self.base / f"{REPO}.git"
+        self.bare = self.base / f"{repo}.git"
         self.work = self.base / "work"
         self.bare.parent.mkdir(parents=True)
         git("init", "--bare", "-q", "-b", "main", str(self.bare))
@@ -84,6 +84,7 @@ def iso(ts):
 class FakeGitHub:
     def __init__(self, login=OWNER):
         self.login = login
+        self.owners = {}  # Forgejo host -> its token's owner
         self.prs = {}  # (repo, number) -> dict
         self.posted = []
         self.ids = itertools.count(1000)
@@ -145,6 +146,9 @@ class FakeGitHub:
     def viewer_login(self):
         return self.login
 
+    def owner(self, repo):  # a Forgejo repo's token owner (forges.Forges.owner): owners by host, else ours
+        return self.owners.get(repo.split("/", 1)[0], self.login)
+
     def list_open_prs(self, repo, limit=500):
         return [dict(pr) for (r, _), pr in self.prs.items() if r == repo and pr["state"] == "OPEN"]
 
@@ -197,7 +201,7 @@ def agent_command(tmp, name, mode):
 
 
 def make_config(tmp, *, claude="ok", codex="ok", opencode="ok", repo_extra=None, service=None,
-                agents=("claude", "codex"), further=None):
+                agents=("claude", "codex"), further=None, repo=REPO, more_repos=()):
     """further: more reviewers, {"codex-sol": {"model": ...}}, each running its type's fake agent."""
     claude_cmd, _ = agent_command(tmp, "claude", claude)
     codex_cmd, _ = agent_command(tmp, "codex", codex)
@@ -210,7 +214,7 @@ def make_config(tmp, *, claude="ok", codex="ok", opencode="ok", repo_extra=None,
                    "opencode": {"command": opencode_cmd, "model": "opencode/test-free"},
                    **{name: {"command": commands[config_mod.agent_type(name)], **table}
                       for name, table in (further or {}).items()}},
-        "repo": [{"name": REPO, **(repo_extra or {})}],
+        "repo": [{"name": repo, **(repo_extra or {})}] + [{"name": name} for name in more_repos],
     }
     return config_mod.parse(data)
 

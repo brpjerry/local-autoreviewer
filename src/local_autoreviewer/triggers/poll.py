@@ -127,7 +127,7 @@ def poll_repo(conn, svc, repo_cfg, now, prs, gone):
         log.info("%s: baseline recorded for %d open PR(s); future updates will be reviewed", repo, len(prs))
     for event in produced:
         events.record(conn, event, now)
-        events.ingest(conn, svc.config, event, now=now, token_owner=svc.token_owner)
+        events.ingest(conn, svc.config, event, now=now, token_owner=svc.owner(repo))
     return produced
 
 
@@ -145,6 +145,7 @@ def _poll(svc, dry_run):
             now = svc.now()
             try:
                 prs, gone = fetch_repo(conn, svc, repo_cfg.name)
+                svc.owner(repo_cfg.name)  # a Forgejo host's is looked up once: not while holding the write lock
                 conn.execute("BEGIN IMMEDIATE")
                 produced = poll_repo(conn, svc, repo_cfg, now, prs, gone)
                 conn.execute("ROLLBACK" if dry_run else "COMMIT")

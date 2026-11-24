@@ -194,7 +194,7 @@ def collect(conn, svc, repo, number):
     PR is retried by a later poll, up to MAX_ATTEMPTS times)."""
     try:
         state = svc.github.pr_view(repo, number)["state"]
-        rows = gather(svc.github, repo, number, svc.token_owner)
+        rows = gather(svc.github, repo, number, svc.owner(repo))
     except (GitHubError, ValueError, KeyError, TypeError, AttributeError) as exc:  # unexpected JSON too
         with db.transaction(conn):
             conn.execute("UPDATE prs SET feedback_attempts=feedback_attempts+1 WHERE repo=? AND number=?",

@@ -12,7 +12,7 @@
   - the agent-file removal and git hardening in `gitops.py`.
 
   `tests/unit/test_agents.py` and `tests/unit/test_pipeline.py` pin all of these. Configuration must never be able to change them.
-- The GitHub token may appear only in the `gh`/`git` subprocess environment (`github.gh_env`). It must never reach an agent, argv or a log line.
+- The GitHub token may appear only in the `gh`/`git` subprocess environment (`github.gh_env`). A Forgejo token may appear only in the `Authorization` header of requests to its own host (`forgejo.Forgejo`) and in `git`'s environment as a header for that host (`forges.Forges.git_env`). Neither may reach an agent, argv or a log line.
 - When you change agent CLI flags, re-verify against the installed CLIs, update `docs/agent-cli-notes.md` and the `REQUIRED_FLAGS` that `doctor` checks.
 - The SQLite schema only grows: add a migration to `db.MIGRATIONS` and never edit an existing one. Rolling back relies on older builds tolerating newer columns.
 - The review schema (`prompts/review.schema.json`) only grows too. `review.validate()` must keep accepting reviews in the older shapes, because housekeeping records saved `review.json` files from before review data was kept. Both CLIs need every property listed in `required`.

@@ -3,6 +3,7 @@
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as config_mod
-from . import db, events, feedback, leakscan, limits, maintenance, paths, pipeline
+from . import db, events, feedback, forges, leakscan, limits, maintenance, paths, pipeline
 from .agents import make_agent
 from .config import ConfigError, ConfigWatcher
 from .github import GitHub, GitHubError, read_token
@@ -25,7 +26,10 @@ from .triggers import poll as poll_mod
 from .worker import Worker, iso
 
 log = logging.getLogger("local_autoreviewer")
+# owner/repo#N or a GitHub PR's URL; host/owner/repo#N or a Forgejo PR's URL (https://host/owner/repo/pulls/N).
 _REF_RE = re.compile(r"^(?:https://github\.com/)?([A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:#|/pull/)(\d+)/?$")
+_FORGEJO_REF_RE = re.compile(r"^(?:https://)?([A-Za-z0-9.-]+(?::\d+)?/[A-Za-z0-9_.-]+/[A-Za-z0-9._-]+?)"
+                             r"(?:#|/pulls/)(\d+)/?$")
 
 
 class CliError(Exception):
@@ -39,9 +43,9 @@ def setup_logging(verbose=False):
 
 
 def parse_ref(ref):
-    match = _REF_RE.match(ref.strip())
+    match = _REF_RE.match(ref.strip()) or _FORGEJO_REF_RE.match(ref.strip())
     if not match:
-        raise CliError(f"expected owner/repo#N or a PR URL, got {ref!r}")
+        raise CliError(f"expected owner/repo#N, host/owner/repo#N (Forgejo) or a PR URL, got {ref!r}")
     return match.group(1), int(match.group(2))
 
 
@@ -80,16 +84,52 @@ def resolve_token_owner(github, state):
         conn.close()
 
 
+def resolve_forgejo_owners(forges_, cfg, state):
+    """Look up each configured Forgejo host's token owner now, as resolve_token_owner does GitHub's, so the
+    worker never waits on it while holding the database. If the host can't be reached, the owner last seen
+    for the same token is used; a host without a readable token, or with a token never seen, is left to the
+    first call that needs it, and only its repos fail."""
+    hosts = sorted({forges.host(repo.name) for repo in cfg.repos.values()} - {None})
+    if not hosts:
+        return
+    conn = db.connect(state / "state.sqlite3")
+    try:
+        for forgejo_host in hosts:
+            try:
+                token = forges_.forgejo(forgejo_host).token
+            except GitHubError as exc:
+                log.warning("%s: %s", forgejo_host, exc)
+                continue
+            key = f"token_owner:{forgejo_host}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+            try:
+                login = forges_.host_owner(forgejo_host)
+            except GitHubError as exc:
+                login = db.kv_get(conn, key)
+                if login:
+                    forges_.owners[forgejo_host] = login
+                    log.warning("%s unreachable (%s); using cached token owner %s", forgejo_host, exc, login)
+                else:
+                    log.warning("%s: %s", forgejo_host, exc)
+                continue
+            with db.transaction(conn):
+                db.kv_set(conn, key, login)
+    finally:
+        conn.close()
+
+
 def build_services(cfg):
     state = paths.state_dir()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     token = read_token(paths.token_file())
     github = GitHub(token, state / "gh")
-    git = Git(os.environ.get("LOCAL_AUTOREVIEWER_GIT_BASE", "https://github.com"), github.env())
+    forges_ = forges.Forges(github, paths.forgejo_token_dir())
+    git = Git(os.environ.get("LOCAL_AUTOREVIEWER_GIT_BASE", "https://github.com"), github.env(),
+              auth_env=forges_.git_env)
     owner = resolve_token_owner(github, state)
+    resolve_forgejo_owners(forges_, cfg, state)
     return pipeline.Services(
-        config=cfg, state=state, github=github, git=git, runner=make_runner(), token_owner=owner,
-        secrets=lambda: [token, *local_secrets(state)])
+        config=cfg, state=state, github=forges_, git=git, runner=make_runner(), token_owner=owner,
+        secrets=lambda: [token, *forges_.secrets(), *local_secrets(state)])
 
 
 def load_config():
@@ -223,6 +263,7 @@ def cmd_enqueue(args):
         pr = svc.github.pr_view(repo_cfg.name, number)
         if pr["state"] != "OPEN":
             raise CliError(f"{repo}#{number} is {pr['state'].lower()}")
+        owner = svc.owner(repo_cfg.name)
         event = events.PrEvent(repo=repo_cfg.name, number=number, action="opened", head_sha=pr["headRefOid"],
                                base_ref=pr["baseRefName"], is_draft=pr["isDraft"],
                                author=(pr.get("author") or {}).get("login", ""), source="manual",
@@ -231,7 +272,7 @@ def cmd_enqueue(args):
         try:
             with db.transaction(conn):
                 events.record(conn, event, svc.now())
-                created = events.ingest(conn, cfg, event, now=svc.now(), token_owner=svc.token_owner)
+                created = events.ingest(conn, cfg, event, now=svc.now(), token_owner=owner)
         finally:
             conn.close()
     if created:
@@ -423,6 +464,11 @@ def _ensure_worktree(cfg, job):
         try:
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)
         except GitError:
+            if forges.host(job["repo"]):  # its token, for git: a repo since removed from the config wasn't loaded
+                try:
+                    svc.github.forgejo(forges.host(job["repo"]))
+                except GitHubError as exc:  # a public repo still fetches without one
+                    log.warning("fetching %s without a Forgejo token: %s", job["repo"], exc)
             svc.git.run(["-C", str(mirror), "fetch", "--quiet", "--no-tags", "origin",
                          f"+refs/pull/{job['number']}/head:refs/autoreview/pr/{job['number']}/head"])
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)
@@ -516,14 +562,25 @@ def cmd_doctor(args):
         if expiry:
             days = (expiry - datetime.now(timezone.utc)).days
             report(days > 30, f"GitHub token expires {expiry:%Y-%m-%d} ({days} days)", warn=days > 0)
-        for repo in cfg.repos.values():
-            try:
-                github.list_open_prs(repo.name, limit=1)
-                report(True, f"{repo.name}: pull requests readable")
-            except GitHubError as exc:
-                report(False, f"{repo.name}: {exc}")
     except GitHubError as exc:
         report(False, str(exc))
+        github = None
+    forges_ = forges.Forges(github, paths.forgejo_token_dir())
+    usable = {None} if github else set()
+    for forgejo_host in sorted({forges.host(repo.name) for repo in cfg.repos.values()} - {None}):
+        try:
+            report(True, f"Forgejo token for {forgejo_host}: authenticated as {forges_.host_owner(forgejo_host)}")
+            usable.add(forgejo_host)
+        except GitHubError as exc:
+            report(False, str(exc))
+    for repo in cfg.repos.values():
+        if forges.host(repo.name) not in usable:
+            continue
+        try:
+            forges_.list_open_prs(repo.name, limit=1)
+            report(True, f"{repo.name}: pull requests readable")
+        except GitHubError as exc:
+            report(False, f"{repo.name}: {exc}")
     used = {agent for repo in cfg.repos.values() for agent in repo.agents} or set(cfg.agents)
     for name in sorted(used):
         agent_cfg = cfg.agents[name]
@@ -576,8 +633,8 @@ def _limits_line(cfg, name, agent):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="local-autoreviewer",
-                                     description="Review your GitHub PRs with local Claude Code, Codex and "
-                                                 "OpenCode sessions.")
+                                     description="Review your GitHub and Forgejo PRs with local Claude Code, "
+                                                 "Codex and OpenCode sessions.")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {paths.read_version()}")
     sub = parser.add_subparsers(dest="command", required=True)

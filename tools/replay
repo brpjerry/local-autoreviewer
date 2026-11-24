@@ -11,7 +11,7 @@ runs through the real pipeline against a scratch copy laid out like GitHub, in a
 is never posted. --prompts names a directory with review.md and review.schema.json (default: this checkout's
 prompts/).
 
-Only the PR's author and base branch, and its title and description, are read from GitHub. A description is
+Only the PR's author and base branch, and its title and description, are read from its forge. A description is
 often updated after the commit was reviewed, and can then describe the fixes the review prompted. So the
 title and description are taken from the service's first review of COMMIT that kept them (the job's
 pr.json), unless --live-description is given; the replay says which it used.
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from local_autoreviewer import config as config_mod  # noqa: E402
-from local_autoreviewer import db, paths, pipeline  # noqa: E402
+from local_autoreviewer import db, forges, paths, pipeline  # noqa: E402
 from local_autoreviewer.__main__ import CliError, local_secrets, parse_ref  # noqa: E402
 from local_autoreviewer.github import GitHub, GitHubError, read_token  # noqa: E402
 from local_autoreviewer.gitops import Git, GitError  # noqa: E402
@@ -130,7 +130,8 @@ def main():
     base = args.base_sha or f"refs/autoreview/pr/{number}/base"
     base_sha = git("-C", str(mirror), "rev-parse", "--verify", f"{base}^{{commit}}")
     token = read_token(paths.token_file())
-    pr = GitHub(token, live_state / "gh").pr_view(repo, number)
+    clients = forges.Forges(GitHub(token, live_state / "gh"), paths.forgejo_token_dir())  # the PR's own forge
+    pr = clients.pr_view(repo_cfg.name, number)
     pr, source = described(pr, None if args.live_description else saved_pr(live_state, repo_cfg.name, number, head),
                            head, live=args.live_description)
     print(f"title and description: {source}", file=sys.stderr)
@@ -159,7 +160,7 @@ def main():
     svc = pipeline.Services(  # with the limit check, as a replay spends the same plan as reviews
         config=cfg, state=state, github=ReplayGitHub(pr, head), git=Git(str(scratch / "remote"), ENV),
         runner=make_runner(), token_owner="",  # only used for posting, which a replay never does
-        secrets=lambda: [token, *local_secrets(live_state)])
+        secrets=lambda: [token, *clients.secrets(), *local_secrets(live_state)])
     # Scratch job ids start at 1 in every replay: keep their scopes apart from other replays' and the service's.
     pipeline.scope_unit = lambda job_id: f"local-autoreviewer-replay-{os.getpid()}-{job_id}"
     reviews = {}
