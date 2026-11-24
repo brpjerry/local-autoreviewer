@@ -104,7 +104,7 @@ class Forgejo:
                 raise self._fail("GET", path, "the answer is not a list")
             items += batch
             total = (headers.get("X-Total-Count") or "").strip() if headers else ""
-            link = (headers.get("Link") or "") if headers else ""
+            link = ",".join(headers.get_all("Link") or []) if headers else ""  # however many fields it came in
             if total.isdigit():
                 done = len(items) >= int(total)
             else:  # a proxy dropped the count: the next link, else (no link either) an empty page, says

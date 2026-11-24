@@ -31,8 +31,16 @@ TOKEN = "forgejo-secret-token"
 FORGE_REPO = "forge.example/team/tool"
 
 
+class Headers(dict):
+    """Response headers, a field possibly repeated (as http.client's message)."""
+
+    def get_all(self, name, failobj=None):
+        value = self.get(name)
+        return failobj if value is None else value if isinstance(value, list) else [value]
+
+
 class Response(io.BytesIO):
-    headers = {}
+    headers = Headers()
 
     def __enter__(self):
         return self
@@ -57,7 +65,7 @@ class FakeServer:
         answer = self.routes[(request.get_method(), url.path)]
         if isinstance(answer, Exception):
             raise answer
-        headers = {}
+        headers = Headers()
         if isinstance(answer, tuple):  # pages, as the server cuts them; it counts them all
             headers["X-Total-Count"] = str(sum(len(page) for page in answer))
             answer = answer[int(query.get("page", 1)) - 1] if int(query.get("page", 1)) <= len(answer) else []
@@ -126,7 +134,8 @@ class ClientTests(unittest.TestCase):
             def __call__(self, request, timeout=None):
                 response = super().__call__(request, timeout)
                 page = int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))["page"])
-                response.headers = {"Link": '<next>; rel=next' if page < 3 else '<prev>; rel="prev"'}  # unquoted
+                response.headers = Headers(Link=['<prev>; rel="prev"', '<next>; rel=next'] if page < 3  # two fields,
+                                           else '<prev>; rel="prev"')  # the next one unquoted
                 return response
         pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
         server = Uncounted({("GET", api("repos/team/tool/pulls")): pages})
@@ -138,7 +147,7 @@ class ClientTests(unittest.TestCase):
         class Bare(FakeServer):  # a proxy that drops both headers
             def __call__(self, request, timeout=None):
                 response = super().__call__(request, timeout)
-                response.headers = {}
+                response.headers = Headers()
                 return response
         pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
         server = Bare({("GET", api("repos/team/tool/pulls")): pages})
