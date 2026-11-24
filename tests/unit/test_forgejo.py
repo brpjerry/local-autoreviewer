@@ -126,7 +126,7 @@ class ClientTests(unittest.TestCase):
             def __call__(self, request, timeout=None):
                 response = super().__call__(request, timeout)
                 page = int(dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))["page"])
-                response.headers = {"Link": '<next>; rel="next"' if page < 3 else '<prev>; rel="prev"'}
+                response.headers = {"Link": '<next>; rel=next' if page < 3 else '<prev>; rel="prev"'}  # unquoted
                 return response
         pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
         server = Uncounted({("GET", api("repos/team/tool/pulls")): pages})
@@ -149,13 +149,15 @@ class ClientTests(unittest.TestCase):
         class CutOff(io.BytesIO):
             def read(self, *args):
                 raise http.client.IncompleteRead(b"partial")
-        refused = urllib.error.HTTPError("u", 502, "Bad Gateway", {}, CutOff())
-        self.addCleanup(refused.close)
-        client, _ = self.client({("GET", api("user")): refused})
-        with self.assertRaises(ForgejoError) as caught:
-            client.viewer_login()
-        self.assertIn("status 502", str(caught.exception))
-        self.assertFalse(pipeline._rejected(caught.exception))  # retried, as a dropped connection is
+        for status in (403, 422, 502):
+            with self.subTest(status=status):
+                refused = urllib.error.HTTPError("u", status, "error", {}, CutOff())
+                self.addCleanup(refused.close)
+                client, _ = self.client({("GET", api("user")): refused})
+                with self.assertRaises(ForgejoError) as caught:
+                    client.viewer_login()
+                self.assertIn(f"HTTP {status}:", str(caught.exception))  # a 422 still drops the inline comments
+                self.assertFalse(pipeline._rejected(caught.exception))  # retried, as a dropped connection is
 
     def test_an_answer_that_isnt_json_is_a_forgejo_error(self):
         client, _ = self.client({("GET", api("user")): b"<html>Sign in</html>"})
@@ -484,6 +486,22 @@ class RenderTests(unittest.TestCase):
         too_long = comment_for(700)
         self.assertIn("more lines", too_long)  # shortened, as the body's copy is
         self.assertLessEqual(len(too_long), suggestions.MAX_COMMENT)
+
+    def test_a_pointer_to_the_rest_of_the_fix_never_overfills_the_comment(self):
+        def edit(line, text):
+            return {"file": "a.rs", "start_line": line, "end_line": line, "current": "x", "original": ["x"],
+                    "replacement": text, "inline": line == 1, "anchor": "matched"}
+        def comment(edits):
+            item = {"title": "T", "file": "a.rs", "line": 1, "severity": "nit", "edits": edits}
+            (inline,) = suggestions.comments({"findings": [], "nits": [item]}, lambda index, item: "**T**",
+                                             suggest=False)
+            return inline
+        lines = ["y" * 500] * 100
+        alone = len(comment([edit(1, "\n".join(lines))])["body"])
+        lines[-1] += "y" * (suggestions.MAX_COMMENT - 20 - alone)  # 20 characters to spare: too few for a pointer
+        inline = comment([edit(1, "\n".join(lines)), edit(5, "z")])
+        self.assertLessEqual(len(inline["body"]), suggestions.MAX_COMMENT)
+        self.assertNotIn("more lines", inline["body"])  # the inline change stays whole; the body lists the rest
 
     def test_a_long_inline_change_is_whole_in_its_forgejo_comment(self):
         old = [f"old {n}" for n in range(220)]

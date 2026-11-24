@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, feedback, forges, leakscan, limits, review, suggestions
+from . import combine, db, events, feedback, forgejo, forges, leakscan, limits, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS, TOKEN_OWNER, agent_type
@@ -1012,10 +1012,11 @@ def preview_round(svc, job_ids, *, title=""):
 
 def _rejected(exc):
     """True for a definite refusal (HTTP 4xx other than a timeout or rate limit): retrying won't help.
-    GitHub reports primary and secondary rate limits as 403 too, so those are recognized by wording."""
+    GitHub reports primary and secondary rate limits as 403 too, so those are recognized by wording; a Forgejo
+    answer cut off before its reason could be one."""
     text = str(exc)
     match = re.search(r"\bHTTP (4\d\d)\b", text)
-    if not match or match.group(1) in ("408", "429"):
+    if not match or match.group(1) in ("408", "429") or text.endswith(forgejo.CUT_OFF):
         return False
     return not re.search(r"rate limit", text, re.IGNORECASE)
 

@@ -4,6 +4,7 @@ treats both alike. The token goes only into the Authorization header of requests
 no proxy from the environment, and no redirect anywhere else. Every failure is a ForgejoError."""
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +15,7 @@ from .github import MARKER_PREFIX, GitHubError, find_marked
 
 PAGE = 50  # asked for; a server may send fewer (MAX_RESPONSE_ITEMS), so X-Total-Count says when to stop
 MAX_PAGES = 100
+CUT_OFF = "the answer was cut off"
 
 
 class ForgejoError(GitHubError):
@@ -83,8 +85,9 @@ class Forgejo:
         except urllib.error.HTTPError as exc:  # "HTTP 4xx" is what pipeline._rejected and the 422 retry look for
             try:
                 detail = exc.read().decode(errors="replace").strip() if exc.fp else ""
-            except (OSError, HTTPException):  # cut off: not a definite refusal (its reason may have said throttled)
-                raise self._fail(method, path, f"the answer (status {exc.code}) was cut off") from None
+            except (OSError, HTTPException):  # its status stands (a 422 still drops the inline comments), but
+                # without its reason it isn't a definite refusal: it may have said throttled (pipeline._rejected)
+                raise self._fail(method, path, f"HTTP {exc.code}: {CUT_OFF}") from None
             raise self._fail(method, path, f"HTTP {exc.code}: {exc.reason} {detail[:500]}") from None
         except (urllib.error.URLError, OSError, HTTPException) as exc:  # timeouts and cut-off answers too
             raise self._fail(method, path, exc) from None
@@ -105,7 +108,7 @@ class Forgejo:
             if total.isdigit():
                 done = len(items) >= int(total)
             else:  # a proxy dropped the count: the next link, else (no link either) an empty page, says
-                done = bool(link) and 'rel="next"' not in link
+                done = bool(link) and not re.search(r'rel="?next\b', link)
             if not batch or done or (limit and len(items) >= limit):
                 return items[:limit] if limit else items
         raise self._fail("GET", path, f"more than {MAX_PAGES} pages")

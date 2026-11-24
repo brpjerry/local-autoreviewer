@@ -208,12 +208,13 @@ def comments(review, label, suggest=True):
                 change = shown_diff(inline)
         body = f"{heading}\n\n{change}"
         others = [edit for edit in edits if edit is not inline]
-        if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
-            rest = _rest_of_fix(others)
-            if len(body) + len(rest) > MAX_COMMENT:
-                rest = _rest_of_fix(others, shorten=True)
-            body += (rest if len(body) + len(rest) <= MAX_COMMENT else
-                     f"\n\n_The fix also changes {_places(len(others))}, shown in the review._")
+        if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer if it fits
+            room = MAX_COMMENT - len(body)
+            for rest in (_rest_of_fix(others), _rest_of_fix(others, shorten=True),
+                         f"\n\n_The fix also changes {_places(len(others))}, shown in the review._"):
+                if len(rest) <= room:
+                    body += rest
+                    break
         comment = {"path": inline["file"], "line": inline["end_line"], "side": "RIGHT", "body": body}
         if inline["start_line"] < inline["end_line"]:
             comment.update(start_line=inline["start_line"], start_side="RIGHT")
