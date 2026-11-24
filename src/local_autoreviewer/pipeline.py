@@ -19,7 +19,7 @@ from string import Template
 from . import combine, db, events, feedback, forges, leakscan, limits, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
-from .config import AGENTS, agent_type
+from .config import AGENTS, TOKEN_OWNER, agent_type
 from .github import GitHubError
 from .gitops import GitError, ShaMismatch
 
@@ -382,12 +382,19 @@ def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running"))
     (events.requeue_for_service), so a crash can't end the job without the replacement. Returns
     whether the job was cancelled."""
     marks = ",".join("?" * len(only_if))
+    owner = None  # looked up before taking the write lock: a Forgejo host's may need a request
+    repo_cfg = svc.config.repo(job["repo"])
+    if job["post"] and repo_cfg is not None and TOKEN_OWNER in repo_cfg.authors:
+        try:
+            owner = svc.owner(job["repo"])
+        except GitHubError as exc:  # the service's own review then waits for the PR's next update
+            log.warning("job %s: cannot look up the token owner for %s: %s", job["id"], job["repo"], exc)
     with db.transaction(conn):
         cancelled = conn.execute(
             f"UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status IN ({marks})",
             (reason[:1000], svc.now(), job["id"], *only_if)).rowcount
         if cancelled and job["post"]:
-            events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.owner(job["repo"]))
+            events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=owner)
         if cancelled:
             _settle_round(conn, svc, job["id"], "cancelled", reason, {})
     if cancelled:

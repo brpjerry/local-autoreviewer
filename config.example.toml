@@ -19,7 +19,7 @@ min_limit_left = 10        # percent of each plan usage limit (5-hour, weekly, .
 
 [defaults]                 # every [[repo]] inherits these and may override any of them
 agents = ["claude", "codex"]
-authors = ["@token-owner"] # "@token-owner" = the GitHub account the token belongs to
+authors = ["@token-owner"] # "@token-owner" = the account the token for the repo's forge belongs to
 project_docs = true        # give the agent the base branch's CLAUDE.md/AGENTS.md as reference
 max_changed_files = 300
 max_diff_bytes = 1_500_000
@@ -56,7 +56,7 @@ name = "your-user/your-scratch-repo"
 # agents = ["claude"]
 # extra_instructions = "This repo targets Python 3.12; prefer the stdlib."
 
-# A repo on a Forgejo (or Gitea) server: its host, then owner/repo. Its token goes in
+# A repo on a Forgejo server: its host, then owner/repo. Its token goes in
 # ~/.config/local-autoreviewer/forgejo-tokens/forge.example (mode 0600); see the README.
 # [[repo]]
 # name = "forge.example/your-user/your-repo"

@@ -3,6 +3,7 @@
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -85,15 +86,21 @@ def resolve_token_owner(github, state):
 
 def resolve_forgejo_owners(forges_, cfg, state):
     """Look up each configured Forgejo host's token owner now, as resolve_token_owner does GitHub's, so the
-    worker never waits on it while holding the database. One that can't be reached or has no token is left
-    to the first call that needs it, and only its repos fail."""
+    worker never waits on it while holding the database. If the host can't be reached, the owner last seen
+    for the same token is used; a host without a readable token, or with a token never seen, is left to the
+    first call that needs it, and only its repos fail."""
     hosts = sorted({forges.host(repo.name) for repo in cfg.repos.values()} - {None})
     if not hosts:
         return
     conn = db.connect(state / "state.sqlite3")
     try:
         for forgejo_host in hosts:
-            key = f"token_owner:{forgejo_host}"
+            try:
+                token = forges_.forgejo(forgejo_host).token
+            except GitHubError as exc:
+                log.warning("%s: %s", forgejo_host, exc)
+                continue
+            key = f"token_owner:{forgejo_host}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
             try:
                 login = forges_.host_owner(forgejo_host)
             except GitHubError as exc:
@@ -122,7 +129,7 @@ def build_services(cfg):
     resolve_forgejo_owners(forges_, cfg, state)
     return pipeline.Services(
         config=cfg, state=state, github=forges_, git=git, runner=make_runner(), token_owner=owner,
-        secrets=lambda: [token, *forges_.tokens(), *local_secrets(state)])
+        secrets=lambda: [token, *forges_.secrets(), *local_secrets(state)])
 
 
 def load_config():
@@ -457,6 +464,8 @@ def _ensure_worktree(cfg, job):
         try:
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)
         except GitError:
+            if forges.host(job["repo"]):  # its token, for git: a repo since removed from the config wasn't loaded
+                svc.github.forgejo(forges.host(job["repo"]))
             svc.git.run(["-C", str(mirror), "fetch", "--quiet", "--no-tags", "origin",
                          f"+refs/pull/{job['number']}/head:refs/autoreview/pr/{job['number']}/head"])
             svc.git.add_worktree(mirror, job["head_sha"], job_paths.worktree)
@@ -621,8 +630,8 @@ def _limits_line(cfg, name, agent):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="local-autoreviewer",
-                                     description="Review your GitHub PRs with local Claude Code, Codex and "
-                                                 "OpenCode sessions.")
+                                     description="Review your GitHub and Forgejo PRs with local Claude Code, "
+                                                 "Codex and OpenCode sessions.")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {paths.read_version()}")
     sub = parser.add_subparsers(dest="command", required=True)

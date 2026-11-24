@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Where a repo lives: GitHub for `owner/name`, a Forgejo (or Gitea) server for `host/owner/name`.
+"""Where a repo lives: GitHub for `owner/name`, a Forgejo server for `host/owner/name`.
 
 The name says which forge hosts the repo, so everything keyed by it (jobs, mirrors, PR refs on the command
 line) stays apart across forges, and a call finds its forge without a lookup. Forges sends each call to the
@@ -47,6 +47,10 @@ def suggests(repo):
     return host(repo) is None
 
 
+def _git_credentials(token):
+    return base64.b64encode(f"local-autoreviewer:{token}".encode()).decode()
+
+
 class Forges:
     """The GitHub client for `owner/name` repos and a Forgejo client per host for `host/owner/name` ones, so
     callers pass the repo as configured and never care where it lives. A Forgejo host's token is read from
@@ -80,29 +84,35 @@ class Forges:
     def owner(self, repo):
         return self.host_owner(host(repo))
 
-    def tokens(self):
-        """Every Forgejo token, read or not yet, for the check that no posted text quotes one."""
-        found = {client.token for client in self._forgejo.values()}
+    def secrets(self):
+        """Every Forgejo token, read or not yet, and the credentials git sends for it (_git_credentials), for the
+        check that no posted text quotes one. Files in the token directory that aren't text are skipped."""
+        found = {client.token for client in list(self._forgejo.values())}
         try:
             for path in self.token_dir.iterdir():
                 try:
-                    found.add(path.read_text().strip())
-                except OSError:
+                    if path.is_file():
+                        found.add(path.read_text().strip())
+                except (OSError, UnicodeError):
                     continue
         except OSError:
             pass
-        return sorted(token for token in found if token)
+        return sorted({secret for token in found if token for secret in (token, _git_credentials(token))})
 
     def git_env(self):
         """Git configuration, as environment variables, that sends each Forgejo token read so far with git's
-        requests to its own host only. A token never goes on a command line."""
+        requests to its own host only, and doesn't follow that host's redirects: git would send the header on
+        to wherever one led. A token never goes on a command line."""
+        settings = []
+        for forgejo_host, client in sorted(list(self._forgejo.items())):
+            prefix = f"http.https://{forgejo_host}/"
+            settings += [(f"{prefix}.extraHeader", f"Authorization: Basic {_git_credentials(client.token)}"),
+                         (f"{prefix}.followRedirects", "false")]
         env = {}
-        for n, (forgejo_host, client) in enumerate(sorted(self._forgejo.items())):
-            credentials = base64.b64encode(f"local-autoreviewer:{client.token}".encode()).decode()
-            env[f"GIT_CONFIG_KEY_{n}"] = f"http.https://{forgejo_host}/.extraHeader"
-            env[f"GIT_CONFIG_VALUE_{n}"] = f"Authorization: Basic {credentials}"
-        if env:
-            env["GIT_CONFIG_COUNT"] = str(len(self._forgejo))
+        for n, (key, value) in enumerate(settings):
+            env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"] = key, value
+        if settings:
+            env["GIT_CONFIG_COUNT"] = str(len(settings))
         return env
 
     # GitHub's interface; see github.GitHub.

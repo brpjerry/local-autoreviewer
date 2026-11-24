@@ -3,6 +3,7 @@
 
 import base64
 import io
+import sqlite3
 import json
 import os
 import tempfile
@@ -13,12 +14,15 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from tests.helpers import OWNER, EnvTestCase, FakeGitHub, Remote, make_config
+from tests.helpers import OWNER, REPO, EnvTestCase, FakeGitHub, Remote, make_config
 from local_autoreviewer import config as config_mod
-from local_autoreviewer import db, feedback, forges, pipeline, review, suggestions
+from local_autoreviewer import db, events, feedback, forges, leakscan, pipeline, review, suggestions
+from local_autoreviewer import __main__ as cli
 from local_autoreviewer.__main__ import CliError, parse_ref
+from local_autoreviewer import forgejo
 from local_autoreviewer.forgejo import Forgejo, ForgejoError, _SameHostRedirects
-from local_autoreviewer.github import GitHubError
+from local_autoreviewer.github import GitHubError, read_token
+from local_autoreviewer.triggers import poll as poll_mod
 from local_autoreviewer.gitops import Git
 
 TOKEN = "forgejo-secret-token"
@@ -26,6 +30,8 @@ FORGE_REPO = "forge.example/team/tool"
 
 
 class Response(io.BytesIO):
+    headers = {}
+
     def __enter__(self):
         return self
 
@@ -49,9 +55,13 @@ class FakeServer:
         answer = self.routes[(request.get_method(), url.path)]
         if isinstance(answer, Exception):
             raise answer
-        if isinstance(answer, tuple):  # pages
+        headers = {}
+        if isinstance(answer, tuple):  # pages, as the server cuts them; it counts them all
+            headers["X-Total-Count"] = str(sum(len(page) for page in answer))
             answer = answer[int(query.get("page", 1)) - 1] if int(query.get("page", 1)) <= len(answer) else []
-        return Response(json.dumps(answer).encode())
+        response = Response(answer if isinstance(answer, bytes) else json.dumps(answer).encode())
+        response.headers = headers
+        return response
 
 
 def api(path):
@@ -98,6 +108,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual([(r["query"]["state"], r["query"]["page"]) for r in server.requests],
                          [("open", "1"), ("open", "2")])
         self.assertEqual(len(client.list_open_prs("team/tool", limit=3)), 3)
+
+    def test_a_server_that_sends_shorter_pages_is_read_to_the_end(self):
+        pages = tuple([forgejo_pr(n) for n in range(start, min(start + 20, 46))] for start in (1, 21, 41))
+        client, server = self.client({("GET", api("repos/team/tool/pulls")): pages})
+        self.assertEqual([pr["number"] for pr in client.list_open_prs("team/tool")], list(range(1, 46)))
+        self.assertEqual(len(server.requests), 3)
+        endless = tuple([forgejo_pr(1)] for _ in range(forgejo.MAX_PAGES + 1))
+        client, _ = self.client({("GET", api("repos/team/tool/pulls")): endless})
+        with self.assertRaises(ForgejoError):  # not a partial list taken for the whole
+            client.list_open_prs("team/tool")
+
+    def test_an_answer_that_isnt_json_is_a_forgejo_error(self):
+        client, _ = self.client({("GET", api("user")): b"<html>Sign in</html>"})
+        with self.assertRaises(ForgejoError):
+            client.viewer_login()
+        client, _ = self.client({("GET", api("user")): {"message": "no login here"}})
+        with self.assertRaises(ForgejoError):
+            client.viewer_login()
 
     def test_a_closed_pr_is_merged_or_closed(self):
         for extra, state in (({}, "OPEN"), ({"state": "closed", "merged": True}, "MERGED"),
@@ -166,6 +194,25 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(sorted((r["source"], r["github_id"], r["review_id"]) for r in rows),
                          [("comment", 21, 1), ("reply", 13, 1)])
 
+    def test_a_later_review_of_ours_on_the_same_line_is_not_a_reply(self):
+        def ours(review_id, at):
+            return {"id": review_id, "state": "COMMENT", "comments_count": 2, "user": {"login": "imouto"},
+                    "body": review.marker(review_id, "a" * 40, "codex"), "submitted_at": at}
+        reviews = [ours(1, "2026-11-23T10:00:00Z"), ours(2, "2026-11-23T11:00:00Z")]
+        first = [comment(11, 1, "imouto", at="2026-11-23T10:00:00Z", body="**1. Old**")]
+        second = [comment(21, 2, "imouto", at="2026-11-23T11:00:00Z", body="**1. New**"),
+                  comment(22, 2, "imouto", at="2026-11-23T12:00:00Z", body="Won't fix.")]
+        client, _ = self.client({("GET", api("repos/team/tool/pulls/4/reviews")): (reviews,),
+                                 ("GET", api("repos/team/tool/pulls/4/reviews/1/comments")): first,
+                                 ("GET", api("repos/team/tool/pulls/4/reviews/2/comments")): second,
+                                 ("GET", api("repos/team/tool/issues/4/comments")): []})
+        found = {c["id"]: (c["pull_request_review_id"], c["in_reply_to_id"])
+                 for c in client.list_review_comments("team/tool", 4)}
+        self.assertEqual(found, {11: (1, None), 21: (2, None), 22: (None, 21)})
+        self.assertEqual([(r["source"], r["github_id"], r["review_id"], r["context"])
+                          for r in feedback.gather(client, "team/tool", 4, "imouto")],
+                         [("reply", 22, 2, "src/a.rs:10 **1. New**")])
+
     def test_a_review_posts_with_its_comments_on_their_lines(self):
         client, server = self.client({("POST", api("repos/team/tool/pulls/4/reviews")): {"id": 9, "html_url": "u"}})
         comments = [{"path": "a.rs", "line": 5, "side": "RIGHT", "body": "one"},
@@ -201,9 +248,14 @@ class ClientTests(unittest.TestCase):
                                          headers={"Authorization": "token t"})
         moved = handler.redirect_request(request, None, 301, "Moved", {}, "https://forge.example/api/v1/repos/team/new")
         self.assertEqual(moved.full_url, "https://forge.example/api/v1/repos/team/new")
-        with self.assertRaises(urllib.error.HTTPError) as caught:
-            handler.redirect_request(request, io.BytesIO(), 301, "Moved", {}, "https://elsewhere.example/steal")
-        caught.exception.close()
+        post = urllib.request.Request("https://forge.example/api/v1/repos/team/old/pulls/1/reviews", data=b"{}",
+                                      method="POST", headers={"Authorization": "token t"})
+        for req, target in ((request, "https://elsewhere.example/steal"),
+                            (request, "http://forge.example/api/v1/repos/team/new"),  # in the clear
+                            (post, "https://forge.example/api/v1/repos/team/new/pulls/1/reviews")):  # would be a GET
+            with self.subTest(target=target), self.assertRaises(urllib.error.HTTPError) as caught:
+                handler.redirect_request(req, io.BytesIO(), 307, "Moved", {}, target)
+            caught.exception.close()
 
     def test_the_default_opener_ignores_proxies_from_the_environment(self):
         with mock.patch.dict(os.environ, {"https_proxy": "http://proxy.example:3128"}):
@@ -292,6 +344,17 @@ class RoutingTests(unittest.TestCase):
             self.forges.pr_view(FORGE_REPO, 1)
         self.assertIn("chmod 600", str(caught.exception))
 
+    def test_a_token_file_must_hold_one_readable_token(self):
+        for name, content in (("two-lines", b"abc123\nsecond-line"), ("spaced", b"token abc123"),
+                              ("binary", b"\xff\xfeabc")):
+            with self.subTest(name=name):
+                path = self.tokens / name
+                path.write_bytes(content)
+                path.chmod(0o600)
+                with self.assertRaises(GitHubError) as caught:
+                    read_token(path)
+                self.assertNotIn("abc", str(caught.exception))
+
     def test_the_token_owner_is_looked_up_once_per_host(self):
         self.token("forge.example")
         self.assertEqual(self.forges.owner(FORGE_REPO), "imouto")
@@ -304,11 +367,25 @@ class RoutingTests(unittest.TestCase):
         self.token("other.example", "other-token")
         self.forges.forgejo("forge.example")
         env = self.forges.git_env()
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")  # only tokens read so far
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "2")  # only tokens read so far
         self.assertEqual(env["GIT_CONFIG_KEY_0"], "http.https://forge.example/.extraHeader")
         scheme, credentials = env["GIT_CONFIG_VALUE_0"].removeprefix("Authorization: ").split()
         self.assertEqual((scheme, base64.b64decode(credentials).decode()), ("Basic", f"local-autoreviewer:{TOKEN}"))
-        self.assertEqual(self.forges.tokens(), sorted([TOKEN, "other-token"]))  # every token, for the leak check
+        self.assertEqual((env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]),
+                         ("http.https://forge.example/.followRedirects", "false"))
+
+    def test_the_leak_check_knows_every_token_and_what_git_sends_for_it(self):
+        self.token("forge.example")
+        self.token("other.example", "other-token")
+        (self.tokens / "forge.example.swp").write_bytes(b"\xff\xfe\x00binary")
+        (self.tokens / "subdir").mkdir()
+        self.forges.forgejo("forge.example")
+        secrets = self.forges.secrets()
+        self.assertIn(TOKEN, secrets)
+        self.assertIn("other-token", secrets)  # not read for a request yet
+        header = self.forges.git_env()["GIT_CONFIG_VALUE_0"]
+        self.assertTrue([hit for hit in leakscan.scan(f"The service sends {header} to git.", secrets)
+                         if hit.startswith("known-secret-") and hit.endswith("-exact")])
 
     def test_git_runs_with_the_auth_env_and_never_puts_a_token_in_argv(self):
         git = Git("https://github.com", {"PATH": os.environ["PATH"]}, auth_env=lambda: {"GIT_CONFIG_COUNT": "1",
@@ -349,6 +426,21 @@ class RenderTests(unittest.TestCase):
         (github_inline,) = suggestions.comments(data, review.comment_label(data))
         self.assertIn("```suggestion\nnew\n```", github_inline["body"])
 
+    def test_a_long_inline_change_is_shown_whole_in_a_forgejo_reviews_body(self):
+        old = [f"old {n}" for n in range(60)]
+        edit = {"file": "a.rs", "start_line": 1, "end_line": 60, "current": "\n".join(old), "original": old,
+                "replacement": "\n".join(f"new {n}" for n in range(60)), "inline": True, "anchor": "matched"}
+        finding = {"title": "Long", "file": "a.rs", "line": 1, "severity": "minor", "category": "correctness",
+                   "detail": "d", "suggestion": "", "trigger": "", "impact": 3, "likelihood": "rare",
+                   "edits": [edit], "readability": "same"}
+        data = review.validate({"summary": "s", "findings": [finding], "nits": [], "test_gaps": [], "questions": []})
+        data["findings"][0]["edits"] = [edit]
+        render = dict(number=4, sha="a" * 40, base_ref="main", agent="codex", model="m", job_id=7)
+        forgejo_body = review.render(data, repo=FORGE_REPO, **render)
+        self.assertIn("+new 59", forgejo_body)
+        self.assertNotIn("more lines", forgejo_body)
+        self.assertIn("more lines", review.render(data, repo="alice/demo", **render))  # its suggestion has it whole
+
 
 class PipelineTests(EnvTestCase):
     """A review of a Forgejo repo end to end, with the fake forge standing in for its API."""
@@ -377,6 +469,121 @@ class PipelineTests(EnvTestCase):
         self.assertTrue(posted["comments"])
         self.assertFalse([c for c in posted["comments"] if "```suggestion" in c["body"]])
         self.assertEqual(svc.owner(FORGE_REPO), OWNER)
+
+    def write_lock_probe(self, result):
+        """An owner lookup that records whether the database's write lock was held when it ran."""
+        calls = []
+
+        def owner(repo):
+            other = sqlite3.connect(self.state / "state.sqlite3", timeout=0, isolation_level=None)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.execute("ROLLBACK")
+                calls.append("unlocked")
+            except sqlite3.OperationalError:
+                calls.append("locked")
+            finally:
+                other.close()
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return owner, calls
+
+    def test_an_ended_foreground_post_looks_up_the_owner_without_the_write_lock(self):
+        for result, handed_back in ((OWNER, 1), (GitHubError("forgejo GET user failed: HTTP 502"), 0)):
+            with self.subTest(result=result):
+                svc = self.services()
+                conn = svc.connect()
+                with db.transaction(conn):
+                    conn.execute("DELETE FROM jobs")
+                    conn.execute("DELETE FROM prs")
+                    conn.execute("INSERT INTO prs (repo, number, state, is_draft, head_sha, base_ref, author, title,"
+                                 " head_changed_at, last_seen_at) VALUES (?, 4, 'open', 0, ?, 'main', ?, '', 0, 0)",
+                                 (FORGE_REPO, self.head, OWNER))
+                    events.record(conn, events.PrEvent(repo=FORGE_REPO, number=4, action="synchronize",
+                                                       head_sha=self.head, base_ref="main", is_draft=False,
+                                                       author=OWNER, source="poll"), self.clock())
+                    job_id = db.insert_job(conn, repo=FORGE_REPO, number=4, head_sha=self.head, base_ref="main",
+                                           agent="claude", model="", source=db.FOREGROUND, not_before=0,
+                                           now=self.clock(), post=True)
+                    db.update_job(conn, job_id, status="running")
+                conn.close()
+                self.github.owner, calls = self.write_lock_probe(result)
+                pipeline.abandon(svc, [job_id], "foreground review ended before the job finished")
+                conn = svc.connect()
+                try:
+                    self.assertEqual(db.get_job(conn, job_id)["status"], "cancelled")
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs WHERE source='poll'").fetchone()[0],
+                                     handed_back)
+                finally:
+                    conn.close()
+                self.assertEqual(calls, ["unlocked"])
+
+    def test_each_forge_admits_its_own_token_owners_prs(self):
+        self.github.owners = {"forge.example": "imouto"}
+        cfg = make_config(self.tmp, repo=FORGE_REPO, more_repos=[REPO],
+                          service={"settle": "0s", "bootstrap": "review"})
+        for repo in (FORGE_REPO, REPO):
+            self.github.set_pr(1, "a" * 40, repo=repo, author="imouto")
+            self.github.set_pr(2, "b" * 40, repo=repo, author=OWNER)
+        results, failures = poll_mod.poll(self.services(cfg))
+        self.assertEqual(failures, 0)
+        conn = self.services(cfg).connect()
+        try:
+            jobs = sorted({(row["repo"], row["number"]) for row in conn.execute("SELECT repo, number FROM jobs")})
+        finally:
+            conn.close()
+        self.assertEqual(jobs, [(REPO, 2), (FORGE_REPO, 1)])
+
+    def test_recreating_a_checkout_loads_the_hosts_token_before_fetching(self):
+        loaded = []
+        self.github.forgejo = loaded.append
+        svc = self.services()
+        conn = svc.connect()
+        with db.transaction(conn):
+            job_id = db.insert_job(conn, repo=FORGE_REPO, number=4, head_sha=self.head, base_ref="main",
+                                   agent="claude", model="", source="poll", not_before=0, now=self.clock(), post=True)
+            job = dict(db.get_job(conn, job_id))
+        conn.close()
+        with mock.patch.object(cli, "build_services", return_value=svc):
+            paths = cli._ensure_worktree(self.cfg, job)
+        self.assertEqual(loaded, ["forge.example"])
+        self.assertTrue(Path(paths.worktree, "src/calc.py").is_file())
+
+
+class OwnerCacheTests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tokens = self.tmp / "forgejo-tokens"
+        self.tokens.mkdir()
+        self.cfg = make_config(self.tmp, repo=FORGE_REPO)
+        self.answer = "imouto"
+
+    def forges(self):
+        def make(host, token):
+            client = mock.Mock(token=token)
+            if isinstance(self.answer, Exception):
+                client.viewer_login.side_effect = self.answer
+            else:
+                client.viewer_login.return_value = self.answer
+            return client
+        made = forges.Forges(FakeGitHub(), self.tokens, make_forgejo=make)
+        cli.resolve_forgejo_owners(made, self.cfg, self.state)
+        return made.owners
+
+    def token(self, value):
+        path = self.tokens / "forge.example"
+        path.write_text(value)
+        path.chmod(0o600)
+
+    def test_an_unreachable_host_falls_back_to_the_owner_seen_for_the_same_token(self):
+        self.assertEqual(self.forges(), {})  # no token: nothing resolved, and no error
+        self.token("token-a")
+        self.assertEqual(self.forges(), {"forge.example": "imouto"})
+        self.answer = GitHubError("forgejo GET user failed: timed out")
+        self.assertEqual(self.forges(), {"forge.example": "imouto"})
+        self.token("token-b")  # another account's, perhaps: the old owner isn't assumed
+        self.assertEqual(self.forges(), {})
 
 
 if __name__ == "__main__":

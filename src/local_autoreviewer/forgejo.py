@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Forgejo (and Gitea) access over its REST API, answering in the shapes github.GitHub returns, so the rest of
-the service treats both alike. The token goes only into the Authorization header of requests to its own host:
-no proxy from the environment, and no redirect to another host."""
+"""Forgejo access over its REST API, answering in the shapes github.GitHub returns, so the rest of the service
+treats both alike. The token goes only into the Authorization header of requests to its own host over HTTPS:
+no proxy from the environment, and no redirect anywhere else. Every failure is a ForgejoError."""
 
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from http.client import HTTPException
 
-from .github import GitHubError, find_marked
+from .github import MARKER_PREFIX, GitHubError, find_marked
 
-PAGE = 50  # Forgejo's default MAX_RESPONSE_ITEMS; a shorter page is the last
+PAGE = 50  # asked for; a server may send fewer (MAX_RESPONSE_ITEMS), so X-Total-Count says when to stop
 MAX_PAGES = 100
 
 
@@ -20,14 +21,16 @@ class ForgejoError(GitHubError):
 
 
 class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect (a renamed repo, say) only within the host, which the token belongs to."""
+    """Follow a GET's redirect (a renamed repo, say) only to HTTPS on the token's own host. urllib would turn a
+    redirected POST into a GET and drop the review, so a POST's redirect fails instead."""
 
     def __init__(self, host):
         self.host = host
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlsplit(newurl).netloc.lower() != self.host:
-            raise urllib.error.HTTPError(newurl, code, f"redirect to another host refused: {msg}", headers, fp)
+        target = urllib.parse.urlsplit(newurl)
+        if req.get_method() != "GET" or target.scheme != "https" or target.netloc.lower() != self.host:
+            raise urllib.error.HTTPError(newurl, code, f"redirect refused: {msg}", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -63,7 +66,10 @@ class Forgejo:
         self._open = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}),
                                                            _SameHostRedirects(host)).open
 
-    def _request(self, method, path, *, query=None, payload=None):
+    def _fail(self, method, path, detail):
+        return ForgejoError(f"forgejo {method} {path} failed: {detail}".replace(self.token, "***"))
+
+    def _request(self, method, path, *, query=None, payload=None, with_headers=False):
         url = self.base + path + (f"?{urllib.parse.urlencode(query)}" if query else "")
         data = None if payload is None else json.dumps(payload).encode()
         headers = {"Authorization": f"token {self.token}", "Accept": "application/json"}
@@ -72,26 +78,37 @@ class Forgejo:
         try:
             with self._open(urllib.request.Request(url, data=data, method=method, headers=headers),
                             timeout=self.timeout) as response:
-                body = response.read()
+                body, answered = response.read(), response.headers
+            result = json.loads(body) if body.strip() else None
         except urllib.error.HTTPError as exc:  # "HTTP 4xx" is what pipeline._rejected and the 422 retry look for
             detail = exc.read().decode(errors="replace").strip() if exc.fp else ""
-            raise ForgejoError(f"forgejo {method} {path} failed: HTTP {exc.code}: {exc.reason} {detail[:500]}"
-                               .replace(self.token, "***")) from None
-        except (urllib.error.URLError, OSError) as exc:  # timeouts too
-            raise ForgejoError(f"forgejo {method} {path} failed: {exc}".replace(self.token, "***")) from None
-        return json.loads(body) if body.strip() else None
+            raise self._fail(method, path, f"HTTP {exc.code}: {exc.reason} {detail[:500]}") from None
+        except (urllib.error.URLError, OSError, HTTPException) as exc:  # timeouts and cut-off answers too
+            raise self._fail(method, path, exc) from None
+        except ValueError as exc:  # not JSON: a sign-in page, say
+            raise self._fail(method, path, f"unreadable answer ({type(exc).__name__})") from None
+        return (result, answered) if with_headers else result
 
     def _pages(self, path, query=None, limit=None):
         items = []
         for page in range(1, MAX_PAGES + 1):
-            batch = self._request("GET", path, query={**(query or {}), "page": page, "limit": PAGE}) or []
+            batch, headers = self._request("GET", path, query={**(query or {}), "page": page, "limit": PAGE},
+                                           with_headers=True)
+            if not isinstance(batch, list):
+                raise self._fail("GET", path, "the answer is not a list")
             items += batch
-            if len(batch) < PAGE or (limit and len(items) >= limit):
-                break
-        return items[:limit] if limit else items
+            total = (headers.get("X-Total-Count") or "").strip() if headers else ""
+            if not batch or (limit and len(items) >= limit) or (
+                    len(items) >= int(total) if total.isdigit() else len(batch) < PAGE):
+                return items[:limit] if limit else items
+        raise self._fail("GET", path, f"more than {MAX_PAGES} pages")
 
     def viewer_login(self):
-        return self._request("GET", "user")["login"]
+        user = self._request("GET", "user")
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login:
+            raise self._fail("GET", "user", "the answer has no login")
+        return login
 
     def token_expiry(self):
         return None  # Forgejo's access tokens don't expire
@@ -108,26 +125,29 @@ class Forgejo:
         return [r for r in self._pages(f"repos/{repo}/pulls/{number}/reviews") if r.get("state") != "PENDING"]
 
     def list_issue_comments(self, repo, number):
-        return self._request("GET", f"repos/{repo}/issues/{number}/comments") or []
+        return self._request("GET", f"repos/{repo}/issues/{number}/comments") or []  # not paginated: all of them
 
     def list_review_comments(self, repo, number):
-        """Every inline comment, as GitHub lists them. Forgejo lists them per review and has no reply links: it
-        shows the comments on one line of a file as one conversation. So a comment counts as a reply to the
-        first one on its line, unless it was posted with it (two of our suggestions that ended on one line,
-        say). Forgejo files a reply made in its web UI under the review it answers, so what tells a reply
-        from the review's own comments is that it came after the review was submitted: the PR's author may
-        be the account our reviews post as."""
-        comments, submitted = [], {}
+        """Every inline comment, as GitHub lists them. Forgejo lists them per review (each list whole) and has no
+        reply links: it shows the comments on one line of a file as one conversation. So a comment counts as a
+        reply to the first one on its line, unless it was posted with it (two of our suggestions that ended on
+        one line, say). Forgejo files a reply made in its web UI under the review it answers, so what tells a
+        reply from the review's own comments is that it came after the review was submitted: the PR's author
+        may be the account our reviews post as. Each of our reviews (by its marker) has threads of its own, so
+        a later review's suggestion on a line an earlier one commented on is never a reply."""
+        comments, submitted, ours = [], {}, {}
         for r in self.list_reviews(repo, number):
             submitted[r["id"]] = r.get("submitted_at")
+            if MARKER_PREFIX in (r.get("body") or ""):
+                ours[r["id"]] = {}
             if r.get("comments_count"):
                 comments += self._request("GET", f"repos/{repo}/pulls/{number}/reviews/{r['id']}/comments") or []
         comments.sort(key=lambda c: (_time(c.get("created_at")), c["id"]))
         roots, out = {}, []
         for c in comments:
             key = (c.get("path"), c.get("position") or 0, c.get("original_position") or 0)
-            root = roots.setdefault(key, c)
             review_id = c.get("pull_request_review_id")
+            root = (ours[review_id] if review_id in ours else roots).setdefault(key, c)
             posted_with_root = review_id == root.get("pull_request_review_id") and (
                 submitted.get(review_id) is None or _time(c.get("created_at")) <= _time(submitted[review_id]))
             reply = root is not c and not posted_with_root
