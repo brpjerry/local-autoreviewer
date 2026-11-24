@@ -1,7 +1,7 @@
 # local-autoreviewer configuration: ~/.config/local-autoreviewer/config.toml
 # The GitHub token lives separately in ~/.config/local-autoreviewer/github-token (mode 0600):
 # a fine-grained PAT for the repos below with Metadata: read, Contents: read, Pull requests: read/write.
-# Changes are picked up by the worker without a restart.
+# Changes, here and to the token files, are picked up by the worker without a restart.
 
 [service]
 paused = false             # stop claiming new reviews (running ones finish)

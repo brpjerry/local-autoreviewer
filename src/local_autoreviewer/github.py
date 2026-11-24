@@ -2,13 +2,18 @@
 """GitHub access through `gh`, with the token confined to these subprocesses."""
 
 import json
+import logging
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 PR_LIST_FIELDS = "number,headRefOid,baseRefName,baseRefOid,isDraft,author,title,updatedAt"
 PR_VIEW_FIELDS = "number,state,headRefOid,baseRefName,baseRefOid,isDraft,author,title,body,url"
 MARKER_PREFIX = "<!-- local-autoreviewer "
+
+log = logging.getLogger(__name__)
 
 
 class GitHubError(RuntimeError):
@@ -33,6 +38,52 @@ def read_token(path, what="GitHub token", hint="a fine-grained PAT"):
     if mode & 0o077:
         raise GitHubError(f"{what} file {path} must not be group/world readable (chmod 600)")
     return token
+
+
+class TokenFile:
+    """A token file read again whenever it changes, so a long-running worker uses a replaced token without a
+    restart. The first read fails as read_token does. A later change that leaves the file unusable (empty or
+    half written, say) keeps the last good token, and the error is logged once for each version of the file."""
+
+    def __init__(self, path, what="GitHub token", hint="a fine-grained PAT"):
+        self.path = Path(path)
+        self.what = what
+        self.hint = hint
+        self.seen = []  # every token read, oldest first: a review must quote none of them
+        self._token = None
+        self._stamp = None  # the version of the file the token was read from (_stat)
+        self._failed = None  # the stamp of the version last reported unusable
+        self._lock = threading.Lock()
+
+    def _stat(self):
+        """What changes when the file is replaced or rewritten, and when its mode is (a chmod 600 makes a
+        refused file usable)."""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_size, st.st_mode, st.st_mtime_ns, st.st_ctime_ns
+
+    def get(self):
+        with self._lock:
+            stamp = self._stat()  # before reading: a change after it makes the next call read again
+            if self._token is not None and stamp == self._stamp:
+                return self._token
+            try:
+                token = read_token(self.path, self.what, self.hint)
+            except GitHubError as exc:
+                if self._token is None:
+                    raise
+                if stamp != self._failed:
+                    log.error("%s; still using the token read before", exc)
+                    self._failed = stamp
+                return self._token
+            if self._token is not None and token != self._token:
+                log.info("%s reloaded from %s", self.what, self.path)
+            self._token, self._stamp, self._failed = token, stamp, None
+            if token not in self.seen:
+                self.seen.append(token)
+            return token
 
 
 def find_marked(reviews, job_id, login):
@@ -78,22 +129,27 @@ mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isRe
 
 class GitHub:
     def __init__(self, token, config_dir, gh="gh"):
-        self.token = token
+        self._token = token  # the token, or a TokenFile to read it from as it is at each call
         self.gh = gh
         self.config_dir = config_dir
         config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    @property
+    def token(self):
+        return self._token.get() if isinstance(self._token, TokenFile) else self._token
 
     def env(self):
         return gh_env(self.token, self.config_dir)
 
     def _run(self, args, *, stdin=None, timeout=120):
+        token = self.token  # read once: the call redacts the token it ran with
         try:
             proc = subprocess.run([self.gh, *args], input=stdin, capture_output=True, text=True,
-                                  env=self.env(), timeout=timeout)
+                                  env=gh_env(token, self.config_dir), timeout=timeout)
         except subprocess.TimeoutExpired:
             raise GitHubError(f"gh {' '.join(args[:3])} timed out") from None
         if proc.returncode != 0:
-            message = (proc.stderr or proc.stdout).strip().replace(self.token, "***")
+            message = (proc.stderr or proc.stdout).strip().replace(token, "***")
             raise GitHubError(f"gh {' '.join(args[:3])} failed: {message[:500]}")
         return proc.stdout
 
