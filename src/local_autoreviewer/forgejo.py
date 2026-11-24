@@ -7,6 +7,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 from .github import GitHubError, find_marked
 
@@ -28,6 +29,10 @@ class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
         if urllib.parse.urlsplit(newurl).netloc.lower() != self.host:
             raise urllib.error.HTTPError(newurl, code, f"redirect to another host refused: {msg}", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _time(value):
+    return datetime.fromisoformat(value).timestamp() if value else 0.0
 
 
 def _pr(pr):
@@ -108,21 +113,26 @@ class Forgejo:
     def list_review_comments(self, repo, number):
         """Every inline comment, as GitHub lists them. Forgejo lists them per review and has no reply links: it
         shows the comments on one line of a file as one conversation. So a comment counts as a reply to the
-        first one on its line, unless both came in the same review from the same person (two of our
-        suggestions that ended on one line, say)."""
-        comments = []
+        first one on its line, unless it was posted with it (two of our suggestions that ended on one line,
+        say). Forgejo files a reply made in its web UI under the review it answers, so what tells a reply
+        from the review's own comments is that it came after the review was submitted: the PR's author may
+        be the account our reviews post as."""
+        comments, submitted = [], {}
         for r in self.list_reviews(repo, number):
+            submitted[r["id"]] = r.get("submitted_at")
             if r.get("comments_count"):
                 comments += self._request("GET", f"repos/{repo}/pulls/{number}/reviews/{r['id']}/comments") or []
-        comments.sort(key=lambda c: (c.get("created_at") or "", c["id"]))
+        comments.sort(key=lambda c: (_time(c.get("created_at")), c["id"]))
         roots, out = {}, []
         for c in comments:
             key = (c.get("path"), c.get("position") or 0, c.get("original_position") or 0)
             root = roots.setdefault(key, c)
-            reply = root is not c and not (root.get("pull_request_review_id") == c.get("pull_request_review_id")
-                                           and (root.get("user") or {}).get("id") == (c.get("user") or {}).get("id"))
+            review_id = c.get("pull_request_review_id")
+            posted_with_root = review_id == root.get("pull_request_review_id") and (
+                submitted.get(review_id) is None or _time(c.get("created_at")) <= _time(submitted[review_id]))
+            reply = root is not c and not posted_with_root
             out.append({**c, "line": c.get("position") or None, "original_line": c.get("original_position") or None,
-                        "pull_request_review_id": None if reply else c.get("pull_request_review_id"),
+                        "pull_request_review_id": None if reply else review_id,
                         "in_reply_to_id": root["id"] if reply else None})
         return out
 

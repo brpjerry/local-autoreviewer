@@ -15,7 +15,7 @@ from unittest import mock
 
 from tests.helpers import OWNER, EnvTestCase, FakeGitHub, Remote, make_config
 from local_autoreviewer import config as config_mod
-from local_autoreviewer import db, forges, pipeline, review, suggestions
+from local_autoreviewer import db, feedback, forges, pipeline, review, suggestions
 from local_autoreviewer.__main__ import CliError, parse_ref
 from local_autoreviewer.forgejo import Forgejo, ForgejoError, _SameHostRedirects
 from local_autoreviewer.github import GitHubError
@@ -121,11 +121,18 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(client.find_marked_review("team/tool", 4, 8, "imouto"))
 
     def test_inline_comments_on_one_line_are_a_thread(self):
-        reviews = [{"id": 1, "state": "COMMENT", "comments_count": 2, "user": {"login": "imouto"}},
-                   {"id": 2, "state": "COMMENT", "comments_count": 0, "user": {"login": "imouto"}},
-                   {"id": 3, "state": "COMMENT", "comments_count": 2, "user": {"login": "author"}}]
+        reviews = [{"id": 1, "state": "COMMENT", "comments_count": 4, "user": {"login": "imouto"},
+                    "submitted_at": "2026-11-23T02:00:00-08:00"},
+                   {"id": 2, "state": "COMMENT", "comments_count": 0, "user": {"login": "imouto"},
+                    "submitted_at": "2026-11-23T10:30:00Z"},
+                   {"id": 3, "state": "COMMENT", "comments_count": 2, "user": {"login": "author"},
+                    "submitted_at": "2026-11-23T11:00:01Z"}]
+        # Our post: two suggestions ending on one line, created as the review was submitted. Then the author,
+        # posting as the same account, replies in the web UI, which files the reply under our review.
         ours = [comment(11, 1, "imouto", at="2026-11-23T10:00:00Z"),
-                comment(12, 1, "imouto", at="2026-11-23T10:00:00Z")]  # two of our suggestions ending on one line
+                comment(12, 1, "imouto", at="2026-11-23T02:00:00-08:00"),
+                comment(13, 1, "imouto", at="2026-11-23T12:00:00Z", body="won't fix, same account"),
+                comment(14, 1, "imouto", path="src/b.rs", at="2026-11-23T10:00:00Z")]
         theirs = [comment(31, 3, "author", at="2026-11-23T11:00:00Z", body="won't fix"),
                   comment(32, 3, "author", position=0, original=4, at="2026-11-23T11:00:01Z")]
         client, server = self.client({("GET", api("repos/team/tool/pulls/4/reviews")): (reviews,),
@@ -133,11 +140,31 @@ class ClientTests(unittest.TestCase):
                                       ("GET", api("repos/team/tool/pulls/4/reviews/3/comments")): theirs})
         found = {c["id"]: c for c in client.list_review_comments("team/tool", 4)}
         self.assertEqual({i: (c["pull_request_review_id"], c["in_reply_to_id"]) for i, c in found.items()},
-                         {11: (1, None), 12: (1, None), 31: (None, 11), 32: (3, None)})
+                         {11: (1, None), 12: (1, None), 13: (None, 11), 14: (1, None), 31: (None, 11),
+                          32: (3, None)})
         self.assertEqual((found[31]["line"], found[32]["line"], found[32]["original_line"]), (10, None, 4))
         self.assertNotIn(api("repos/team/tool/pulls/4/reviews/2/comments"),
                          [urllib.parse.urlsplit(r["url"]).path for r in server.requests])  # no comments to list
         self.assertEqual(client.review_threads("team/tool", 4), [])  # nothing Forgejo's API could resolve
+
+    def test_replies_and_feedback_are_read_when_the_author_is_the_account_reviews_post_as(self):
+        body = "review\n\n" + review.marker(7, "a" * 40, "codex")
+        reviews = [{"id": 1, "state": "COMMENT", "comments_count": 2, "user": {"login": "imouto"}, "body": body,
+                    "commit_id": "a" * 40, "submitted_at": "2026-11-23T02:00:00-08:00", "html_url": "r1"}]
+        comments = [comment(11, 1, "imouto", at="2026-11-23T10:00:00Z", body="**1. Bug**\n\n```diff\n-a\n+b\n```"),
+                    comment(13, 1, "imouto", at="2026-11-23T12:00:00Z", body="Won't fix: not supported.")]
+        issue = [{"id": 21, "user": {"login": "imouto"}, "body": "Review feedback: 1 was right.",
+                  "created_at": "2026-11-23T13:00:00Z", "html_url": "c21"}]
+        client, _ = self.client({("GET", api("repos/team/tool/pulls/4/reviews")): (reviews,),
+                                 ("GET", api("repos/team/tool/pulls/4/reviews/1/comments")): comments,
+                                 ("GET", api("repos/team/tool/issues/4/comments")): issue})
+        said = feedback.author_comments(client, "team/tool", 4, "imouto", login="imouto")
+        self.assertEqual([(c["kind"], c["body"]) for c in said],
+                         [("reply", "Won't fix: not supported."), ("comment", "Review feedback: 1 was right.")])
+        self.assertEqual(said[0]["thread"], "src/a.rs:10 **1. Bug**")
+        rows = feedback.gather(client, "team/tool", 4, "imouto")
+        self.assertEqual(sorted((r["source"], r["github_id"], r["review_id"]) for r in rows),
+                         [("comment", 21, 1), ("reply", 13, 1)])
 
     def test_a_review_posts_with_its_comments_on_their_lines(self):
         client, server = self.client({("POST", api("repos/team/tool/pulls/4/reviews")): {"id": 9, "html_url": "u"}})
