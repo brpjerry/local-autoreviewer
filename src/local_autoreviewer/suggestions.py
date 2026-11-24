@@ -186,11 +186,12 @@ def fence(info, text):
     return f"{ticks}{info}\n{body + chr(10) if body else ''}{ticks}"
 
 
-def comments(review, label):
+def comments(review, label, suggest=True):
     """GitHub review comments with a suggested change: one per finding or nit with an inline edit (see
     _mark_inline), so each has one thread. The rest of the item's fix is shown in the same comment as diffs,
     unless that would make it too long; the review body has all of it either way. label(index, item) gives
-    the heading that ties the comment to its item in the review body."""
+    the heading that ties the comment to its item in the review body. suggest: False on a forge without
+    suggested changes (forges.suggests), where the inline edit is a diff too."""
     out = []
     items = [(i, f) for i, f in enumerate(review["findings"])] + [(None, n) for n in review["nits"]]
     for index, item in items:
@@ -198,7 +199,8 @@ def comments(review, label):
         inline = next((edit for edit in edits if edit.get("inline")), None)
         if inline is None:
             continue
-        body = f"{label(index, item)}\n\n{fence('suggestion', inline['replacement'])}"
+        change = fence("suggestion", inline["replacement"]) if suggest else shown_diff(inline, shorten=False)
+        body = f"{label(index, item)}\n\n{change}"
         others = [edit for edit in edits if edit is not inline]
         if others:  # in full if it fits, else shortened as a long review's body has it, else a pointer
             rest = _rest_of_fix(others)

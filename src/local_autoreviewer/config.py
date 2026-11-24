@@ -18,7 +18,8 @@ AGENTS = ("claude", "codex", "opencode")  # the agent types: each has a fixed ad
 # with its own model and effort. Its type alone picks the adapter, so the locked flags still apply.
 _AGENT_NAME_RE = re.compile(rf"({'|'.join(AGENTS)})(-[a-z0-9]+)*")  # fullmatch
 TOKEN_OWNER = "@token-owner"
-_REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")  # on GitHub: owner/name
+_FORGEJO_REPO_RE = re.compile(r"^([A-Za-z0-9.-]+(?::\d+)?)/[A-Za-z0-9_.-]+/[A-Za-z0-9._-]+$")  # host/owner/name
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$")
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _MEMORY_RE = re.compile(r"^\d+[KMG]$")
@@ -72,7 +73,7 @@ class RepoConfig:
 
     @property
     def owner(self):
-        return self.name.split("/", 1)[0]
+        return self.name.split("/")[-2]
 
 
 @dataclass(frozen=True)
@@ -229,8 +230,12 @@ def parse(data, path=None):
         if "name" not in table:
             raise ConfigError(f"{where}: missing name")
         name = table["name"]
-        if not isinstance(name, str) or not _REPO_RE.match(name):
-            raise ConfigError(f"{where}.name: expected 'owner/repo', got {name!r}")
+        forgejo = _FORGEJO_REPO_RE.match(name) if isinstance(name, str) else None
+        if not isinstance(name, str) or not (_REPO_RE.match(name) or forgejo):
+            raise ConfigError(f"{where}.name: expected 'owner/repo' (GitHub) or 'host/owner/repo' (Forgejo), "
+                              f"got {name!r}")
+        if forgejo and forgejo.group(1).lower() in ("github.com", "www.github.com"):
+            raise ConfigError(f"{where}.name: a GitHub repo is named 'owner/repo', got {name!r}")
         if name.lower() in repos:
             raise ConfigError(f"{where}.name: duplicate repo {name}")
         settings = _repo_settings({k: v for k, v in table.items() if k != "name"}, base, where, agents)

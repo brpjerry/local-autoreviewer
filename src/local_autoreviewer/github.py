@@ -15,16 +15,26 @@ class GitHubError(RuntimeError):
     pass
 
 
-def read_token(path):
+def read_token(path, what="GitHub token", hint="a fine-grained PAT"):
     try:
         token = path.read_text().strip()
     except FileNotFoundError:
-        raise GitHubError(f"GitHub token missing: create {path} (mode 0600) with a fine-grained PAT") from None
+        raise GitHubError(f"{what} missing: create {path} (mode 0600) with {hint}") from None
     if not token:
-        raise GitHubError(f"GitHub token file {path} is empty")
+        raise GitHubError(f"{what} file {path} is empty")
     if path.stat().st_mode & 0o077:
-        raise GitHubError(f"GitHub token file {path} must not be group/world readable (chmod 600)")
+        raise GitHubError(f"{what} file {path} must not be group/world readable (chmod 600)")
     return token
+
+
+def find_marked(reviews, job_id, login):
+    """The review `login` posted for this job, by its marker, if any."""
+    needle = f"{MARKER_PREFIX}job={job_id} "
+    for review in reviews:
+        user = (review.get("user") or {}).get("login", "")
+        if user.lower() == login.lower() and needle in (review.get("body") or ""):
+            return review
+    return None
 
 
 def gh_env(token, config_dir):
@@ -152,12 +162,7 @@ class GitHub:
 
     def find_marked_review(self, repo, number, job_id, login):
         """Find a review we already posted for this job (crash between post and DB update)."""
-        needle = f"{MARKER_PREFIX}job={job_id} "
-        for review in self.list_reviews(repo, number):
-            user = (review.get("user") or {}).get("login", "")
-            if user.lower() == login.lower() and needle in (review.get("body") or ""):
-                return review
-        return None
+        return find_marked(self.list_reviews(repo, number), job_id, login)
 
     def post_review(self, repo, number, commit_sha, body, comments=None):
         """Post a COMMENT review pinned to commit_sha, with optional inline comments (suggested changes)."""

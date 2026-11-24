@@ -1,8 +1,8 @@
 # local-autoreviewer
 
-`local-autoreviewer` reviews your own GitHub pull requests automatically with **local** [Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) and [OpenCode](https://opencode.ai) sessions, and posts each review back to the PR. Claude uses the `claude` login you already have on the machine, and Codex and OpenCode log in once for reviews, so reviews draw on those subscriptions rather than on API keys. OpenCode's free models need no login at all.
+`local-autoreviewer` reviews your own GitHub and Forgejo pull requests automatically with **local** [Claude Code](https://docs.claude.com/en/docs/claude-code), [Codex](https://github.com/openai/codex) and [OpenCode](https://opencode.ai) sessions, and posts each review back to the PR. Claude uses the `claude` login you already have on the machine, and Codex and OpenCode log in once for reviews, so reviews draw on those subscriptions rather than on API keys. OpenCode's free models need no login at all.
 
-It needs no inbound connectivity: a systemd timer polls GitHub every 2 minutes, so it works behind NAT on a home server or workstation.
+It needs no inbound connectivity: a systemd timer polls GitHub (and your Forgejo servers) every 2 minutes, so it works behind NAT on a home server or workstation.
 
 ```text
 poll.timer → poll → events → ingest (your PRs, no drafts, dedupe, settle, supersede) → job queue
@@ -21,13 +21,14 @@ For each update to one of your open PRs on a configured repo, every enabled agen
 - **Fixes:** each finding comes with the exact proposed change. Reviewers are asked for the simplest fix: concise, readable code in the style of the code around it, changing or removing code rather than adding it where they can. Each finding or nit with a change within the PR's diff gets one inline comment, so one thread to reply in: that first change is a GitHub suggested change, which you apply with **Commit suggestion**, and the rest of its fix is shown in the same comment as diffs (a suggestion can only replace its own comment's lines). The review body shows every change as a diff too. Each change carries the text it replaces, so one whose line numbers are a little off is moved to where that text is, and one whose text isn't in the file is left out rather than applied to the wrong lines.
 - **Severity:** reviewers rate each finding's impact from 0 to 10, its likelihood and its trigger, and severity follows from impact. Then a fix the reviewer rates less readable moves anything below Blocker down two levels, as far as Nit. A fix that removes lines outside the tests (`test_paths`) doesn't change the severity; the finding says how many of those lines it removes, net.
 - **Links:** every finding links to the file and line at that commit.
+- **Forgejo:** a repo on a Forgejo (or Gitea) server is named with its host, `forge.example/owner/repo`, in the config and on the command line, and has a token of its own (see [Setup](#setup)). It is polled, reviewed, followed up and asked for feedback like a GitHub repo. Two things differ: Forgejo has no suggested changes, so an inline comment shows its change as a diff, and its API can't resolve a conversation, so the thread of a fixed finding stays open.
 - **Pushes:** a burst of pushes produces one review. A push during a review cancels it in favour of the new commit.
 - **Follow-ups:** after the first review, later commits get a follow-up instead of a full review. Each agent checks whether the previous round's issues (both agents' findings, or a previous follow-up's open ones) are fixed, partly fixed, not fixed, obsolete, or declined. It reads what you wrote on the PR since the first review (replies in its threads, comments and reviews; nobody else's), and a finding you said you won't fix is declined, with your reason, and not asked about again: the follow-up contests a decline only with something your reason doesn't cover. Its summary says whether what's still open justifies another round. Once the follow-up is posted, the review threads of a finding every reviewer of the round found fixed or obsolete are resolved, so its stale suggestion collapses on the PR; if GitHub refuses, they stay open. It also reports regressions in what changed since. If the new commits add new code (behaviour none of the previous findings asked for, rather than their fixes and the tests for them), the follow-up also reviews the whole PR as if it were new, with the full review's method, and reports test gaps, questions and nits as well. It is told what earlier rounds raised that it isn't asked about (nits, test gaps, questions, and findings you triaged away, with your note), so it doesn't post them again. The post says who reviewed the whole PR. A previous commit that is gone from the mirror means a full review again, and so does a retarget, unless the old base's changes are all in the new one. That usually covers a stacked PR whose PR below has merged, even by squash, so it carries on with follow-ups. If the PR below changed the same lines again after the last review, it's a full review.
 - **Feedback:** every review ends by asking for feedback: a PR comment that starts with **Review feedback**, or a reply to one of its inline suggestions. When the PR closes, the next poll collects that feedback, and again a day later; it is kept, tied to the review it answers, for tuning the prompts (see [Review data](#review-data)).
 
 > **Security model: built for your own PRs.**
 >
-> By default only PRs authored by the token's owner are reviewed. The agents run on the host as your user. They run without a container, but with locked-down CLI flags (see [What protects what](#what-protects-what)).
+> By default only PRs authored by the token's owner (on Forgejo, that host's token's owner) are reviewed. The agents run on the host as your user. They run without a container, but with locked-down CLI flags (see [What protects what](#what-protects-what)).
 >
 > That is proportionate when you wrote the code. It is not a sandbox for hostile input: a malicious PR could try to steer an agent through prompt injection. Do not add other people to `authors`, or `enqueue` untrusted PRs, unless you accept that.
 
@@ -67,7 +68,13 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
    install -Dm600 /dev/stdin ~/.config/local-autoreviewer/github-token
    ```
    The token is passed only to the `gh` and `git` processes this tool starts. It is never written to `gh`'s own config and never reaches an agent. Reviews are posted as the token's owner.
-2. **Configure.** Copy `config.example.toml` (installed in `/usr/share/doc/local-autoreviewer/`) to `~/.config/local-autoreviewer/config.toml` and list your repos under `[[repo]]`. Check it with `local-autoreviewer config-check`.
+
+   **For a Forgejo repo**, create an access token on its server (*Settings → Applications*) with the scopes *read:user*, *read:issue* and *write:repository* (posting a review needs write access, and Forgejo has no narrower scope for it), and save it in a file named after the host:
+   ```sh
+   install -Dm600 /dev/stdin ~/.config/local-autoreviewer/forgejo-tokens/forge.example
+   ```
+   The service sends it only to that host: in its own API requests (ignoring any proxy settings and refusing redirects to another host) and to `git`, as a header for that host in its environment. Reviews are posted as the token's owner. Forgejo submits any review that account has pending on the PR together with the service's, so give the service an account that doesn't leave review drafts there (a second account, with `authors` naming yours), or don't keep drafts on PRs it reviews.
+2. **Configure.** Copy `config.example.toml` (installed in `/usr/share/doc/local-autoreviewer/`) to `~/.config/local-autoreviewer/config.toml` and list your repos under `[[repo]]`: `owner/repo` on GitHub, `host/owner/repo` on a Forgejo server. Check it with `local-autoreviewer config-check`.
 3. **Log the agents in for reviews.** For Codex, run `local-autoreviewer codex-login`. Reviews use their own `CODEX_HOME`, because a global `~/.codex/AGENTS.md` would otherwise be loaded into every review, even with `--ignore-user-config`. Log in there rather than copying `~/.codex/auth.json`: Codex processes sharing one `auth.json` take turns refreshing it, but a copy races the original for the rotating refresh token.
 
    **OpenCode** reviews run in a home of their own (`~/.local/state/local-autoreviewer/opencode-home/`), so your own opencode config, instructions and sessions stay out of them. Free models need no login. For OpenCode Go, run `local-autoreviewer opencode-login` and paste your Go API key when asked. It logs in to the `opencode-go` integration; name another one to log in to it instead.
@@ -99,6 +106,8 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
 | `local-autoreviewer triage ID… [--impact 0-10] [--disposition fixed\|declined\|…] [--commit SHA] [--note …]` | Record what was done about findings |
 | `local-autoreviewer feedback [owner/repo#N] [--collect] [--json]` | Feedback on the reviews, collected when PRs close; `--collect` fetches it now; `--json` exports it with the reviews it answers |
 | `journalctl --user -u local-autoreviewer-worker -f` | Watch the worker |
+
+A Forgejo PR is `host/owner/repo#N`, or its URL (`https://host/owner/repo/pulls/N`).
 
 - **Foreground reviews.** `review` waits out retries of up to 5 minutes and cancels a job that would wait longer, such as one hitting a usage limit with `min_limit_left = 0`. Without `--post` it is a trial, which doesn't stop the service from reviewing that commit. With `--post`, a post interrupted by Ctrl-C is finished by the worker, and a run cancelled before its review is ready lets the service review that commit as it otherwise would have.
 - **Pausing.** Set `paused = true` in the config. The worker picks this up without a restart, and running reviews finish, including posts that were interrupted or failed.
@@ -153,6 +162,8 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 - Git runs with hooks, LFS smudge, fsmonitor, external diff and your `~/.gitconfig` disabled.
 - Nothing from the PR is built or installed. The agents are told not to run anything; Claude has no way to.
 
+**Forgejo tokens** go only to their own host: in the service's API requests (no proxy from the environment, no redirect to another host) and in `git`'s environment, as an `Authorization` header configured for that host. They never reach an agent, argv or a log.
+
 **Reading plan limits** (see Plan reserve) sends your Claude access token only to Anthropic's usage endpoint, from the service's own process; it never reaches an agent, argv or a log.
 
 **Running the agents:**
@@ -163,7 +174,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 **Before posting:**
 - The duplicate check runs the agent with the same locked-down flags and config as its review, in the same checkout.
 - The review is rebuilt from structured output. HTML comments are escaped, @mentions neutralized, embedded images dropped, and the body capped at 65,536 characters.
-- It is scanned for credential patterns (each review, and again the merged post), and for exact, base64, hex and reversed copies of the GitHub token and the local Claude, Codex and opencode credentials (opencode's are read from its database, yours and the reviews'). A match marks the job `blocked`, and nothing is posted.
+- It is scanned for credential patterns (each review, and again the merged post), and for exact, base64, hex and reversed copies of the GitHub and Forgejo tokens and the local Claude, Codex and opencode credentials (opencode's are read from its database, yours and the reviews'). A match marks the job `blocked`, and nothing is posted.
 - The PR head is re-checked immediately before posting, so a review of a superseded commit is never posted.
 
 ## Files
@@ -172,6 +183,7 @@ The known gap is that Codex **can read outside the checkout**. Set `[agents.code
 | --- | --- |
 | `~/.config/local-autoreviewer/config.toml` | Configuration; reloaded when it changes |
 | `~/.config/local-autoreviewer/github-token` | Fine-grained token (0600) |
+| `~/.config/local-autoreviewer/forgejo-tokens/<host>` | A Forgejo server's access token (0600) |
 | `~/.local/state/local-autoreviewer/state.sqlite3` | PR snapshots, events, jobs |
 | `~/.local/state/local-autoreviewer/status.json` | Snapshot written by the worker |
 | `~/.local/state/local-autoreviewer/jobs/<id>/` | `repo/` checkout and `context/` (pr.diff, pr.json, …), both removed after `retain_jobs`; `out/` (agent output, review.json, review.md, the PR's pr.json once the context goes, and for the job that posted several reviews round.md and the duplicate check's output), kept |

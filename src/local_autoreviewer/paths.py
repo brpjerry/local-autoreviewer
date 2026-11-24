@@ -26,6 +26,11 @@ def token_file():
     return config_dir() / "github-token"
 
 
+def forgejo_token_dir():
+    """Each Forgejo host's token, in a file named after the host."""
+    return config_dir() / "forgejo-tokens"
+
+
 def state_dir():
     # systemd sets STATE_DIRECTORY for StateDirectory=; the CLI falls back to XDG.
     value = os.environ.get("STATE_DIRECTORY")

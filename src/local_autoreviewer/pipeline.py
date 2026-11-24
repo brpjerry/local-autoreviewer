@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 
-from . import combine, db, events, feedback, leakscan, limits, review, suggestions
+from . import combine, db, events, feedback, forges, leakscan, limits, review, suggestions
 from .agents import make_agent
 from .agents.base import JobPaths
 from .config import AGENTS, agent_type
@@ -49,6 +49,10 @@ class Services:
 
     def connect(self):
         return db.connect(self.state / "state.sqlite3")
+
+    def owner(self, repo):
+        """The login the repo's reviews post as: the GitHub token's owner, or its Forgejo host's token's."""
+        return self.github.owner(repo) if forges.host(repo) else self.token_owner
 
     def now(self):
         return int(self.clock())
@@ -383,7 +387,7 @@ def _cancel_foreground(conn, svc, job, reason, *, only_if=("queued", "running"))
             f"UPDATE jobs SET status='cancelled', reason=?, finished_at=? WHERE id=? AND status IN ({marks})",
             (reason[:1000], svc.now(), job["id"], *only_if)).rowcount
         if cancelled and job["post"]:
-            events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.token_owner)
+            events.requeue_for_service(conn, svc.config, job, now=svc.now(), token_owner=svc.owner(job["repo"]))
         if cancelled:
             _settle_round(conn, svc, job["id"], "cancelled", reason, {})
     if cancelled:
@@ -504,7 +508,7 @@ def _author_comments(svc, job, pr):
     which only costs the follow-up that context."""
     author = (pr.get("author") or {}).get("login") or ""
     try:
-        return (feedback.author_comments(svc.github, job["repo"], job["number"], author, login=svc.token_owner)
+        return (feedback.author_comments(svc.github, job["repo"], job["number"], author, login=svc.owner(job["repo"]))
                 if author else [])
     except (GitHubError, ValueError, KeyError, TypeError, AttributeError) as exc:  # unexpected JSON too, as collect
         log.warning("job %s: cannot read the author's comments (%s); the follow-up goes without them", job["id"], exc)
@@ -655,7 +659,7 @@ def _run(conn, svc, job, cancel):
     else:
         body = review.render(structured, repo=job["repo"], number=job["number"], sha=job["head_sha"],
                              base_ref=pr["baseRefName"], agent=job["agent"], model=job["model"], job_id=job["id"])
-    inline = suggestions.comments(structured, review.comment_label(structured))
+    inline = suggestions.comments(structured, review.comment_label(structured), forges.suggests(job["repo"]))
     Path(paths.out, "review.json").write_text(json.dumps(structured, indent=2))
     Path(paths.out, "review.md").write_text(body)
     Path(paths.out, "comments.json").write_text(json.dumps(inline, indent=2))
@@ -954,7 +958,7 @@ def _render_round(conn, svc, rows, record):
     else:
         body = review.render_round(merged, repo=lead["repo"], number=lead["number"], sha=lead["head_sha"],
                                    base_ref=lead["base_ref"])
-    return body, suggestions.comments(merged, review.comment_label(merged))
+    return body, suggestions.comments(merged, review.comment_label(merged), forges.suggests(lead["repo"]))
 
 
 def preview_round(svc, job_ids, *, title=""):
@@ -1016,7 +1020,7 @@ def post_failed(conn, svc, job, exc):
     rejected = _rejected(exc)
     if not rejected and post_attempts >= svc.config.service.max_attempts:
         try:  # out of retries: one last look, in case a failure that wasn't a refusal did reach GitHub
-            existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
+            existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.owner(job["repo"]))
         except Exception:
             existing = None
         if existing:
@@ -1049,7 +1053,7 @@ def recover_post(conn, svc, job):
     GitHub, otherwise post the saved review, unless a push, retarget or close has ended the job since.
     Returns the job's status afterwards."""
     try:
-        existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.token_owner)
+        existing = svc.github.find_marked_review(job["repo"], job["number"], job["id"], svc.owner(job["repo"]))
     except GitHubError as exc:
         if not db.get_job(conn, job["id"])["cancel_requested"]:
             return post_failed(conn, svc, job, exc)

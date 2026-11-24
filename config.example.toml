@@ -55,3 +55,8 @@ mode = "shell"             # "inline": no shell tool; the diff and changed files
 name = "your-user/your-scratch-repo"
 # agents = ["claude"]
 # extra_instructions = "This repo targets Python 3.12; prefer the stdlib."
+
+# A repo on a Forgejo (or Gitea) server: its host, then owner/repo. Its token goes in
+# ~/.config/local-autoreviewer/forgejo-tokens/forge.example (mode 0600); see the README.
+# [[repo]]
+# name = "forge.example/your-user/your-repo"

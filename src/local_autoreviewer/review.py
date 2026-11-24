@@ -6,9 +6,8 @@ import json
 import re
 from pathlib import Path
 from string import Template
-from urllib.parse import quote
 
-from . import paths, suggestions
+from . import forges, paths, suggestions
 
 MAX_BODY = 65_536
 MAX_FIELD = 6_000
@@ -293,18 +292,18 @@ def _location(repo, sha, file, line):
     if not file:
         return ""
     label = clean(f"{file}:{line}" if line else file, 300)
-    url = f"https://github.com/{repo}/blob/{sha}/{quote(file)}" + (f"#L{line}" if line else "")
-    return f"[{_code(label)}]({url})"
+    return f"[{_code(label)}]({forges.file_url(repo, sha, file, line)})"
 
 
 def marker(job_id, sha, agent):
     return f"<!-- local-autoreviewer job={job_id} sha={sha} agent={agent} -->"
 
 
-def _proposed_changes(edits, by=""):
+def _proposed_changes(edits, by="", suggests=True):
     """Each proposed change as a collapsed diff, so the review stands on its own without its inline
     suggestions. The diff is code; only marker-like HTML comments are broken up. by: the reviewer whose
-    alternative these are, for a merged duplicate's own fix."""
+    alternative these are, for a merged duplicate's own fix. suggests: whether the forge makes an inline
+    suggestion one click (forges.suggests)."""
     lines = []
     what = f"{by}'s proposed change" if by else "Proposed change"
     shown = suggestions.applied(edits)
@@ -314,7 +313,8 @@ def _proposed_changes(edits, by=""):
                      f"{'were' if dropped > 1 else 'was'} left out._")
     for edit in shown:
         where = clean(suggestions.edit_where(edit), 300)
-        note = " (also a one-click suggestion on the PR)" if edit.get("inline") else ""
+        note = (" (also a one-click suggestion on the PR)" if suggests else " (also inline on the PR)") \
+            if edit.get("inline") else ""
         # Shortened to the usual length when the inline suggestion has it whole, or when the review is too long
         # (see _compacted); otherwise the body is its one copy, so only a huge one is cut.
         shorten = bool(edit.get("inline") or edit.get("shorten"))
@@ -378,7 +378,7 @@ def _finding(number, item, repo, sha, attribute=False):
         lines.append(clean(item["detail"]))
     if item["suggestion"]:
         lines.append("> **Suggestion:** " + clean(item["suggestion"]).replace("\n", "\n> "))
-    lines += _proposed_changes(item.get("edits") or [])
+    lines += _proposed_changes(item.get("edits") or [], suggests=forges.suggests(repo))
     lines += _alternatives(item)
     # The item's continuation, indented past its marker: "10. " needs four spaces where "9. " needs three.
     return [lines[0]] + _within_item(lines[1:], " " * len(f"{number}. "))
@@ -592,7 +592,7 @@ def render_round(merged, *, repo, number, sha, base_ref):
 
 def _round_parts(merged, *, repo, number, sha, base_ref):
     attribute = len(merged["members"]) > 1
-    commit_url = f"https://github.com/{repo}/pull/{number}/commits/{sha}"
+    commit_url = forges.commit_url(repo, number, sha)
     head = [
         _heading("Automated review", merged["members"]),
         "",
@@ -643,7 +643,8 @@ def _nits(merged, demoted, repo, sha, attribute):
     for nit in nits:
         where = _location(repo, sha, nit["file"], nit["line"])
         lines.append(f"- {where + ': ' if where else ''}{clean(nit['text'], 1000)}{_by(nit, attribute)}")
-        lines += _within_item(_proposed_changes(nit.get("edits") or []) + _alternatives(nit), "  ")
+        lines += _within_item(_proposed_changes(nit.get("edits") or [], suggests=forges.suggests(repo))
+                              + _alternatives(nit), "  ")
     return lines + ["", "</details>", ""]
 
 
@@ -664,8 +665,8 @@ def render_followup_round(merged, previous, *, repo, number, sha, previous_sha):
 
 def _followup_parts(merged, previous, *, repo, number, sha, previous_sha):
     attribute = len(merged["members"]) > 1
-    commit = f"[`{sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{sha})"
-    before = f"[`{previous_sha[:7]}`](https://github.com/{repo}/pull/{number}/commits/{previous_sha})"
+    commit = f"[`{sha[:7]}`]({forges.commit_url(repo, number, sha)})"
+    before = f"[`{previous_sha[:7]}`]({forges.commit_url(repo, number, previous_sha)})"
     whole = [member["agent"] for member in merged["members"] if member.get("new_code")]
     if whole:
         who = reviewer_names(whole) if attribute else "the reviewer"
