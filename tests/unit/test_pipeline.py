@@ -1287,14 +1287,26 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(self.github.posted, [])
         self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
 
+    def test_a_pr_that_moves_on_while_checked_gets_no_stale_notice(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, repo_extra={"max_changed_files": 1}))
+        listed = self.github.list_reviews
+
+        def pushed_meanwhile(*args):
+            self.github.set_pr(1, "f" * 40)
+            return listed(*args)
+        with mock.patch.object(self.github, "list_reviews", side_effect=pushed_meanwhile):
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
+        self.assertEqual(self.notices(), [])
+
     def test_codex_inline_mode_leaves_out_excluded_files(self):
-        self.push({"Cargo.lock": "LOCKED-CONTENT\n"})
+        self.push({"Cargo.lock": "LOCKED-CONTENT\n", "dist/generated ": "GENERATED-CONTENT\n"})  # sorts before sub/
         cfg = make_config(self.tmp)
         cfg.agents["codex"] = type(cfg.agents["codex"])(**{**cfg.agents["codex"].__dict__, "mode": "inline"})
         svc, (job_id,) = self.queue(cfg, agents=("codex",))
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
         (call,) = self.agent_log("codex")
         self.assertNotIn("LOCKED-CONTENT", call["prompt"])
+        self.assertNotIn("GENERATED-CONTENT", call["prompt"])  # its name ends in a space
         self.assertIn("## sub/x.py", call["prompt"])
 
     def test_codex_inline_mode_embeds_diff(self):

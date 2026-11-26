@@ -164,10 +164,11 @@ class Git:
         excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
 
         diff = self.run(["-C", m, *DIFF, merge_base, head_sha, "--", ".", *excludes], text=False).stdout
-        excluded = self.out(["-C", m, "diff", "--no-color", "--name-only", merge_base, head_sha, "--",
-                             *[f":(glob){pattern}" for pattern in exclude]]).splitlines() if exclude else []
-        name_status = self.out(["-C", m, "diff", "--no-color", "--find-renames", "--name-status",
-                                merge_base, head_sha])
+        # Not stripped (as out() would): a path may end in a space, and inline mode matches the two by name.
+        excluded = self.run(["-C", m, "diff", "--no-color", "--name-only", merge_base, head_sha, "--",
+                             *[f":(glob){pattern}" for pattern in exclude]]).stdout.splitlines() if exclude else []
+        name_status = self.run(["-C", m, "diff", "--no-color", "--find-renames", "--name-status",
+                                merge_base, head_sha]).stdout.removesuffix("\n")
         commits = self.out(["-C", m, "log", "--no-color", "--format=%h %an: %s%n%b",
                             f"{merge_base}..{head_sha}"])
 

@@ -150,6 +150,7 @@ def _note_too_large(svc, job, reason):
         if latest.startswith(review.SKIPPED_HEADING) and TOO_LARGE in latest:
             log.info("job %s: the PR already shows it is too large; no new notice", job["id"])
             return
+        _check_pr(svc, job)  # it may have moved on, or closed, while we looked: a notice would be stale
         body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])
         svc.github.post_review(repo, number, job["head_sha"], body)
 
