@@ -279,6 +279,17 @@ class ClientTests(unittest.TestCase):
         client.post_review("team/tool", 4, "c" * 40, "body")
         self.assertNotIn("comments", server.requests[1]["payload"])
 
+    def test_a_comment_on_a_long_change_spans_at_most_fifty_lines(self):
+        client, server = self.client({("POST", api("repos/team/tool/pulls/4/reviews")): {"id": 9, "html_url": "u"}})
+        comments = [{"path": "a.rs", "line": 130, "side": "RIGHT", "start_line": 11, "start_side": "RIGHT",
+                     "body": "a 120-line change"},
+                    {"path": "b.rs", "line": 60, "side": "RIGHT", "start_line": 11, "start_side": "RIGHT",
+                     "body": "exactly fifty"}]
+        client.post_review("team/tool", 4, "c" * 40, "body", comments=comments)
+        sent = server.requests[0]["payload"]["comments"]
+        # Forgejo refuses every comment of a review for a longer one.
+        self.assertEqual([(c["new_position"], c["extra_lines_count"]) for c in sent], [(11, 49), (11, 49)])
+
     def test_errors_name_the_status_without_the_token(self):
         refused = urllib.error.HTTPError("u", 422, "Unprocessable Entity", {}, io.BytesIO(
             f"line not in diff, token {TOKEN}".encode()))

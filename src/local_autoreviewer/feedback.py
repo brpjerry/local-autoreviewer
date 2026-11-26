@@ -123,11 +123,16 @@ def author_comments(github, repo, number, author, *, login=None):
     return kept
 
 
+def our_reviews(reviews, login):
+    """The reviews (skip notices too) `login` posted with our marker, in the order they were submitted."""
+    return sorted((r for r in reviews if _login(r).lower() == login.lower() and MARKER_PREFIX in (r.get("body") or "")
+                   and r.get("submitted_at")), key=lambda r: (_time(r["submitted_at"]), r["id"]))
+
+
 def gather(github, repo, number, login):
     """The PR's feedback on our reviews (those `login` posted), as rows for store()."""
     reviews = github.list_reviews(repo, number)
-    ours = sorted((r for r in reviews if _login(r).lower() == login.lower() and MARKER_PREFIX in (r.get("body") or "")
-                   and r.get("submitted_at")), key=lambda r: _time(r["submitted_at"]))
+    ours = our_reviews(reviews, login)
     our_ids = {r["id"] for r in ours}
 
     def answered(created_at):

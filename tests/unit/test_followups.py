@@ -126,18 +126,33 @@ class FollowupTests(EnvTestCase):
         self.svc = self.services(make_config(self.tmp, agents=("claude",), repo_extra={"max_diff_bytes": 10_000}))
         first, status = self.review_at(self.remote.push_pr(1, {"data.txt": "x\n" * 2_500}))  # a 7.5 KB diff
         self.assertEqual(status, "posted")
-        work = self.remote.work
-        git("checkout", "-q", "pr1", cwd=work)
-        git("rm", "-q", "data.txt", cwd=work)  # the PR drops it again
-        self.remote.write("other.txt", "y\n" * 1_000)
-        head = self.remote.commit("swap the data")
-        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
-        git("checkout", "-q", "main", cwd=work)
-        # The PR's diff (3 KB) is within the limit; the change since the review (10.5 KB) isn't.
-        second, status = self.review_at(head)
+        # The PR's diff (3 KB) is within the limit; the change since the review (7.5 KB out, 3 KB in) isn't.
+        second, status = self.review_at(self.remote.push_pr(1, {"data.txt": "y\n" * 1_000}, "swap the data"))
         self.assertEqual(status, "posted")
         self.assertEqual(self.rows("SELECT review_kind FROM jobs WHERE id=?", second), [{"review_kind": "full"}])
         self.assertFalse(self.context(second, "since-review.diff").exists())
+
+    def test_a_followup_counts_neither_deleted_content_nor_deleted_files(self):
+        self.svc = self.services(make_config(self.tmp, agents=("claude",),
+                                             repo_extra={"max_diff_bytes": 10_000, "max_changed_files": 2}))
+        self.remote.open_pr(1, {f"vendor/{n}.h": "x\n" * 2_000 for n in range(3)})  # on the base: 12 KB
+        git("checkout", "-q", "main", cwd=self.remote.work)
+        git("merge", "-q", "pr1", cwd=self.remote.work)
+        git("push", "-q", str(self.remote.bare), "main", cwd=self.remote.work)
+        first, status = self.review_at(self.remote.push_pr(1, {"src/calc.py": FIXED}))
+        self.assertEqual(status, "posted")
+        work = self.remote.work
+        git("checkout", "-q", "pr1", cwd=work)
+        git("rm", "-q", "-r", "vendor", cwd=work)  # 18 KB and 3 files of deletions
+        head = self.remote.commit("drop the vendored headers")
+        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
+        git("checkout", "-q", "main", cwd=work)
+        second, status = self.review_at(head)
+        self.assertEqual((status, self.rows("SELECT review_kind FROM jobs WHERE id=?", second)),
+                         ("posted", [{"review_kind": "followup"}]))
+        since = self.context(second, "since-review.diff").read_text()
+        self.assertIn("deleted file mode", since)
+        self.assertNotIn("-x", since)
 
     def test_a_chain_of_followups_carries_the_open_issues(self):
         self.review_at(self.head_a)

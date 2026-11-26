@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.helpers import OWNER, REPO, EnvTestCase, agent_command, make_config
+from tests.helpers import OWNER, REPO, EnvTestCase, agent_command, git, make_config
 from local_autoreviewer import db, events, pipeline, review
 from local_autoreviewer.config import ConfigWatcher
 from local_autoreviewer.github import GitHubError
@@ -1210,11 +1210,104 @@ class PipelineTests(EnvTestCase):
         self.assertIn("too large", self.github.posted[0]["body"])
         self.assertEqual(self.agent_log("claude"), [])
 
+    def push(self, files):
+        self.head = self.remote.push_pr(1, files)
+        self.github.set_pr(1, self.head)
+
+    def notices(self):
+        return [p for p in self.github.posted if p["body"].startswith(review.SKIPPED_HEADING)]
+
+    def test_a_pr_too_large_is_noted_once_until_it_is_reviewed(self):
+        small = make_config(self.tmp, repo_extra={"max_changed_files": 1})
+        for n in range(2):  # a push that leaves it too large posts nothing more
+            svc, (job_id,) = self.queue(small)
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+            self.assertEqual((len(self.github.posted), len(self.notices())), (1, 1))
+            self.assertTrue(self.job(svc, job_id)["reason"].startswith(pipeline.TOO_LARGE))
+            self.push({"sub/x.py": f"X = {n + 2}\n"})
+        svc, (job_id,) = self.queue(post=False)  # a trial: nothing reaches the PR
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.push({"sub/x.py": "X = 5\n"})
+        svc, (job_id,) = self.queue(small)
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
+        self.push({"sub/x.py": "X = 6\n"})
+        svc, (job_id,) = self.queue()
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        self.push({"sub/x.py": "X = 9\n"})
+        svc, (job_id,) = self.queue(small)  # too large again, after a review: worth saying again
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 2)
+
+    def test_two_reviewers_of_a_commit_too_large_post_one_notice(self):
+        svc, ids = self.queue(make_config(self.tmp, repo_extra={"max_changed_files": 1}), agents=("claude", "codex"))
+        for job_id in reversed(ids):  # in either order
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_a_notice_whose_answer_was_lost_isnt_posted_again(self):
+        small = make_config(self.tmp, repo_extra={"max_changed_files": 1})
+        post = self.github.post_review
+
+        def lost(*args, **kwargs):
+            post(*args, **kwargs)
+            raise GitHubError("gh api failed: timed out")
+        svc, (job_id,) = self.queue(small)
+        with mock.patch.object(self.github, "post_review", side_effect=lost):
+            pipeline.run_job(svc, job_id, pipeline.CancelToken())
+        self.push({"sub/x.py": "X = 5\n"})
+        svc, (job_id,) = self.queue(small)
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_deleted_and_excluded_files_dont_count_toward_the_limits(self):
+        work = self.remote.work
+        git("checkout", "-q", "main", cwd=work)
+        self.remote.write("vendor/big.h", "int x;\n" * 20_000)  # 140 KB on the base
+        self.remote.commit("vendor a header")
+        git("push", "-q", str(self.remote.bare), "main", cwd=work)
+        git("checkout", "-q", "pr1", cwd=work)
+        git("merge", "-q", "--no-edit", "main", cwd=work)
+        git("rm", "-q", "vendor/big.h", cwd=work)
+        self.remote.write("Cargo.lock", "lock\n" * 5_000)  # excluded by default
+        self.head = self.remote.commit("drop the vendored header")
+        git("push", "-q", "-f", str(self.remote.bare), "HEAD:refs/pull/1/head", cwd=work)
+        git("checkout", "-q", "main", cwd=work)
+        self.github.set_pr(1, self.head)
+        cfg = make_config(self.tmp, repo_extra={"max_changed_files": 11, "max_diff_bytes": 20_000})
+        svc, (job_id,) = self.queue(cfg)
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        diff = Path(pipeline.job_paths(self.state, job_id).context, "pr.diff").read_text()
+        self.assertIn("deleted file mode", diff)
+        self.assertNotIn("int x;", diff)
+
     def test_no_post_keeps_review_locally(self):
         svc, (job_id,) = self.queue(post=False)
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
         self.assertEqual(self.github.posted, [])
         self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
+
+    def test_a_pr_that_moves_on_while_checked_gets_no_stale_notice(self):
+        svc, (job_id,) = self.queue(make_config(self.tmp, repo_extra={"max_changed_files": 1}))
+        listed = self.github.list_reviews
+
+        def pushed_meanwhile(*args):
+            self.github.set_pr(1, "f" * 40)
+            return listed(*args)
+        with mock.patch.object(self.github, "list_reviews", side_effect=pushed_meanwhile):
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "superseded")
+        self.assertEqual(self.notices(), [])
+
+    def test_codex_inline_mode_leaves_out_excluded_files(self):
+        self.push({"Cargo.lock": "LOCKED-CONTENT\n", "dist/generated ": "GENERATED-CONTENT\n"})  # sorts before sub/
+        cfg = make_config(self.tmp)
+        cfg.agents["codex"] = type(cfg.agents["codex"])(**{**cfg.agents["codex"].__dict__, "mode": "inline"})
+        svc, (job_id,) = self.queue(cfg, agents=("codex",))
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        (call,) = self.agent_log("codex")
+        self.assertNotIn("LOCKED-CONTENT", call["prompt"])
+        self.assertNotIn("GENERATED-CONTENT", call["prompt"])  # its name ends in a space
+        self.assertIn("## sub/x.py", call["prompt"])
 
     def test_codex_inline_mode_embeds_diff(self):
         cfg = make_config(self.tmp)
