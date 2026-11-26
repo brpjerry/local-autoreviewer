@@ -85,7 +85,7 @@ class TokenFile:
     def get(self):
         with self._lock:
             stamp = self._stat()  # before reading: a change after it makes the next call read again
-            if self._token is not None and stamp == self._stamp:
+            if self._token is not None and stamp is not None and stamp == self._stamp:  # no file: never cached
                 self._failed = _UNREPORTED  # the file in use is back: report its next failure again
                 return self._token
             try:

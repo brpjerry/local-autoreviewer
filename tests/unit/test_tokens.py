@@ -77,6 +77,15 @@ class TokenFileTests(unittest.TestCase):
         self.write("new-token")
         self.assertEqual(tokens.get(), "new-token")
 
+    def test_a_file_that_appeared_while_read_is_still_reported_when_it_goes(self):
+        self.write("old-token")
+        tokens = TokenFile(self.path)
+        with mock.patch.object(tokens, "_stat", return_value=None):  # missing at the stat, there at the read
+            tokens.get()
+        self.path.unlink()
+        with self.assertLogs("local_autoreviewer.github", "ERROR"):
+            self.assertEqual(tokens.get(), "old-token")
+
     def test_the_leak_check_keeps_a_token_refused_for_its_mode(self):
         self.write("old-token")
         tokens = TokenFile(self.path)
