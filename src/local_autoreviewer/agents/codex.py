@@ -203,9 +203,13 @@ class CodexAgent:
                     cut = "\n(truncated: size limit)"
                 parts.append(f"\n## {name}\n\n```\n{text[:limit]}\n```{cut}\n")
                 size += len(parts[-1])
+        try:  # files left out of the diff (lock files, say) are left out here too
+            excluded = set(json.loads(Path(paths.context, "pr.json").read_text()).get("excluded_from_diff") or ())
+        except (OSError, ValueError):
+            excluded = set()
         for line in Path(paths.context, "files.txt").read_text().splitlines():
             fields = line.split("\t")
-            if not fields or fields[0].startswith("D"):
+            if not fields or fields[0].startswith("D") or fields[-1] in excluded:
                 continue
             path = Path(paths.worktree, fields[-1])
             if not path.is_file() or path.stat().st_size > 200_000:

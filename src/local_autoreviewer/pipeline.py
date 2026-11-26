@@ -138,14 +138,20 @@ def _check_pr(svc, job):
 TOO_LARGE = "PR too large for automated review"
 
 
-def _too_large_noted(conn, job):
-    """Whether the PR already shows that it is too large: its last review before this one was skipped for that,
-    with a notice posted. Each push to a PR that stays too large would otherwise post another."""
-    last = conn.execute("SELECT status, reason, post FROM jobs WHERE repo=? AND number=? AND id<?"
-                        " AND status IN ('posted','skipped') ORDER BY id DESC LIMIT 1",
-                        (job["repo"], job["number"], job["id"])).fetchone()
-    return bool(last and last["status"] == "skipped" and last["post"]
-                and (last["reason"] or "").startswith(TOO_LARGE))
+def _note_too_large(svc, job, reason):
+    """Post the skip notice unless the PR shows one already: its latest review from us is a too-large notice, so a
+    push that leaves it too large adds nothing. The PR says so, not the jobs: a trial or a review skipped for plan
+    limits posts nothing, and a post whose answer was lost may still have gone through. A lock per PR keeps two
+    reviewers of one commit from both posting it."""
+    repo, number = job["repo"], job["number"]
+    with repo_lock(Path(svc.state, "locks", "notices", repo, str(number))):
+        ours = feedback.our_reviews(svc.github.list_reviews(repo, number), svc.owner(repo))
+        latest = (ours[-1].get("body") or "") if ours else ""
+        if latest.startswith(review.SKIPPED_HEADING) and TOO_LARGE in latest:
+            log.info("job %s: the PR already shows it is too large; no new notice", job["id"])
+            return
+        body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])
+        svc.github.post_review(repo, number, job["head_sha"], body)
 
 
 def run_job(svc, job_id, cancel):
@@ -612,9 +618,8 @@ def _run(conn, svc, job, cancel):
     if ctx.changed_files > repo_cfg.max_changed_files or ctx.diff_bytes > repo_cfg.max_diff_bytes:
         reason = (f"{TOO_LARGE}: {ctx.changed_files} files, {ctx.diff_bytes} diff bytes "
                   f"(limits {repo_cfg.max_changed_files} files, {repo_cfg.max_diff_bytes} bytes)")
-        if job["post"] and not _too_large_noted(conn, job):
-            body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])
-            svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
+        if job["post"]:
+            _note_too_large(svc, job, reason)
         raise Outcome("skipped", reason)
 
     if cancel():

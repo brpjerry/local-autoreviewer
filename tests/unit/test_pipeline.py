@@ -1214,21 +1214,51 @@ class PipelineTests(EnvTestCase):
         self.head = self.remote.push_pr(1, files)
         self.github.set_pr(1, self.head)
 
+    def notices(self):
+        return [p for p in self.github.posted if p["body"].startswith(review.SKIPPED_HEADING)]
+
     def test_a_pr_too_large_is_noted_once_until_it_is_reviewed(self):
         small = make_config(self.tmp, repo_extra={"max_changed_files": 1})
-        notices = lambda: [p for p in self.github.posted if "Automated review skipped" in p["body"]]  # noqa: E731
         for n in range(2):  # a push that leaves it too large posts nothing more
             svc, (job_id,) = self.queue(small)
             self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
-            self.assertEqual((len(self.github.posted), len(notices())), (1, 1))
+            self.assertEqual((len(self.github.posted), len(self.notices())), (1, 1))
             self.assertTrue(self.job(svc, job_id)["reason"].startswith(pipeline.TOO_LARGE))
             self.push({"sub/x.py": f"X = {n + 2}\n"})
+        svc, (job_id,) = self.queue(post=False)  # a trial: nothing reaches the PR
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.push({"sub/x.py": "X = 5\n"})
+        svc, (job_id,) = self.queue(small)
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
+        self.push({"sub/x.py": "X = 6\n"})
         svc, (job_id,) = self.queue()
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
         self.push({"sub/x.py": "X = 9\n"})
         svc, (job_id,) = self.queue(small)  # too large again, after a review: worth saying again
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
-        self.assertEqual(len(notices()), 2)
+        self.assertEqual(len(self.notices()), 2)
+
+    def test_two_reviewers_of_a_commit_too_large_post_one_notice(self):
+        svc, ids = self.queue(make_config(self.tmp, repo_extra={"max_changed_files": 1}), agents=("claude", "codex"))
+        for job_id in reversed(ids):  # in either order
+            self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_a_notice_whose_answer_was_lost_isnt_posted_again(self):
+        small = make_config(self.tmp, repo_extra={"max_changed_files": 1})
+        post = self.github.post_review
+
+        def lost(*args, **kwargs):
+            post(*args, **kwargs)
+            raise GitHubError("gh api failed: timed out")
+        svc, (job_id,) = self.queue(small)
+        with mock.patch.object(self.github, "post_review", side_effect=lost):
+            pipeline.run_job(svc, job_id, pipeline.CancelToken())
+        self.push({"sub/x.py": "X = 5\n"})
+        svc, (job_id,) = self.queue(small)
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
+        self.assertEqual(len(self.notices()), 1)
 
     def test_deleted_and_excluded_files_dont_count_toward_the_limits(self):
         work = self.remote.work
@@ -1256,6 +1286,16 @@ class PipelineTests(EnvTestCase):
         self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "skipped")
         self.assertEqual(self.github.posted, [])
         self.assertTrue(Path(pipeline.job_paths(self.state, job_id).out, "review.md").is_file())
+
+    def test_codex_inline_mode_leaves_out_excluded_files(self):
+        self.push({"Cargo.lock": "LOCKED-CONTENT\n"})
+        cfg = make_config(self.tmp)
+        cfg.agents["codex"] = type(cfg.agents["codex"])(**{**cfg.agents["codex"].__dict__, "mode": "inline"})
+        svc, (job_id,) = self.queue(cfg, agents=("codex",))
+        self.assertEqual(pipeline.run_job(svc, job_id, pipeline.CancelToken()), "posted")
+        (call,) = self.agent_log("codex")
+        self.assertNotIn("LOCKED-CONTENT", call["prompt"])
+        self.assertIn("## sub/x.py", call["prompt"])
 
     def test_codex_inline_mode_embeds_diff(self):
         cfg = make_config(self.tmp)

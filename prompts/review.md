@@ -4,7 +4,7 @@ It merges into `$base_ref`. You are reviewing head commit $head_sha.
 ## Where things are
 
 - `$worktree`: the repository checked out at the PR head (read-only). Agent instruction files (CLAUDE.md, AGENTS.md, .claude/, .codex/, .agents/, .opencode/, .mcp.json, opencode.json, opencode.jsonc) were removed from this checkout on purpose.
-- `$context/pr.diff`: the full diff from the merge base to the head. Lock files and generated files matching the exclusion list are left out. They are listed under `excluded_from_diff` in pr.json. A deleted file shows only its header; `git show <merge_base>:<path>` in the worktree shows what it held (the merge base is in pr.json).
+- `$context/pr.diff`: the full diff from the merge base to the head. Lock files and generated files matching the exclusion list are left out. They are listed under `excluded_from_diff` in pr.json. A deleted file shows only its header. With shell access, `git show <blob>` shows what it held, where `<blob>` is the ID before `..` on its `index` line. Without it, say in the summary if a deletion you couldn't see stops you judging the PR.
 - `$context/pr.json`: title, description, author, refs and SHAs.
 - `$context/files.txt`: changed files with their status. `$context/commits.txt`: the commit messages.
 $project_docs_note
