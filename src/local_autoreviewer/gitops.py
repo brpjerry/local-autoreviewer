@@ -41,11 +41,16 @@ class ShaMismatch(GitError):
     """GitHub's refs/pull/N/head has not caught up with the head the API reported."""
 
 
+# How the diffs the agent reads are made. A deleted file shows only its header (--irreversible-delete): its old
+# content is in the repo, and a PR that drops a vendored library would otherwise be all of it.
+DIFF = ("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--irreversible-delete")
+
+
 @dataclass
 class Context:
     merge_base: str
     base_sha: str
-    changed_files: int
+    changed_files: int  # files whose changes pr.diff shows: not excluded, not deleted (see shown_files)
     diff_bytes: int
     excluded: list
 
@@ -158,8 +163,7 @@ class Git:
         merge_base = self.out(["-C", m, "merge-base", base_sha, head_sha])
         excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
 
-        diff = self.run(["-C", m, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
-                         merge_base, head_sha, "--", ".", *excludes], text=False).stdout
+        diff = self.run(["-C", m, *DIFF, merge_base, head_sha, "--", ".", *excludes], text=False).stdout
         excluded = self.out(["-C", m, "diff", "--no-color", "--name-only", merge_base, head_sha, "--",
                              *[f":(glob){pattern}" for pattern in exclude]]).splitlines() if exclude else []
         name_status = self.out(["-C", m, "diff", "--no-color", "--find-renames", "--name-status",
@@ -185,9 +189,16 @@ class Git:
                     docs_dir.mkdir(exist_ok=True)
                     (docs_dir / name).write_bytes(proc.stdout[:200_000])
 
-        changed = len([line for line in name_status.splitlines() if line.strip()])
-        return Context(merge_base=merge_base, base_sha=base_sha, changed_files=changed,
+        return Context(merge_base=merge_base, base_sha=base_sha,
+                       changed_files=self.shown_files(m, merge_base, head_sha, excludes),
                        diff_bytes=len(diff), excluded=excluded)
+
+    def shown_files(self, mirror, start, head_sha, excludes):
+        """How many files a diff from start shows the changes of, for the size limits: excluded and deleted files
+        are listed but leave nothing to read."""
+        names = self.run(["-C", str(mirror), "diff", "--no-color", "--find-renames", "--name-only", "-z",
+                          "--diff-filter=d", start, head_sha, "--", ".", *excludes], text=False).stdout
+        return names.count(b"\0")
 
     def has_commit(self, mirror, sha):
         return self.run(["-C", str(mirror), "cat-file", "-e", f"{sha}^{{commit}}"], check=False).returncode == 0
@@ -218,14 +229,11 @@ class Git:
         """A follow-up's extra context: what the PR changed since the previous review (from start, see
         since_review_start), that review's open findings, and what earlier reviews raised besides."""
         excludes = [f":(exclude,glob){pattern}" for pattern in exclude]
-        diff = self.run(["-C", str(mirror), "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
-                         start, head_sha, "--", ".", *excludes], text=False).stdout
+        diff = self.run(["-C", str(mirror), *DIFF, start, head_sha, "--", ".", *excludes], text=False).stdout
         (Path(ctx_dir) / "since-review.diff").write_bytes(diff)
         (Path(ctx_dir) / "previous-findings.json").write_text(json.dumps(previous, indent=2))
         (Path(ctx_dir) / "already-raised.json").write_text(json.dumps(list(raised), indent=2))
-        names = self.run(["-C", str(mirror), "diff", "--no-color", "--name-only", "-z", start, head_sha, "--", ".",
-                          *excludes], text=False).stdout
-        return len(diff), names.count(b"\0")  # for the size limits, like the PR's own diff
+        return len(diff), self.shown_files(mirror, start, head_sha, excludes)  # for the size limits, as the PR's
 
 
 def strip_agent_files(root):

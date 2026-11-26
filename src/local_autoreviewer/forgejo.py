@@ -15,6 +15,7 @@ from .github import MARKER_PREFIX, GitHubError, find_marked
 
 PAGE = 50  # asked for; a server may send fewer (MAX_RESPONSE_ITEMS), so X-Total-Count says when to stop
 MAX_PAGES = 100
+MAX_SPAN = 50  # lines a code comment may span: Forgejo refuses the whole review's comments for a longer one
 CUT_OFF = "the answer was cut off"
 
 
@@ -52,11 +53,11 @@ def _pr(pr):
 
 def _comment(comment):
     """A GitHub review comment (see suggestions.comments) as Forgejo takes it: the first line, and how many
-    more it covers."""
+    more it covers, at most MAX_SPAN lines in all. The comment's diff shows a longer change whole."""
     first = comment.get("start_line") or comment["line"]
     side = "old_position" if comment.get("side") == "LEFT" else "new_position"
     return {"path": comment["path"], "body": comment["body"], side: first,
-            "extra_lines_count": comment["line"] - first}
+            "extra_lines_count": min(comment["line"] - first, MAX_SPAN - 1)}
 
 
 class Forgejo:

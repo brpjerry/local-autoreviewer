@@ -22,9 +22,9 @@ min_limit_left = 10        # percent of each plan usage limit (5-hour, weekly, .
 agents = ["claude", "codex"]
 authors = ["@token-owner"] # "@token-owner" = the account the token for the repo's forge belongs to
 project_docs = true        # give the agent the base branch's CLAUDE.md/AGENTS.md as reference
-max_changed_files = 300
-max_diff_bytes = 1_500_000
-# diff_exclude = ["**/*.lock", "**/package-lock.json", "**/dist/**"]   # left out of pr.diff
+max_changed_files = 300    # files the diff shows changes to (not excluded or deleted ones)
+max_diff_bytes = 1_500_000 # a deleted file counts only its header
+# diff_exclude = ["**/*.lock", "**/package-lock.json", "**/dist/**"]   # left out of pr.diff; replaces the defaults
 # test_paths = ["tests/**", "**/test_*", "**/*.test.*"]   # proposed changes here don't count towards the
 #                                                          # lines a fix removes (defaults cover common layouts)
 post = true                # false: write reviews to the state dir only

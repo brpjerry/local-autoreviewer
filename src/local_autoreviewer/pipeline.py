@@ -135,6 +135,19 @@ def _check_pr(svc, job):
     return pr
 
 
+TOO_LARGE = "PR too large for automated review"
+
+
+def _too_large_noted(conn, job):
+    """Whether the PR already shows that it is too large: its last review before this one was skipped for that,
+    with a notice posted. Each push to a PR that stays too large would otherwise post another."""
+    last = conn.execute("SELECT status, reason, post FROM jobs WHERE repo=? AND number=? AND id<?"
+                        " AND status IN ('posted','skipped') ORDER BY id DESC LIMIT 1",
+                        (job["repo"], job["number"], job["id"])).fetchone()
+    return bool(last and last["status"] == "skipped" and last["post"]
+                and (last["reason"] or "").startswith(TOO_LARGE))
+
+
 def run_job(svc, job_id, cancel):
     """Run one claimed job (status already 'running'). Returns the resulting status."""
     conn = svc.connect()
@@ -597,9 +610,9 @@ def _run(conn, svc, job, cancel):
         db.update_job(conn, job["id"], base_sha=base_sha, workdir=paths.root)
 
     if ctx.changed_files > repo_cfg.max_changed_files or ctx.diff_bytes > repo_cfg.max_diff_bytes:
-        reason = (f"PR too large for automated review: {ctx.changed_files} files, {ctx.diff_bytes} diff bytes "
+        reason = (f"{TOO_LARGE}: {ctx.changed_files} files, {ctx.diff_bytes} diff bytes "
                   f"(limits {repo_cfg.max_changed_files} files, {repo_cfg.max_diff_bytes} bytes)")
-        if job["post"]:
+        if job["post"] and not _too_large_noted(conn, job):
             body = review.render_skipped(reason=reason, sha=job["head_sha"], job_id=job["id"], agent=job["agent"])
             svc.github.post_review(job["repo"], job["number"], job["head_sha"], body)
         raise Outcome("skipped", reason)
