@@ -9,6 +9,7 @@ import sqlite3
 import json
 import os
 import shutil
+import signal
 import tempfile
 import unittest
 import urllib.error
@@ -413,8 +414,17 @@ class RoutingTests(unittest.TestCase):
 
     def test_a_fifo_in_place_of_a_token_file_fails_at_once(self):
         os.mkfifo(self.tokens / "forge.example", 0o600)
-        with self.assertRaisesRegex(GitHubError, "must be a regular file"):
-            read_token(self.tokens / "forge.example")
+
+        def blocked(*_):
+            raise AssertionError("the token read blocked on a FIFO")
+        previous = signal.signal(signal.SIGALRM, blocked)
+        try:
+            signal.alarm(5)
+            with self.assertRaisesRegex(GitHubError, "must be a regular file"):
+                read_token(self.tokens / "forge.example")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
 
     def test_the_token_owner_is_looked_up_once_per_host(self):
         self.token("forge.example")
@@ -697,7 +707,7 @@ class OwnerCacheTests(EnvTestCase):
 
         def make(host, token):
             if not asked and token == "token-a":
-                self.token("token-b")  # replaced just after the first read
+                self.token("replacement-token-b")  # just after the first read; the size changes on any clock
             return mock.Mock(token=token, viewer_login=lambda: asked.append(token) or "imouto")
         made = forges.Forges(FakeGitHub(), self.tokens, make_forgejo=make)
         cli.resolve_forgejo_owners(made, self.cfg, self.state)

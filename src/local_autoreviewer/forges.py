@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .forgejo import Forgejo
-from .github import TokenFile
+from .github import TokenFile, is_token_text
 
 GITHUB = "https://github.com"
 
@@ -62,7 +62,7 @@ class Forges:
         self.make_forgejo = make_forgejo
         self._tokens = {}  # Forgejo host: its TokenFile, shared by every caller
         self._forgejo = {}  # Forgejo host: the client for its current token
-        self._scanned = set()  # every token secrets() found in the directory: it may be replaced since
+        self._scanned = set()  # every token-shaped value secrets() found in the directory: it may be gone since
         self.owners = {}  # Forgejo host: its token's owner
 
     def forgejo(self, forgejo_host):
@@ -98,7 +98,10 @@ class Forges:
             for path in self.token_dir.iterdir():
                 try:
                     if path.is_file():
-                        self._scanned.add(path.read_text().strip())
+                        value = path.read_text().strip()
+                        found.add(value)
+                        if is_token_text(value):  # kept: but not a note or other text that was only there
+                            self._scanned.add(value)
                 except (OSError, UnicodeError):
                     continue
         except OSError:

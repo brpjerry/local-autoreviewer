@@ -25,6 +25,11 @@ def _open_nonblocking(name, flags):
     return os.open(name, flags | os.O_NONBLOCK)  # a FIFO in the file's place fails instead of blocking
 
 
+def is_token_text(value):
+    """Whether value can be a token: one ASCII word, printable, as it goes in a header."""
+    return bool(value) and value.isascii() and value.isprintable() and " " not in value
+
+
 def read_token(path, what="GitHub token", hint="a fine-grained PAT", *, seen=None):
     """The token in `path`, checked through the one open file it was read from. A well-formed token is added to
     `seen` (a list) even if its file's mode refuses it: the leak check must know it all the same."""
@@ -40,7 +45,7 @@ def read_token(path, what="GitHub token", hint="a fine-grained PAT", *, seen=Non
         raise GitHubError(f"cannot read {what} file {path}: {type(exc).__name__}") from None
     if not token:
         raise GitHubError(f"{what} file {path} is empty")
-    if not token.isascii() or not token.isprintable() or " " in token:  # it goes in a header: never quote it
+    if not is_token_text(token):  # never quote it
         raise GitHubError(f"{what} file {path} must hold the token alone, on one line")
     if seen is not None and token not in seen:
         seen.append(token)

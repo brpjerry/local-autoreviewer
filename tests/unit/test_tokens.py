@@ -91,21 +91,19 @@ class TokenFileTests(unittest.TestCase):
 
     def test_gh_runs_with_the_token_in_the_file_and_redacts_that_one(self):
         self.write("ghp_first")
-        gh = Path(self._tmp.name) / "gh"
-        new = self.path.with_suffix(".rotated")
-        gh.write_text(f"""#!/bin/sh
-echo "bad credentials $GH_TOKEN" >&2
-printf 'ghp_second\\n' > {new}; chmod 600 {new}; mv {new} {self.path}
-exit 1
-""")
-        gh.chmod(0o700)
-        github = GitHub(TokenFile(self.path), Path(self._tmp.name) / "gh-config", gh=str(gh))
-        for sent in ("ghp_first", "ghp_second"):  # the script replaces the file as it fails
-            with self.assertRaises(GitHubError) as caught:
-                github.viewer_login()
-            self.assertIn("bad credentials ***", str(caught.exception))
-            self.assertNotIn(sent, str(caught.exception))
+        github = GitHub(TokenFile(self.path), Path(self._tmp.name) / "gh-config")
 
+        def fail(args, *, env, **kwargs):
+            self.write("ghp_second")  # replaced while gh runs
+            return subprocess.CompletedProcess(args, 1, "", f"bad credentials {env['GH_TOKEN']}")
+
+        with mock.patch.object(subprocess, "run", side_effect=fail) as run:
+            for sent in ("ghp_first", "ghp_second"):
+                with self.assertRaises(GitHubError) as caught:
+                    github.viewer_login()
+                self.assertEqual(run.call_args.kwargs["env"]["GH_TOKEN"], sent)
+                self.assertIn("bad credentials ***", str(caught.exception))
+                self.assertNotIn(sent, str(caught.exception))
 
 class WorkerServicesTests(unittest.TestCase):
     """The services the worker builds once follow a replaced token everywhere it goes."""
@@ -166,10 +164,13 @@ class WorkerServicesTests(unittest.TestCase):
     def test_the_leak_check_remembers_a_forgejo_token_it_only_saw_in_the_directory(self):
         self.write(self.token_path, "ghp_old")
         self.write(self.forgejo_dir / "other.example", "fj-unused-token")
+        self.write(self.forgejo_dir / "NOTES", "tokens for the forges")
         svc = cli.build_services(config_mod.parse({}))
+        self.assertLessEqual({"fj-unused-token", "tokens for the forges"}, set(svc.secrets()))
+        for name in ("other.example", "NOTES"):
+            (self.forgejo_dir / name).unlink()
         self.assertIn("fj-unused-token", svc.secrets())
-        (self.forgejo_dir / "other.example").unlink()
-        self.assertIn("fj-unused-token", svc.secrets())
+        self.assertNotIn("tokens for the forges", svc.secrets())  # not a token: forgotten with its file
 
     def test_a_host_without_a_usable_token_leaves_git_working(self):
         self.write(self.token_path, "ghp_old")
