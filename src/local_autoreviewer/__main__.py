@@ -96,13 +96,13 @@ def resolve_forgejo_owners(forges_, cfg, state):
     try:
         for forgejo_host in hosts:
             try:
-                token = forges_.forgejo(forgejo_host).token
+                client = forges_.forgejo(forgejo_host)  # one client: the login is stored under its own token
             except GitHubError as exc:
                 log.warning("%s: %s", forgejo_host, exc)
                 continue
-            key = f"token_owner:{forgejo_host}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+            key = f"token_owner:{forgejo_host}:{hashlib.sha256(client.token.encode()).hexdigest()[:16]}"
             try:
-                login = forges_.host_owner(forgejo_host)
+                login = forges_.owners[forgejo_host] = client.viewer_login()
             except GitHubError as exc:
                 login = db.kv_get(conn, key)
                 if login:

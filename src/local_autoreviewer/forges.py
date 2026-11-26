@@ -60,22 +60,17 @@ class Forges:
         self.github = github
         self.token_dir = Path(token_dir)
         self.make_forgejo = make_forgejo
-        self._tokens = {}  # Forgejo host: its TokenFile, once read
+        self._tokens = {}  # Forgejo host: its TokenFile, shared by every caller
         self._forgejo = {}  # Forgejo host: the client for its current token
+        self._scanned = set()  # every token secrets() found in the directory: it may be replaced since
         self.owners = {}  # Forgejo host: its token's owner
 
-    def _token(self, forgejo_host):
-        tokens = self._tokens.get(forgejo_host)
-        if tokens is None:
-            tokens = TokenFile(self.token_dir / forgejo_host, what=f"Forgejo token for {forgejo_host}",
-                               hint="an access token")
-            token = tokens.get()  # if it fails, the next call tries again
-            self._tokens[forgejo_host] = tokens
-            return token
-        return tokens.get()
-
     def forgejo(self, forgejo_host):
-        token = self._token(forgejo_host)
+        tokens = self._tokens.get(forgejo_host)
+        if tokens is None:  # setdefault: two threads' first calls share one, and with it its history
+            tokens = self._tokens.setdefault(forgejo_host, TokenFile(
+                self.token_dir / forgejo_host, what=f"Forgejo token for {forgejo_host}", hint="an access token"))
+        token = tokens.get()  # until a first read succeeds, every call tries again
         client = self._forgejo.get(forgejo_host)
         if client is None or client.token != token:
             client = self._forgejo[forgejo_host] = self.make_forgejo(forgejo_host, token)
@@ -103,11 +98,12 @@ class Forges:
             for path in self.token_dir.iterdir():
                 try:
                     if path.is_file():
-                        found.add(path.read_text().strip())
+                        self._scanned.add(path.read_text().strip())
                 except (OSError, UnicodeError):
                     continue
         except OSError:
             pass
+        found |= set(self._scanned)
         return sorted({secret for token in found if token for secret in (token, _git_credentials(token))})
 
     def git_env(self):
@@ -115,9 +111,10 @@ class Forges:
         now) with git's requests to its own host only, and doesn't follow that host's redirects: git would send the
         header on to wherever one led. A token never goes on a command line."""
         settings = []
-        for forgejo_host, tokens in sorted(list(self._tokens.items())):
+        for forgejo_host in sorted(list(self._forgejo)):  # hosts whose token was read: get() won't fail
             prefix = f"http.https://{forgejo_host}/"
-            settings += [(f"{prefix}.extraHeader", f"Authorization: Basic {_git_credentials(tokens.get())}"),
+            token = self._tokens[forgejo_host].get()
+            settings += [(f"{prefix}.extraHeader", f"Authorization: Basic {_git_credentials(token)}"),
                          (f"{prefix}.followRedirects", "false")]
         env = {}
         for n, (key, value) in enumerate(settings):

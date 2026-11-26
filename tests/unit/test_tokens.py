@@ -9,8 +9,12 @@ from unittest import mock
 from tests.helpers import ROOT  # noqa: F401  (puts src/ on sys.path)
 from local_autoreviewer import __main__ as cli
 from local_autoreviewer import config as config_mod
-from local_autoreviewer import gitops
+import base64
+
+from local_autoreviewer import gitops, leakscan
 from local_autoreviewer.github import GitHub, GitHubError, TokenFile
+
+PAT = "github_pat_" + "A1b2C3d4E5" * 8 + "xy"  # as long as a real fine-grained token
 
 
 class TokenFileTests(unittest.TestCase):
@@ -51,6 +55,56 @@ class TokenFileTests(unittest.TestCase):
         self.assertNotIn("new-token", logged.output[0])
         self.path.chmod(0o600)  # only the mode changes
         self.assertEqual(tokens.get(), "new-token")
+
+    def test_a_rewrite_in_place_is_read_again(self):
+        self.write("token-aaa")
+        tokens = TokenFile(self.path)
+        tokens.get()
+        inode, mtime = self.path.stat().st_ino, self.path.stat().st_mtime_ns
+        self.path.write_text("token-bbb\n")  # the same inode and size
+        os.utime(self.path, ns=(mtime + 10**9, mtime + 10**9))
+        self.assertEqual((self.path.stat().st_ino, tokens.get()), (inode, "token-bbb"))
+
+    def test_a_deleted_file_is_reported_once_and_a_new_one_is_picked_up(self):
+        self.write("old-token")
+        tokens = TokenFile(self.path)
+        tokens.get()
+        self.path.unlink()
+        with self.assertLogs("local_autoreviewer.github", "ERROR") as logged:
+            self.assertEqual([tokens.get() for _ in range(3)], ["old-token"] * 3)
+        self.assertEqual(len(logged.records), 1)
+        self.assertIn("missing", logged.output[0])
+        self.write("new-token")
+        self.assertEqual(tokens.get(), "new-token")
+
+    def test_the_leak_check_keeps_a_token_refused_for_its_mode(self):
+        self.write("old-token")
+        tokens = TokenFile(self.path)
+        tokens.get()
+        self.write(PAT, mode=0o644)
+        with self.assertLogs("local_autoreviewer.github", "ERROR"):
+            self.assertEqual(tokens.get(), "old-token")
+        self.path.unlink()
+        with self.assertLogs("local_autoreviewer.github", "ERROR"):
+            tokens.get()
+        self.assertTrue(any(hit.startswith("known-secret-") for hit in leakscan.scan(f"leaked {PAT}", tokens.seen)))
+
+    def test_gh_runs_with_the_token_in_the_file_and_redacts_that_one(self):
+        self.write("ghp_first")
+        gh = Path(self._tmp.name) / "gh"
+        new = self.path.with_suffix(".rotated")
+        gh.write_text(f"""#!/bin/sh
+echo "bad credentials $GH_TOKEN" >&2
+printf 'ghp_second\\n' > {new}; chmod 600 {new}; mv {new} {self.path}
+exit 1
+""")
+        gh.chmod(0o700)
+        github = GitHub(TokenFile(self.path), Path(self._tmp.name) / "gh-config", gh=str(gh))
+        for sent in ("ghp_first", "ghp_second"):  # the script replaces the file as it fails
+            with self.assertRaises(GitHubError) as caught:
+                github.viewer_login()
+            self.assertIn("bad credentials ***", str(caught.exception))
+            self.assertNotIn(sent, str(caught.exception))
 
 
 class WorkerServicesTests(unittest.TestCase):
@@ -101,11 +155,29 @@ class WorkerServicesTests(unittest.TestCase):
         old = svc.github.forgejo("forge.example")
         old_header = svc.github.git_env()["GIT_CONFIG_VALUE_0"]
         self.write(self.forgejo_dir / "forge.example", "fj-new")
+        header = svc.github.git_env()["GIT_CONFIG_VALUE_0"]  # git first, before any API request reads the file
+        self.assertNotEqual(header, old_header)
+        self.assertEqual(base64.b64decode(header.split()[-1]).decode(), "local-autoreviewer:fj-new")
         new = svc.github.forgejo("forge.example")
         self.assertEqual((old.token, new.token), ("fj-old", "fj-new"))
-        self.assertNotEqual(svc.github.git_env()["GIT_CONFIG_VALUE_0"], old_header)
         (self.forgejo_dir / "forge.example").unlink()  # the leak check still knows the token it no longer reads
         self.assertLessEqual({"fj-old", "fj-new"}, set(svc.secrets()))
+
+    def test_the_leak_check_remembers_a_forgejo_token_it_only_saw_in_the_directory(self):
+        self.write(self.token_path, "ghp_old")
+        self.write(self.forgejo_dir / "other.example", "fj-unused-token")
+        svc = cli.build_services(config_mod.parse({}))
+        self.assertIn("fj-unused-token", svc.secrets())
+        (self.forgejo_dir / "other.example").unlink()
+        self.assertIn("fj-unused-token", svc.secrets())
+
+    def test_a_host_without_a_usable_token_leaves_git_working(self):
+        self.write(self.token_path, "ghp_old")
+        svc = cli.build_services(config_mod.parse({}))
+        with self.assertRaises(GitHubError):
+            svc.github.forgejo("forge.example")
+        self.assertEqual(svc.github.git_env(), {})
+        self.assertEqual(self.git_token(svc), "ghp_old")
 
 
 if __name__ == "__main__":

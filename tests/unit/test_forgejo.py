@@ -2,6 +2,7 @@
 """Forgejo repos: the API client (against a fake HTTP opener), routing by repo name, links, git auth."""
 
 import base64
+import hashlib
 import http.client
 import io
 import sqlite3
@@ -404,10 +405,15 @@ class RoutingTests(unittest.TestCase):
                     read_token(path)
                 self.assertNotIn("abc", str(caught.exception))
 
-    def test_a_token_file_that_goes_away_while_read_is_a_github_error(self):
+    def test_a_token_file_whose_metadata_cant_be_read_is_a_github_error(self):
         self.token("forge.example")
-        with mock.patch.object(Path, "stat", side_effect=FileNotFoundError(2, "gone")), \
+        with mock.patch.object(os, "fstat", side_effect=OSError("metadata unavailable")), \
                 self.assertRaises(GitHubError):
+            read_token(self.tokens / "forge.example")
+
+    def test_a_fifo_in_place_of_a_token_file_fails_at_once(self):
+        os.mkfifo(self.tokens / "forge.example", 0o600)
+        with self.assertRaisesRegex(GitHubError, "must be a regular file"):
             read_token(self.tokens / "forge.example")
 
     def test_the_token_owner_is_looked_up_once_per_host(self):
@@ -684,6 +690,24 @@ class OwnerCacheTests(EnvTestCase):
         self.assertEqual(self.forges(), {"forge.example": "imouto"})
         self.token("token-b")  # another account's, perhaps: the old owner isn't assumed
         self.assertEqual(self.forges(), {})
+
+    def test_the_owner_is_stored_under_the_token_its_request_used(self):
+        self.token("token-a")
+        asked = []
+
+        def make(host, token):
+            if not asked and token == "token-a":
+                self.token("token-b")  # replaced just after the first read
+            return mock.Mock(token=token, viewer_login=lambda: asked.append(token) or "imouto")
+        made = forges.Forges(FakeGitHub(), self.tokens, make_forgejo=make)
+        cli.resolve_forgejo_owners(made, self.cfg, self.state)
+        conn = db.connect(self.state / "state.sqlite3")
+        try:
+            stored = {row["key"] for row in conn.execute("SELECT key FROM kv WHERE key LIKE 'token_owner:%'")}
+        finally:
+            conn.close()
+        digest = hashlib.sha256(b"token-a").hexdigest()[:16]
+        self.assertEqual((asked, stored), (["token-a"], {f"token_owner:forge.example:{digest}"}))
 
 
 if __name__ == "__main__":
