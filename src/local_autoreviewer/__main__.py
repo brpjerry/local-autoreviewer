@@ -19,7 +19,7 @@ from . import config as config_mod
 from . import db, events, feedback, forges, leakscan, limits, maintenance, paths, pipeline
 from .agents import make_agent
 from .config import ConfigError, ConfigWatcher
-from .github import GitHub, GitHubError, read_token
+from .github import GitHub, GitHubError, TokenFile, read_token
 from .gitops import Git, GitError
 from .runner import make_runner
 from .triggers import poll as poll_mod
@@ -96,13 +96,13 @@ def resolve_forgejo_owners(forges_, cfg, state):
     try:
         for forgejo_host in hosts:
             try:
-                token = forges_.forgejo(forgejo_host).token
+                client = forges_.forgejo(forgejo_host)  # one client: the login is stored under its own token
             except GitHubError as exc:
                 log.warning("%s: %s", forgejo_host, exc)
                 continue
-            key = f"token_owner:{forgejo_host}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+            key = f"token_owner:{forgejo_host}:{hashlib.sha256(client.token.encode()).hexdigest()[:16]}"
             try:
-                login = forges_.host_owner(forgejo_host)
+                login = forges_.owners[forgejo_host] = client.viewer_login()
             except GitHubError as exc:
                 login = db.kv_get(conn, key)
                 if login:
@@ -120,16 +120,22 @@ def resolve_forgejo_owners(forges_, cfg, state):
 def build_services(cfg):
     state = paths.state_dir()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    token = read_token(paths.token_file())
-    github = GitHub(token, state / "gh")
+    # The token files are read again whenever they change, so the worker picks up a replaced token by itself.
+    tokens = TokenFile(paths.token_file())
+    tokens.get()  # a missing or unusable token fails here, before anything starts
+    github = GitHub(tokens, state / "gh")
     forges_ = forges.Forges(github, paths.forgejo_token_dir())
+    # gh's credential helper finds GitHub's token in GH_TOKEN; git gets it as it is at each run.
     git = Git(os.environ.get("LOCAL_AUTOREVIEWER_GIT_BASE", "https://github.com"), github.env(),
-              auth_env=forges_.git_env)
+              auth_env=lambda: {**forges_.git_env(), "GH_TOKEN": github.token})
     owner = resolve_token_owner(github, state)
     resolve_forgejo_owners(forges_, cfg, state)
+
+    def secrets():
+        tokens.get()  # reads a replaced file, so tokens.seen holds the token in use
+        return [*tokens.seen, *forges_.secrets(), *local_secrets(state)]
     return pipeline.Services(
-        config=cfg, state=state, github=forges_, git=git, runner=make_runner(), token_owner=owner,
-        secrets=lambda: [token, *forges_.secrets(), *local_secrets(state)])
+        config=cfg, state=state, github=forges_, git=git, runner=make_runner(), token_owner=owner, secrets=secrets)
 
 
 def load_config():

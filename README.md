@@ -74,6 +74,13 @@ To build it yourself from a checkout, see [packaging/arch/README.md](packaging/a
    install -Dm600 /dev/stdin ~/.config/local-autoreviewer/forgejo-tokens/forge.example
    ```
    The service sends it only to that host: in its own API requests (ignoring any proxy settings, and following only a GET's redirect, and only to HTTPS on the same host) and to `git`, as a header for that host in its environment, with git told not to follow that host's redirects. Reviews are posted as the token's owner. Forgejo submits any review that account has pending on the PR together with the service's, so give the service an account that doesn't leave review drafts there (a second account, with `authors` naming yours), or don't keep drafts on PRs it reviews.
+
+   **To replace a token for the same account**, save the new one beside the old one, then rename it over the old one, so the worker never reads a half-written file:
+   ```sh
+   install -Dm600 /dev/stdin ~/.config/local-autoreviewer/github-token.new
+   mv ~/.config/local-autoreviewer/github-token.new ~/.config/local-autoreviewer/github-token
+   ```
+   The worker reads a token file again whenever it changes, so it needs no restart. If the file fails to read, isn't a single token, or is readable by others, the worker keeps the token it had, logs the error once, and switches when the file is fixed. **To switch accounts**, stop the worker (`systemctl --user stop local-autoreviewer-worker`), replace the file, then start it again: the account reviews post as is looked up at startup.
 2. **Configure.** Copy `config.example.toml` (installed in `/usr/share/doc/local-autoreviewer/`) to `~/.config/local-autoreviewer/config.toml` and list your repos under `[[repo]]`: `owner/repo` on GitHub, `host/owner/repo` on a Forgejo server. Check it with `local-autoreviewer config-check`.
 3. **Log the agents in for reviews.** For Codex, run `local-autoreviewer codex-login`. Reviews use their own `CODEX_HOME`, because a global `~/.codex/AGENTS.md` would otherwise be loaded into every review, even with `--ignore-user-config`. Log in there rather than copying `~/.codex/auth.json`: Codex processes sharing one `auth.json` take turns refreshing it, but a copy races the original for the rotating refresh token.
 

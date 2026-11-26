@@ -2,37 +2,105 @@
 """GitHub access through `gh`, with the token confined to these subprocesses."""
 
 import json
+import logging
 import os
+import stat
 import subprocess
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 PR_LIST_FIELDS = "number,headRefOid,baseRefName,baseRefOid,isDraft,author,title,updatedAt"
 PR_VIEW_FIELDS = "number,state,headRefOid,baseRefName,baseRefOid,isDraft,author,title,body,url"
 MARKER_PREFIX = "<!-- local-autoreviewer "
+
+log = logging.getLogger(__name__)
 
 
 class GitHubError(RuntimeError):
     pass
 
 
-def read_token(path, what="GitHub token", hint="a fine-grained PAT"):
+def _open_nonblocking(name, flags):
+    return os.open(name, flags | os.O_NONBLOCK)  # a FIFO in the file's place fails instead of blocking
+
+
+def is_token_text(value):
+    """Whether value can be a token: one ASCII word, printable, as it goes in a header."""
+    return bool(value) and value.isascii() and value.isprintable() and " " not in value
+
+
+def read_token(path, what="GitHub token", hint="a fine-grained PAT", *, seen=None):
+    """The token in `path`, checked through the one open file it was read from. A well-formed token is added to
+    `seen` (a list) even if its file's mode refuses it: the leak check must know it all the same."""
     try:
-        token = path.read_text().strip()
+        with open(path, "rb", opener=_open_nonblocking) as handle:
+            mode = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(mode):
+                raise GitHubError(f"{what} file {path} must be a regular file")
+            token = handle.read().decode().strip()
     except FileNotFoundError:
         raise GitHubError(f"{what} missing: create {path} (mode 0600) with {hint}") from None
     except (OSError, UnicodeError) as exc:
         raise GitHubError(f"cannot read {what} file {path}: {type(exc).__name__}") from None
     if not token:
         raise GitHubError(f"{what} file {path} is empty")
-    if not token.isascii() or not token.isprintable() or " " in token:  # it goes in a header: never quote it
+    if not is_token_text(token):  # never quote it
         raise GitHubError(f"{what} file {path} must hold the token alone, on one line")
-    try:
-        mode = path.stat().st_mode
-    except OSError as exc:  # gone since it was read
-        raise GitHubError(f"cannot read {what} file {path}: {type(exc).__name__}") from None
+    if seen is not None and token not in seen:
+        seen.append(token)
     if mode & 0o077:
         raise GitHubError(f"{what} file {path} must not be group/world readable (chmod 600)")
     return token
+
+
+_UNREPORTED = object()
+
+
+class TokenFile:
+    """A token file read again whenever it changes, so a long-running worker uses a replaced token without a
+    restart. The first read fails as read_token does. A later read, format or permission error (a file still
+    empty, readable by others, or gone) keeps the token read before, and is logged once for each version of the
+    file."""
+
+    def __init__(self, path, what="GitHub token", hint="a fine-grained PAT"):
+        self.path = Path(path)
+        self.what = what
+        self.hint = hint
+        self.seen = []  # every well-formed token read, oldest first: a review must quote none of them
+        self._token = None
+        self._stamp = None  # the version of the file the token was read from (_stat)
+        self._failed = _UNREPORTED  # the stamp of the version last reported unusable
+        self._lock = threading.Lock()
+
+    def _stat(self):
+        """What changes when the file is replaced or rewritten, and when its mode is (a chmod 600 makes a
+        refused file usable); None while there is no file."""
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_size, st.st_mode, st.st_mtime_ns, st.st_ctime_ns
+
+    def get(self):
+        with self._lock:
+            stamp = self._stat()  # before reading: a change after it makes the next call read again
+            if self._token is not None and stamp is not None and stamp == self._stamp:  # no file: never cached
+                self._failed = _UNREPORTED  # the file in use is back: report its next failure again
+                return self._token
+            try:
+                token = read_token(self.path, self.what, self.hint, seen=self.seen)
+            except GitHubError as exc:
+                if self._token is None:
+                    raise
+                if stamp != self._failed:
+                    log.error("%s; still using the token read before", exc)
+                    self._failed = stamp
+                return self._token
+            if self._token is not None and token != self._token:
+                log.info("%s reloaded from %s", self.what, self.path)
+            self._token, self._stamp, self._failed = token, stamp, _UNREPORTED
+            return token
 
 
 def find_marked(reviews, job_id, login):
@@ -78,22 +146,27 @@ mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isRe
 
 class GitHub:
     def __init__(self, token, config_dir, gh="gh"):
-        self.token = token
+        self._token = token  # the token, or a TokenFile to read it from as it is at each call
         self.gh = gh
         self.config_dir = config_dir
         config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    @property
+    def token(self):
+        return self._token.get() if isinstance(self._token, TokenFile) else self._token
 
     def env(self):
         return gh_env(self.token, self.config_dir)
 
     def _run(self, args, *, stdin=None, timeout=120):
+        token = self.token  # read once: the call redacts the token it ran with
         try:
             proc = subprocess.run([self.gh, *args], input=stdin, capture_output=True, text=True,
-                                  env=self.env(), timeout=timeout)
+                                  env=gh_env(token, self.config_dir), timeout=timeout)
         except subprocess.TimeoutExpired:
             raise GitHubError(f"gh {' '.join(args[:3])} timed out") from None
         if proc.returncode != 0:
-            message = (proc.stderr or proc.stdout).strip().replace(self.token, "***")
+            message = (proc.stderr or proc.stdout).strip().replace(token, "***")
             raise GitHubError(f"gh {' '.join(args[:3])} failed: {message[:500]}")
         return proc.stdout
 

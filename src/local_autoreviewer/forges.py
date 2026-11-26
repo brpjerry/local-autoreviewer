@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .forgejo import Forgejo
-from .github import read_token
+from .github import TokenFile, is_token_text
 
 GITHUB = "https://github.com"
 
@@ -54,20 +54,25 @@ def _git_credentials(token):
 class Forges:
     """The GitHub client for `owner/name` repos and a Forgejo client per host for `host/owner/name` ones, so
     callers pass the repo as configured and never care where it lives. A Forgejo host's token is read from
-    token_dir/<host> on first use."""
+    token_dir/<host> on first use, and again whenever that file changes."""
 
     def __init__(self, github, token_dir, *, make_forgejo=Forgejo):
         self.github = github
         self.token_dir = Path(token_dir)
         self.make_forgejo = make_forgejo
-        self._forgejo = {}
+        self._tokens = {}  # Forgejo host: its TokenFile, shared by every caller
+        self._forgejo = {}  # Forgejo host: the client for its current token
+        self._scanned = set()  # every token-shaped value secrets() found in the directory: it may be gone since
         self.owners = {}  # Forgejo host: its token's owner
 
     def forgejo(self, forgejo_host):
+        tokens = self._tokens.get(forgejo_host)
+        if tokens is None:  # setdefault: two threads' first calls share one, and with it its history
+            tokens = self._tokens.setdefault(forgejo_host, TokenFile(
+                self.token_dir / forgejo_host, what=f"Forgejo token for {forgejo_host}", hint="an access token"))
+        token = tokens.get()  # until a first read succeeds, every call tries again
         client = self._forgejo.get(forgejo_host)
-        if client is None:
-            token = read_token(self.token_dir / forgejo_host, what=f"Forgejo token for {forgejo_host}",
-                               hint="an access token")
+        if client is None or client.token != token:
             client = self._forgejo[forgejo_host] = self.make_forgejo(forgejo_host, token)
         return client
 
@@ -85,28 +90,34 @@ class Forges:
         return self.host_owner(host(repo))
 
     def secrets(self):
-        """Every Forgejo token, read or not yet, and the credentials git sends for it (_git_credentials), for the
-        check that no posted text quotes one. Files in the token directory that aren't text are skipped."""
-        found = {client.token for client in list(self._forgejo.values())}
+        """Every Forgejo token, read or not yet (or replaced since), and the credentials git sends for it
+        (_git_credentials), for the check that no posted text quotes one. Files in the token directory that aren't
+        text are skipped."""
+        found = {token for tokens in list(self._tokens.values()) for token in list(tokens.seen)}
         try:
             for path in self.token_dir.iterdir():
                 try:
                     if path.is_file():
-                        found.add(path.read_text().strip())
+                        value = path.read_text().strip()
+                        found.add(value)
+                        if is_token_text(value):  # kept: but not a note or other text that was only there
+                            self._scanned.add(value)
                 except (OSError, UnicodeError):
                     continue
         except OSError:
             pass
+        found |= set(self._scanned)
         return sorted({secret for token in found if token for secret in (token, _git_credentials(token))})
 
     def git_env(self):
-        """Git configuration, as environment variables, that sends each Forgejo token read so far with git's
-        requests to its own host only, and doesn't follow that host's redirects: git would send the header on
-        to wherever one led. A token never goes on a command line."""
+        """Git configuration, as environment variables, that sends each Forgejo token read so far (as its file is
+        now) with git's requests to its own host only, and doesn't follow that host's redirects: git would send the
+        header on to wherever one led. A token never goes on a command line."""
         settings = []
-        for forgejo_host, client in sorted(list(self._forgejo.items())):
+        for forgejo_host in sorted(list(self._forgejo)):  # hosts whose token was read: get() won't fail
             prefix = f"http.https://{forgejo_host}/"
-            settings += [(f"{prefix}.extraHeader", f"Authorization: Basic {_git_credentials(client.token)}"),
+            token = self._tokens[forgejo_host].get()
+            settings += [(f"{prefix}.extraHeader", f"Authorization: Basic {_git_credentials(token)}"),
                          (f"{prefix}.followRedirects", "false")]
         env = {}
         for n, (key, value) in enumerate(settings):
